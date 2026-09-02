@@ -29,6 +29,7 @@ CHUNK = 3900
 
 PROMPT_Q = queue.Queue()
 STATE_LOCK = threading.Lock()
+RUN_STATE = {"busy": False}
 
 
 def log(msg):
@@ -165,6 +166,7 @@ def worker(cfg, state):
     """Serial agent-run consumer; poll loop stays live for commands."""
     while True:
         chat_id, message_id, prompt = PROMPT_Q.get()
+        RUN_STATE["busy"] = True
         with STATE_LOCK:
             session_id = state.get("sessions", {}).get(str(chat_id))
         react(cfg["bot_token"], chat_id, message_id, "👀")
@@ -182,6 +184,7 @@ def worker(cfg, state):
             new_sid, answer = session_id, None
         finally:
             stop_typing.set()
+            RUN_STATE["busy"] = False
         with STATE_LOCK:
             if new_sid and new_sid != session_id:
                 state.setdefault("sessions", {})[str(chat_id)] = new_sid
@@ -238,6 +241,12 @@ def handle_update(cfg, state, upd):
         return
 
     PROMPT_Q.put((chat_id, message_id, text.strip()))
+    if RUN_STATE["busy"]:
+        send(
+            cfg["bot_token"],
+            chat_id,
+            f"⏳ queued (position {PROMPT_Q.qsize()}) — /status for details",
+        )
 
 
 def main():
