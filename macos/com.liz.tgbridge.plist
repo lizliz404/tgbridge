@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.liz.tgbridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>tgbridge.py</string>
+  </array>
+  <!-- Edit: where you cloned the repo -->
+  <key>WorkingDirectory</key><string>/Users/YOU/tgbridge</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- Edit: output of `which opencode` -->
+    <key>OPENCODE_BIN</key><string>/usr/local/bin/opencode</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/tgbridge.log</string>
+  <key>StandardErrorPath</key><string>/tmp/tgbridge.log</string>
+</dict>
+</plist>

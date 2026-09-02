@@ -62,6 +62,12 @@ def api(token, method, **params):
                 return json.load(r)
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")
+            if e.code == 409:
+                log(
+                    "409 CONFLICT: another poller holds this bot token — is an old bridge still running?"
+                )
+                time.sleep(15)
+                return None
             if e.code == 429 and attempt == 1:
                 try:
                     time.sleep(
@@ -238,6 +244,9 @@ def worker(cfg, state):
         finally:
             stop_typing.set()
             RUN_STATE["busy"] = False
+        if err and session_id and "opencode failed" in err:
+            live["trail"].append("♻️ stale session — retrying fresh")
+            new_sid, answer, err = run_agent(cfg, None, prompt, live)
         if live["status_id"]:
             edit_status(cfg, live, final="✅ done" if not err else "🔴 failed")
         with STATE_LOCK:

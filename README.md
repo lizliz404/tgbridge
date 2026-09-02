@@ -35,7 +35,9 @@ Get your user ID from [@userinfobot](https://t.me/userinfobot). Group chat IDs
 are negative (`-100...`); get them by posting in the group with the bot in it
 and reading the `chat.id` from a getUpdates call.
 
-**3. Run** it as a user service:
+**3. Run** it as a service.
+
+Linux (systemd user service):
 
 ```sh
 cp systemd/tgbridge.service ~/.config/systemd/user/
@@ -44,9 +46,28 @@ systemctl --user enable --now tgbridge
 journalctl --user -u tgbridge -f
 ```
 
+macOS (launchd):
+
+```sh
+# edit macos/com.liz.tgbridge.plist: WorkingDirectory + OPENCODE_BIN paths
+cp macos/com.liz.tgbridge.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.liz.tgbridge.plist
+tail -f /tmp/tgbridge.log
+```
+
+or just run it inside `tmux`: `OPENCODE_BIN=$(which opencode) python3 tgbridge.py`
+
 **4. Talk to it.** DM the bot, or add it to a group and @mention it.
 For groups you may want BotFather → `/setprivacy` → Disable, or make the bot
 a group admin, so it can see plain messages.
+
+### Multiple agents in one group
+
+One bridge per machine, one bot per bridge (a bot token allows exactly one
+poller). Each collaborator creates their own bot, runs their own bridge against
+their own local opencode, and adds their bot to the shared group. Put **all**
+human user IDs in every config's `allowed_user_ids` — the gate checks the
+*sender*, so anyone allowlisted can talk to any bot in the group.
 
 ## Configuration
 
