@@ -3,11 +3,14 @@
 
 Bot API long-poll -> gate (chat allowlist + user allowlist + group trigger)
 -> opencode run (per-chat session, --format json) -> reply to source chat.
-Reactions: eyes on accept, check on done, red circle on error.
+
+Architecture: the poll loop never blocks. Slash commands are answered inline;
+prompts are enqueued and consumed serially by a worker thread.
 """
 
 import json
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -23,6 +26,9 @@ OPENCODE = os.environ.get(
 )
 RUN_TIMEOUT_S = 900
 CHUNK = 3900
+
+PROMPT_Q = queue.Queue()
+STATE_LOCK = threading.Lock()
 
 
 def log(msg):
@@ -155,6 +161,42 @@ def run_agent(cfg, session_id, prompt):
     return sid, "\n".join(texts).strip(), None
 
 
+def worker(cfg, state):
+    """Serial agent-run consumer; poll loop stays live for commands."""
+    while True:
+        chat_id, message_id, prompt = PROMPT_Q.get()
+        with STATE_LOCK:
+            session_id = state.get("sessions", {}).get(str(chat_id))
+        react(cfg["bot_token"], chat_id, message_id, "👀")
+        stop_typing = threading.Event()
+        threading.Thread(
+            target=typing_loop,
+            args=(cfg["bot_token"], chat_id, stop_typing),
+            daemon=True,
+        ).start()
+        log(f"chat={chat_id} run start (session={session_id}, q={PROMPT_Q.qsize()})")
+        try:
+            new_sid, answer, err = run_agent(cfg, session_id, prompt)
+        except Exception as e:
+            err = f"bridge error: {e}"
+            new_sid, answer = session_id, None
+        finally:
+            stop_typing.set()
+        with STATE_LOCK:
+            if new_sid and new_sid != session_id:
+                state.setdefault("sessions", {})[str(chat_id)] = new_sid
+            save_json(STATE_PATH, state)
+        if err:
+            react(cfg["bot_token"], chat_id, message_id, "🔴")
+            send(cfg["bot_token"], chat_id, f"⚠️ {err}")
+            log(f"chat={chat_id} error: {err[:120]}")
+        else:
+            react(cfg["bot_token"], chat_id, message_id, "✅")
+            send(cfg["bot_token"], chat_id, answer or "", reply_to=message_id)
+            log(f"chat={chat_id} done ({len(answer or '')} chars, session={new_sid})")
+        PROMPT_Q.task_done()
+
+
 def handle_update(cfg, state, upd):
     msg = upd.get("message")
     if not msg:
@@ -176,49 +218,26 @@ def handle_update(cfg, state, upd):
             return
         text = text.replace(f"@{bot_username}", "").strip()
 
-    sessions = state.setdefault("sessions", {})
-    session_id = sessions.get(str(chat_id))
-
     if text in ("/new", f"/new@{bot_username}"):
-        sessions.pop(str(chat_id), None)
-        save_json(STATE_PATH, state)
+        with STATE_LOCK:
+            state.setdefault("sessions", {}).pop(str(chat_id), None)
+            save_json(STATE_PATH, state)
         send(cfg["bot_token"], chat_id, "session cleared. next message starts fresh.")
         return
     if text in ("/status", f"/status@{bot_username}"):
-        info = session_id or "(none)"
+        with STATE_LOCK:
+            info = state.get("sessions", {}).get(str(chat_id)) or "(none)"
         send(
             cfg["bot_token"],
             chat_id,
-            f"chat {chat_id}\nsession: {info}\ncwd: {cfg['workdir']}",
+            f"chat {chat_id}\nsession: {info}\ncwd: {cfg['workdir']}\n"
+            f"queued: {PROMPT_Q.qsize()}",
         )
         return
     if not text.strip():
         return
 
-    react(cfg["bot_token"], chat_id, message_id, "👀")
-    stop_typing = threading.Event()
-    threading.Thread(
-        target=typing_loop,
-        args=(cfg["bot_token"], chat_id, stop_typing),
-        daemon=True,
-    ).start()
-    log(f"chat={chat_id} run start (session={session_id})")
-    try:
-        new_sid, answer, err = run_agent(cfg, session_id, text)
-    finally:
-        stop_typing.set()
-    if new_sid and new_sid != session_id:
-        sessions[str(chat_id)] = new_sid
-    state["offset"] = upd["update_id"] + 1
-    save_json(STATE_PATH, state)
-    if err:
-        react(cfg["bot_token"], chat_id, message_id, "🔴")
-        send(cfg["bot_token"], chat_id, f"⚠️ {err}")
-        log(f"chat={chat_id} error: {err[:120]}")
-    else:
-        react(cfg["bot_token"], chat_id, message_id, "✅")
-        send(cfg["bot_token"], chat_id, answer or "", reply_to=message_id)
-        log(f"chat={chat_id} done ({len(answer or '')} chars, session={new_sid})")
+    PROMPT_Q.put((chat_id, message_id, text.strip()))
 
 
 def main():
@@ -243,6 +262,8 @@ def main():
     )
     log(f"tgbridge up as @{state['bot_username']}, chats={cfg['allowed_chats']}")
 
+    threading.Thread(target=worker, args=(cfg, state), daemon=True).start()
+
     offset = state.get("offset")
     while True:
         params = {"timeout": 50, "allowed_updates": json.dumps(["message"])}
@@ -262,8 +283,9 @@ def main():
                 cid = (m.get("chat") or {}).get("id")
                 if cid:
                     send(cfg["bot_token"], cid, f"⚠️ bridge error: {e}")
-            state["offset"] = offset
-            save_json(STATE_PATH, state)
+            with STATE_LOCK:
+                state["offset"] = offset
+                save_json(STATE_PATH, state)
 
 
 if __name__ == "__main__":
