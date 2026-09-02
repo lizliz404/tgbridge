@@ -2,7 +2,7 @@
 
 A minimal Telegram bridge for a local [opencode](https://opencode.ai) agent.
 
-~210 lines of Python, **zero dependencies** (stdlib only). No webhooks, no
+~290 lines of Python, **zero dependencies** (stdlib only). No webhooks, no
 public ports, no databases: Bot API long-poll in, `opencode run` out.
 
 ## Features
