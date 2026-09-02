@@ -121,7 +121,40 @@ def typing_loop(token, chat_id, stop_event):
         api(token, "sendChatAction", chat_id=chat_id, action="typing")
 
 
-def run_agent(cfg, session_id, prompt):
+def trail_line(part):
+    tool = part.get("tool", "?")
+    st = part.get("state") or {}
+    inp = st.get("input") or {}
+    summary = ""
+    for v in inp.values():
+        if isinstance(v, str) and len(v) > len(summary):
+            summary = v
+    summary = summary.replace("\n", " ")[:60]
+    return f"🔧 {tool}: {summary}" if summary else f"🔧 {tool}"
+
+
+def edit_status(cfg, live, final=None):
+    now = time.time()
+    if not final and now - live.get("last_edit", 0) < 8:
+        return
+    live["last_edit"] = now
+    elapsed = int(now - live["start"])
+    if final:
+        text = f"{final} · {elapsed}s · {len(live['trail'])} tool calls"
+    else:
+        trail = "\n".join(live["trail"][-5:])
+        text = f"⚙️ working… {elapsed}s\n{trail}"
+    if live.get("status_id"):
+        api(
+            cfg["bot_token"],
+            "editMessageText",
+            chat_id=live["chat_id"],
+            message_id=live["status_id"],
+            text=text,
+        )
+
+
+def run_agent(cfg, session_id, prompt, live=None):
     cmd = [OPENCODE, "run", "--format", "json"]
     if session_id:
         cmd += ["--session", session_id]
@@ -150,7 +183,10 @@ def run_agent(cfg, session_id, prompt):
         except json.JSONDecodeError:
             continue
         sid = ev.get("sessionID") or sid
-        if ev.get("type") == "text":
+        if ev.get("type") == "tool_use" and live is not None:
+            live["trail"].append(trail_line(ev.get("part") or {}))
+            edit_status(cfg, live)
+        elif ev.get("type") == "text":
             part = ev.get("part") or {}
             if isinstance(part, dict) and part.get("text"):
                 texts.append(part["text"])
@@ -170,6 +206,23 @@ def worker(cfg, state):
         with STATE_LOCK:
             session_id = state.get("sessions", {}).get(str(chat_id))
         react(cfg["bot_token"], chat_id, message_id, "👀")
+        status = api(
+            cfg["bot_token"],
+            "sendMessage",
+            chat_id=chat_id,
+            text="⚙️ working… 0s",
+            reply_parameters=json.dumps({"message_id": message_id}),
+            disable_notification=True,
+        )
+        live = {
+            "chat_id": chat_id,
+            "status_id": (status.get("result") or {}).get("message_id")
+            if status
+            else None,
+            "trail": [],
+            "start": time.time(),
+            "last_edit": 0,
+        }
         stop_typing = threading.Event()
         threading.Thread(
             target=typing_loop,
@@ -178,13 +231,15 @@ def worker(cfg, state):
         ).start()
         log(f"chat={chat_id} run start (session={session_id}, q={PROMPT_Q.qsize()})")
         try:
-            new_sid, answer, err = run_agent(cfg, session_id, prompt)
+            new_sid, answer, err = run_agent(cfg, session_id, prompt, live)
         except Exception as e:
             err = f"bridge error: {e}"
             new_sid, answer = session_id, None
         finally:
             stop_typing.set()
             RUN_STATE["busy"] = False
+        if live["status_id"]:
+            edit_status(cfg, live, final="✅ done" if not err else "🔴 failed")
         with STATE_LOCK:
             if new_sid and new_sid != session_id:
                 state.setdefault("sessions", {})[str(chat_id)] = new_sid
