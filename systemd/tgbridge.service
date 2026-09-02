@@ -1,0 +1,12 @@
+[Unit]
+Description=tgbridge - minimal Telegram bridge for opencode
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/opt/tgbridge/tgbridge.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
