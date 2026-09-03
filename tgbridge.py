@@ -137,13 +137,63 @@ def split_chunks(text, limit=CHUNK):
     return [c for c in chunks if c] or [""]
 
 
+def esc(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def inline_html(line):
+    """One markdown line -> Telegram HTML. Line-local by design: no entity
+    ever spans lines, so per-chunk conversion stays balanced even when a
+    chunk boundary lands mid-paragraph."""
+    s = esc(line)
+    s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+    s = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", s)
+    s = MD_LINK.sub(r'<a href="\2">\1</a>', s)
+    s = re.sub(r"^#{1,6}\s+(.*)", r"<b>\1</b>", s)
+    return s
+
+
+MD_LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+
+
+def md_to_html(md, in_pre=False):
+    """Markdown -> Telegram HTML. Returns (html, in_pre_after) so a fenced
+    block split across chunks stays a valid <pre> in every chunk."""
+    out = ["<pre>"] if in_pre else []
+    for line in md.split("\n"):
+        if line.lstrip().startswith("```"):
+            out.append("</pre>" if in_pre else "<pre>")
+            in_pre = not in_pre
+            continue
+        out.append(esc(line) if in_pre else inline_html(line))
+    if in_pre:
+        out.append("</pre>")
+    return "\n".join(out), in_pre
+
+
 def send(token, chat_id, text, reply_to=None, chunk_limit=CHUNK):
+    """Send markdown text rendered as Telegram HTML; any chunk Telegram
+    refuses (bad entity, overlong tag) falls back to plain text so a
+    formatting bug can never drop the payload."""
     ok = True
+    in_pre = False
     for i, chunk in enumerate(split_chunks(text, chunk_limit)):
-        params = {"chat_id": chat_id, "text": chunk}
+        html, in_pre = md_to_html(chunk, in_pre)
+        params = {
+            "chat_id": chat_id,
+            "text": html,
+            "parse_mode": "HTML",
+            "link_preview_options": json.dumps({"is_disabled": True}),
+        }
         if i == 0 and reply_to:
             params["reply_parameters"] = json.dumps({"message_id": reply_to})
         res = api(token, "sendMessage", **params)
+        if not res or not res.get("ok"):
+            log("html send failed — resending chunk as plain text")
+            params.pop("parse_mode", None)
+            params.pop("link_preview_options", None)
+            params["text"] = chunk
+            res = api(token, "sendMessage", **params)
         if not res or not res.get("ok"):
             ok = False
     return ok
@@ -604,6 +654,50 @@ def selftest():
     if parts[0] != "x" or len(parts) < 2:
         fails.append("chunk boundary")
 
+    # markdown -> telegram HTML
+    h, pre = md_to_html("code `<b>&</b>` and **bold** [t](http://x/y)")
+    if (
+        h
+        != (
+            "code <code>&lt;b&gt;&amp;&lt;/b&gt;</code> and <b>bold</b> "
+            '<a href="http://x/y">t</a>'
+        )
+        or pre
+    ):
+        fails.append("md inline")
+    h, pre = md_to_html("a\n```py\nx < y\n```\nb")
+    if pre or h != "a\n<pre>\nx &lt; y\n</pre>\nb":
+        fails.append("md fence")
+    # fence split across chunks stays balanced per chunk
+    h1, pre1 = md_to_html("intro\n```py\nprint(1)")
+    h2, pre2 = md_to_html("print(2)\n```", in_pre=pre1)
+    if (
+        pre1 is not True
+        or pre2 is not False
+        or "</pre>" not in h1
+        or h2.count("<pre>") != 1
+    ):
+        fails.append("md fence continuation")
+
+    # send(): HTML refused -> plain-text fallback, never lost
+    sent = []
+
+    def fake_api(token, method, **params):
+        sent.append(params)
+        if params.get("parse_mode") == "HTML" and "<b>" in params["text"]:
+            return None  # simulate Telegram rejecting the entity
+        return {"ok": True}
+
+    orig_api = api
+    globals()["api"] = fake_api
+    try:
+        if not send("t", 1, "hi **there**"):
+            fails.append("send fallback ok")
+    finally:
+        globals()["api"] = orig_api
+    if len(sent) != 2 or "parse_mode" in sent[1] or sent[1]["text"] != "hi **there**":
+        fails.append("send fallback shape")
+
     # every runner builds a cmd and parses a synthetic event
     for name, fn in RUNNERS.items():
         try:
@@ -803,9 +897,10 @@ def worker(cfg, state):
                 outbox = outbox_dir(cfg)
                 for fn in sorted(os.listdir(outbox)):
                     p = os.path.join(outbox, fn)
-                    if os.path.isfile(p):
-                        send_document(cfg["bot_token"], chat_id, p)
-                        os.remove(p)
+                    if os.path.isfile(p) and chat_id is not None:
+                        res = send_document(cfg["bot_token"], chat_id, p)
+                        if res and res.get("ok"):
+                            os.remove(p)  # keep the file if delivery failed
             except FileNotFoundError:
                 pass
             except Exception as e:
