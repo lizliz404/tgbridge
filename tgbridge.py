@@ -37,7 +37,7 @@ CHUNK = 3900
 PROMPT_Q = queue.Queue()
 STATE_LOCK = threading.Lock()
 AUDIT_LOCK = threading.Lock()
-RUN_STATE = {"busy": False}
+RUN_STATE: dict = {"busy": False, "current": None}
 
 
 def log(msg):
@@ -133,11 +133,15 @@ def split_chunks(text, limit=CHUNK):
 
 
 def send(token, chat_id, text, reply_to=None):
+    ok = True
     for i, chunk in enumerate(split_chunks(text)):
         params = {"chat_id": chat_id, "text": chunk}
         if i == 0 and reply_to:
             params["reply_parameters"] = json.dumps({"message_id": reply_to})
-        api(token, "sendMessage", **params)
+        res = api(token, "sendMessage", **params)
+        if not res or not res.get("ok"):
+            ok = False
+    return ok
 
 
 def typing_loop(token, chat_id, stop_event):
@@ -164,10 +168,16 @@ def edit_status(cfg, live, final=None):
     live["last_edit"] = now
     elapsed = int(now - live["start"])
     if final:
-        text = f"{final} · {elapsed}s · {len(live['trail'])} tool calls"
+        extra = ""
+        if live.get("cost"):
+            extra += f" · {live['tokens'] or 0} tok · ${live['cost']:.4f}"
+        text = f"{final} · {elapsed}s · {len(live['trail'])} tool calls{extra}"
     else:
         trail = "\n".join(live["trail"][-5:])
         text = f"⚙️ working… {elapsed}s\n{trail}"
+        thinking = (live.get("thinking") or "").strip().replace("\n", " ")
+        if thinking:
+            text += f"\n💭 …{thinking[-200:]}"
         preview = (live.get("preview") or "").strip().replace("\n", " ")
         if preview:
             text += f"\n💬 …{preview[-200:]}"
@@ -190,6 +200,8 @@ def run_agent(cfg, session_id, prompt, live=None):
     cmd = [OPENCODE, "run", "--format", "json"]
     if session_id:
         cmd += ["--session", session_id]
+    else:
+        cmd += ["--title", time.strftime("tg %Y%m%d-%H%M")]
     cmd.append(prompt)
     proc = subprocess.Popen(
         cmd,
@@ -220,20 +232,37 @@ def run_agent(cfg, session_id, prompt, live=None):
             except json.JSONDecodeError:
                 continue
             sid = ev.get("sessionID") or sid
+            part = ev.get("part") or {}
             if ev.get("type") == "tool_use" and live is not None:
-                live["trail"].append(trail_line(ev.get("part") or {}))
+                live["trail"].append(trail_line(part if isinstance(part, dict) else {}))
                 edit_status(cfg, live)
             elif ev.get("type") == "text":
-                part = ev.get("part") or {}
                 if isinstance(part, dict) and part.get("text"):
                     texts.append(part["text"])
                     if live is not None:
                         live["preview"] = part["text"]
                         edit_status(cfg, live)
+            elif ev.get("type") == "reasoning" and live is not None:
+                if isinstance(part, dict) and part.get("text"):
+                    live["thinking"] = part["text"]
+                    edit_status(cfg, live)
+            elif ev.get("type") == "step_finish" and live is not None:
+                if isinstance(part, dict):
+                    live["cost"] = live.get("cost", 0.0) + (part.get("cost") or 0.0)
+                    live["tokens"] = (part.get("tokens") or {}).get("total")
         proc.wait()
     finally:
         killer.cancel()
     if timed_out:
+        partial = "\n".join(texts).strip()
+        if partial:
+            return (
+                sid,
+                partial
+                + "\n\n⚠️ (partial answer — hit the %ss timeout and was killed)"
+                % RUN_TIMEOUT_S,
+                None,
+            )
         return sid, None, "agent timed out after %ss and was killed" % RUN_TIMEOUT_S
     if proc.returncode != 0:
         tail = (errbuf[0] if errbuf else "").strip()[-600:]
@@ -312,10 +341,30 @@ def transcribe(cfg, token, file_id):
 def worker(cfg, state):
     """Serial agent-run consumer; poll loop stays live for commands."""
     while True:
-        chat_id, message_id, prompt = PROMPT_Q.get()
+        entry = PROMPT_Q.get()
+        chat_id, message_id, prompt = (
+            entry["chat_id"],
+            entry["message_id"],
+            entry["prompt"],
+        )
         RUN_STATE["busy"] = True
+        RUN_STATE["current"] = {
+            "chat": chat_id,
+            "since": time.time(),
+            "prompt": prompt[:60],
+        }
         with STATE_LOCK:
             session_id = state.get("sessions", {}).get(str(chat_id))
+            pending = state.get("pending", [])
+            for i, e in enumerate(pending):
+                if e.get("message_id") == message_id and e.get("chat_id") == chat_id:
+                    del pending[i]
+                    break
+        outbox = os.path.join(cfg["workdir"], ".tgbridge-outbox")
+        prompt = prompt + (
+            f"\n\n(To give files to the user, write them into {outbox}/ "
+            "— they are delivered automatically after this run.)"
+        )
         audit("run_start", chat_id=chat_id, chars=len(prompt), session=session_id)
         react(cfg["bot_token"], chat_id, message_id, "👀")
         status = api(
@@ -334,7 +383,12 @@ def worker(cfg, state):
             "trail": [],
             "start": time.time(),
             "last_edit": 0,
+            "cost": 0.0,
+            "tokens": None,
         }
+        with STATE_LOCK:
+            state["running"] = dict(entry, status_id=live["status_id"])
+            save_json(STATE_PATH, state)
         stop_typing = threading.Event()
         threading.Thread(
             target=typing_loop,
@@ -350,6 +404,7 @@ def worker(cfg, state):
         finally:
             stop_typing.set()
             RUN_STATE["busy"] = False
+            RUN_STATE["current"] = None
         if err and session_id and "opencode failed" in err:
             live["trail"].append("♻️ stale session — retrying fresh")
             new_sid, answer, err = run_agent(cfg, None, prompt, live)
@@ -361,7 +416,7 @@ def worker(cfg, state):
             save_json(STATE_PATH, state)
         if err:
             audit("run_error", chat_id=chat_id, err=err[:200])
-            react(cfg["bot_token"], chat_id, message_id, "🔴")
+            react(cfg["bot_token"], chat_id, message_id, "👎")
             send(cfg["bot_token"], chat_id, f"⚠️ {err}")
             log(f"chat={chat_id} error: {err[:120]}")
         else:
@@ -371,9 +426,17 @@ def worker(cfg, state):
                 chars=len(answer or ""),
                 secs=int(time.time() - live["start"]),
             )
-            react(cfg["bot_token"], chat_id, message_id, "✅")
+            react(cfg["bot_token"], chat_id, message_id, "👍")
             send(cfg["bot_token"], chat_id, answer or "", reply_to=message_id)
             log(f"chat={chat_id} done ({len(answer or '')} chars, session={new_sid})")
+        try:
+            for fn in sorted(os.listdir(outbox)):
+                p = os.path.join(outbox, fn)
+                if os.path.isfile(p):
+                    send_document(cfg["bot_token"], chat_id, p)
+                    os.remove(p)
+        except FileNotFoundError:
+            pass
         PROMPT_Q.task_done()
 
 
@@ -398,6 +461,58 @@ def rearm_at(cfg, state):
         t = threading.Timer(max(d - time.time(), 1), fire_at, args=(cfg, state, d))
         t.daemon = True
         t.start()
+
+
+def save_document(cfg, msg):
+    doc = msg.get("document") or {}
+    fid = doc.get("file_id")
+    if not fid:
+        return None
+    name = os.path.basename(doc.get("file_name") or "file") or "file"
+    r = api(cfg["bot_token"], "getFile", file_id=fid)
+    fp = (r or {}).get("result", {}).get("file_path")
+    if not fp:
+        return None
+    inbox = os.path.expanduser("~/.config/tgbridge/inbox")
+    os.makedirs(inbox, exist_ok=True)
+    dest = os.path.join(inbox, time.strftime("%Y%m%d-%H%M%S") + "-" + name)
+    url = f"https://api.telegram.org/file/bot{cfg['bot_token']}/{fp}"
+    try:
+        urllib.request.urlretrieve(url, dest)
+    except Exception as e:
+        log(f"download {name}: {e}")
+        return None
+    log(f"attachment saved: {dest}")
+    return dest
+
+
+def send_document(token, chat_id, path):
+    boundary = "----tgbridge" + str(int(time.time() * 1000))
+    fn = os.path.basename(path)
+    with open(path, "rb") as f:
+        data = f.read()
+    body = (
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="chat_id"\r\n\r\n{chat_id}\r\n'
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="document"; filename="{fn}"\r\n'
+            f"Content-Type: application/octet-stream\r\n\r\n"
+        ).encode()
+        + data
+        + f"\r\n--{boundary}--\r\n".encode()
+    )
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendDocument",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return json.load(r)
+    except Exception as e:
+        log(f"send_document {fn}: {e}")
+        return None
 
 
 def botcmd(text):
@@ -441,6 +556,11 @@ def handle_update(cfg, state, upd):
             return
         text = text.replace(f"@{bot_username}", "").strip()
 
+    if msg.get("document"):
+        doc_path = save_document(cfg, msg)
+        if doc_path:
+            text = (text + f"\n[attachment saved: {doc_path}]").strip()
+
     cmd, rest = botcmd(text)
     if cmd == "/new":
         with STATE_LOCK:
@@ -454,11 +574,15 @@ def handle_update(cfg, state, upd):
             pending = sum(
                 1 for e in state.get("at", {}).values() if e.get("chat_id") == chat_id
             )
+        cur = ""
+        if RUN_STATE.get("current"):
+            c = RUN_STATE["current"]
+            cur = f"\nrunning: {c['prompt']}… ({int(time.time() - c['since'])}s)"
         send(
             cfg["bot_token"],
             chat_id,
             f"chat {chat_id}\nsession: {info}\ncwd: {cfg['workdir']}\n"
-            f"queued: {PROMPT_Q.qsize()}\nscheduled: {pending}",
+            f"queued: {PROMPT_Q.qsize()}\nscheduled: {pending}{cur}",
         )
         return
     if cmd == "/at":
@@ -501,7 +625,7 @@ def handle_update(cfg, state, upd):
             return
         text, err = transcribe(cfg, cfg["bot_token"], msg["voice"].get("file_id"))
         if err:
-            react(cfg["bot_token"], chat_id, message_id, "🔴")
+            react(cfg["bot_token"], chat_id, message_id, "👎")
             send(cfg["bot_token"], chat_id, f"⚠️ {err}")
             return
         audit("voice", chat_id=chat_id, chars=len(text or ""))
