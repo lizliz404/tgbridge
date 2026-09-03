@@ -42,6 +42,8 @@ OPENCODE = os.environ.get(
 )
 OPENCODE_SERVER = os.environ.get("OPENCODE_SERVER", "http://localhost:4096")
 RUN_TIMEOUT_S = 900
+SERVER_POLL_S = 0.5
+SERVER_QUIET_S = 0.75
 CHUNK = 3900
 CANCEL_MSG = "🛑 cancelled by user"
 CODEX_YOLO_FLAG = "--dangerously-bypass-approvals-and-sandbox"
@@ -49,13 +51,19 @@ CODEX_YOLO_FLAG = "--dangerously-bypass-approvals-and-sandbox"
 PROMPT_Q = queue.Queue()
 STATE_LOCK = threading.Lock()
 AUDIT_LOCK = threading.Lock()
+RUN_LOCK = threading.Lock()
 RUN_STATE: dict = {
     "busy": False,
     "current": None,
     "proc": None,
     "cancel": False,
     "server_sid": None,
+    "server_directory": None,
+    "server_url": None,
+    "server_run_id": 0,
+    "steer_count": 0,
     "steer_pending": 0,
+    "steer_errors": [],
 }
 
 
@@ -620,6 +628,7 @@ def _bin(env_key, name):
 
 
 RUNNERS = {}
+SERVER_RUNNERS = {}
 
 
 def runner(name):
@@ -846,14 +855,16 @@ def run_agent(cfg, session_id, prompt, live=None):
     return sid, "\n".join(acc["texts"]).strip(), None
 
 
-def _server_call(method, path, body=None, timeout=15):
-    """JSON call to the local opencode server; returns parsed body or None.
-
-    POST /session/{id}/message blocks until that message's turn completes, so
-    callers that must not block (steering, prompt firing) wrap it in a thread."""
+def _server_call(
+    method, path, body=None, timeout=15, directory=None, base_url=None
+):
+    """JSON call to the local OpenCode server; returns parsed body or None."""
+    if directory:
+        separator = "&" if "?" in path else "?"
+        path += separator + urllib.parse.urlencode({"directory": directory})
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
-        OPENCODE_SERVER + path,
+        (base_url or OPENCODE_SERVER).rstrip("/") + path,
         data=data,
         method=method,
         headers={"Content-Type": "application/json"} if data else {},
@@ -863,20 +874,33 @@ def _server_call(method, path, body=None, timeout=15):
     return json.loads(raw) if raw.strip() else None
 
 
-def server_ok():
+def runner_mode(cfg):
+    """Explicit transport mode with compatibility for the WIP boolean key."""
+    mode = cfg.get("runner_mode")
+    if mode is None:
+        return "server" if cfg.get("server_runner") else "cli"
+    return str(mode).lower()
+
+
+def server_url(cfg):
+    return str(cfg.get("server_url") or OPENCODE_SERVER).rstrip("/")
+
+
+def server_ok(cfg=None):
     try:
-        with urllib.request.urlopen(
-            OPENCODE_SERVER + "/api/session/active", timeout=2
-        ) as r:
-            return r.getcode() == 200
-    except OSError:
+        health = _server_call(
+            "GET",
+            "/global/health",
+            timeout=2,
+            base_url=server_url(cfg or {}),
+        )
+        return bool((health or {}).get("healthy"))
+    except Exception:
         return False
 
 
 def server_event(ev, acc, seen):
-    """Fold one /api/event object into the accumulator; parts arrive as full
-    snapshots keyed by part id (text replaces its previous revision). Returns
-    a trail line on first sighting of a tool part, else None."""
+    """Fold one server part snapshot, replacing text revisions by part id."""
     data = ev.get("data") or {}
     if ev.get("type") != "message.part.updated":
         return None
@@ -902,26 +926,78 @@ def server_event(ev, acc, seen):
     return None
 
 
+def server_messages(messages, baseline, acc, seen):
+    """Fold authoritative GET /session/{id}/message snapshots.
+
+    Only assistant messages created after the pre-prompt baseline belong to
+    this bridge run. Returns (new trail lines, relevant assistant infos).
+    """
+    trails = []
+    infos = []
+    for message in messages or []:
+        info = message.get("info") or {}
+        mid = info.get("id")
+        if not mid or mid in baseline or info.get("role") != "assistant":
+            continue
+        infos.append(info)
+        error_ids = acc.setdefault("error_ids", set())
+        if info.get("error") and mid not in error_ids:
+            acc.setdefault("errors", []).append(info["error"])
+            error_ids.add(mid)
+        for part in message.get("parts") or []:
+            trail = server_event(
+                {"type": "message.part.updated", "data": {"part": part}},
+                acc,
+                seen,
+            )
+            if trail:
+                trails.append(trail)
+    return trails, infos
+
+
+def _server_poll_interval(cfg):
+    try:
+        return min(5.0, max(0.1, float(cfg.get("server_poll_s", SERVER_POLL_S))))
+    except (TypeError, ValueError):
+        return SERVER_POLL_S
+
+
+def _begin_steer(chat_id):
+    """Atomically reserve a steer delivery for a same-chat server run."""
+    with RUN_LOCK:
+        cur = RUN_STATE.get("current")
+        sid = RUN_STATE.get("server_sid")
+        if not (RUN_STATE.get("busy") and sid and cur and cur.get("chat") == chat_id):
+            return None
+        RUN_STATE["steer_pending"] = RUN_STATE.get("steer_pending", 0) + 1
+        return (
+            sid,
+            RUN_STATE.get("server_run_id", 0),
+            RUN_STATE.get("server_directory"),
+            RUN_STATE.get("server_url"),
+        )
+
+
 def should_steer(chat_id):
     """A same-chat message arriving during a server-mode run becomes live
     steering instead of a queued follow-up run."""
-    cur = RUN_STATE.get("current")
-    return bool(
-        RUN_STATE.get("busy")
-        and RUN_STATE.get("server_sid")
-        and cur
-        and cur.get("chat") == chat_id
-    )
+    with RUN_LOCK:
+        cur = RUN_STATE.get("current")
+        return bool(
+            RUN_STATE.get("busy")
+            and RUN_STATE.get("server_sid")
+            and cur
+            and cur.get("chat") == chat_id
+        )
 
 
-def _steer_deliver(sid, text):
-    """POST a steering message; counters were raised at receipt, so a failed
-    delivery rolls them back — the run may otherwise wait for a turn that
-    never comes."""
+def _steer_deliver(sid, run_id, directory, base_url, text):
+    """Submit one non-blocking prompt and publish its delivery atomically."""
+    err = None
     try:
         _server_call(
             "POST",
-            f"/session/{sid}/message",
+            f"/session/{sid}/prompt_async",
             {
                 "parts": [
                     {
@@ -931,108 +1007,222 @@ def _steer_deliver(sid, text):
                     }
                 ]
             },
+            timeout=5,
+            directory=directory,
+            base_url=base_url,
         )
+        audit("steer_delivered", session=sid, chars=len(text))
     except Exception as e:
-        RUN_STATE["steer_count"] = max(0, RUN_STATE.get("steer_count", 1) - 1)
+        err = str(e)
+        audit("steer_error", session=sid, err=err[:200])
         log(f"steer deliver: {e}")
     finally:
-        RUN_STATE["steer_pending"] = max(0, RUN_STATE.get("steer_pending", 1) - 1)
+        with RUN_LOCK:
+            if (
+                RUN_STATE.get("server_sid") == sid
+                and RUN_STATE.get("server_run_id") == run_id
+                and RUN_STATE.get("server_directory") == directory
+                and RUN_STATE.get("server_url") == base_url
+            ):
+                if err:
+                    RUN_STATE.setdefault("steer_errors", []).append(err)
+                else:
+                    RUN_STATE["steer_count"] = RUN_STATE.get("steer_count", 0) + 1
+                RUN_STATE["steer_pending"] = max(
+                    0, RUN_STATE.get("steer_pending", 1) - 1
+                )
 
 
 def run_agent_server(cfg, session_id, prompt, live=None):
-    """Server-mode run: POST the prompt to a live opencode session and stream
-    /api/event until quiescent. The message POST blocks until its turn ends,
-    so it fires on a side thread; the worker thread streams events. Steering
-    messages posted mid-run are queued server-side and consumed at the next
-    gap — the run ends only when a turn completes with no steer following it."""
+    """Run through OpenCode's local server with poll-based live steering.
+
+    `/prompt_async` makes both the initial message and later steers non-blocking.
+    `/session/{id}/message` is the authoritative transcript; `/session/status`
+    supplies the busy/idle boundary (idle sessions are omitted by OpenCode
+    1.1.12). A quiet grace prevents a just-arriving steer from being split into
+    a second Telegram run.
+    """
+    sid = session_id
+    timed_out = False
+    cancelled = False
+    directory = cfg["workdir"]
+    base_url = server_url(cfg)
+    acc = {"parts": {}, "order": [], "thinking": None, "errors": []}
+    seen = set()
     try:
         if session_id:
             sid = session_id
         else:
             created = _server_call(
-                "POST", "/session", {"title": time.strftime("tg %Y%m%d-%H%M")}
+                "POST",
+                "/session",
+                {"title": time.strftime("tg %Y%m%d-%H%M")},
+                directory=directory,
+                base_url=base_url,
             )
             sid = (created or {}).get("id")
             if not sid:
                 return session_id, None, "server: could not create session"
+        before = (
+            _server_call(
+                "GET",
+                f"/session/{sid}/message",
+                timeout=5,
+                directory=directory,
+                base_url=base_url,
+            )
+            or []
+        )
+        baseline = {
+            (message.get("info") or {}).get("id")
+            for message in before
+            if (message.get("info") or {}).get("id")
+        }
         body: dict = {"parts": [{"type": "text", "text": prompt}]}
         model = cfg.get("model")
         if model and "/" in model:
             prov, _, mid = model.partition("/")
             body["model"] = {"providerID": prov, "modelID": mid}
-        RUN_STATE["server_sid"] = sid
-        RUN_STATE["steer_count"] = 0
-        RUN_STATE["steer_pending"] = 0
-        RUN_STATE["current"]["session"] = sid
-        threading.Thread(
-            target=_server_call,
-            args=("POST", f"/session/{sid}/message", body),
-            daemon=True,
-        ).start()
-        timeout_s = run_timeout(cfg)
-        timed_out = []
-        killer = threading.Timer(
-            timeout_s,
-            lambda: _server_call("POST", f"/session/{sid}/interrupt"),
+        _server_call(
+            "POST",
+            f"/session/{sid}/prompt_async",
+            body,
+            timeout=5,
+            directory=directory,
+            base_url=base_url,
         )
-        killer.daemon = True
-        killer.start()
-        acc = {"parts": {}, "order": [], "thinking": None}
-        seen = set()
-        last_seen = 0
-        try:
-            with urllib.request.urlopen(
-                OPENCODE_SERVER + "/api/event", timeout=120
-            ) as stream:
-                for raw in stream:
-                    line = raw.decode("utf-8", "replace").strip()
-                    if not line.startswith("data: "):
-                        continue
-                    try:
-                        ev = json.loads(line[6:])
-                    except json.JSONDecodeError:
-                        continue
-                    if RUN_STATE.get("cancel"):
-                        break
-                    if (ev.get("data") or {}).get("sessionID") != sid:
-                        continue
-                    if ev.get("type") == "message.updated":
-                        info = (ev.get("data") or {}).get("info") or {}
-                        if info.get("role") == "assistant" and (
-                            info.get("time") or {}
-                        ).get("completed"):
-                            if (
-                                RUN_STATE["steer_pending"] == 0
-                                and RUN_STATE["steer_count"] == last_seen
-                            ):
-                                time.sleep(0.75)  # grace: a steer may be in flight
-                                if (
-                                    RUN_STATE["steer_pending"] == 0
-                                    and RUN_STATE["steer_count"] == last_seen
-                                ):
-                                    break  # turn done, nothing steered: quiescent
-                            last_seen = RUN_STATE["steer_count"]
-                    trail = server_event(ev, acc, seen)
-                    if live is not None:
-                        if trail:
-                            live["trail"].append(trail)
-                            edit_status(cfg, live)
-                        if acc["thinking"]:
-                            live["thinking"] = acc["thinking"]
-                            edit_status(cfg, live)
-                        if acc["order"]:
-                            last = acc["parts"].get(acc["order"][-1])
-                            if last:
-                                live["preview"] = last
-                                edit_status(cfg, live)
-        finally:
-            killer.cancel()
-            RUN_STATE["server_sid"] = None
+        with RUN_LOCK:
+            RUN_STATE["server_run_id"] = RUN_STATE.get("server_run_id", 0) + 1
+            run_id = RUN_STATE["server_run_id"]
+            RUN_STATE["server_sid"] = sid
+            RUN_STATE["server_directory"] = directory
+            RUN_STATE["server_url"] = base_url
+            RUN_STATE["steer_count"] = 0
             RUN_STATE["steer_pending"] = 0
+            RUN_STATE["steer_errors"] = []
+            RUN_STATE["cancel"] = False
+            if RUN_STATE.get("current"):
+                RUN_STATE["current"]["session"] = sid
+        timeout_s = run_timeout(cfg)
+        deadline = time.monotonic() + timeout_s
+        poll_s = _server_poll_interval(cfg)
+        quiet_s = max(SERVER_QUIET_S, poll_s)
+        while True:
+            with RUN_LOCK:
+                cancelled = bool(RUN_STATE.get("cancel"))
+            if cancelled:
+                try:
+                    _server_call(
+                        "POST",
+                        f"/session/{sid}/abort",
+                        timeout=5,
+                        directory=directory,
+                        base_url=base_url,
+                    )
+                except Exception as e:
+                    log(f"server abort: {e}")
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                try:
+                    _server_call(
+                        "POST",
+                        f"/session/{sid}/abort",
+                        timeout=5,
+                        directory=directory,
+                        base_url=base_url,
+                    )
+                except Exception as e:
+                    log(f"server timeout abort: {e}")
+                break
+
+            messages = _server_call(
+                "GET",
+                f"/session/{sid}/message",
+                timeout=5,
+                directory=directory,
+                base_url=base_url,
+            ) or []
+            trails, infos = server_messages(messages, baseline, acc, seen)
+            if live is not None:
+                if trails:
+                    live["trail"].extend(trails)
+                    edit_status(cfg, live)
+                if acc["thinking"]:
+                    live["thinking"] = acc["thinking"]
+                    edit_status(cfg, live)
+                if acc["order"]:
+                    last = acc["parts"].get(acc["order"][-1])
+                    if last:
+                        live["preview"] = last
+                        edit_status(cfg, live)
+
+            statuses = (
+                _server_call(
+                    "GET",
+                    "/session/status",
+                    timeout=5,
+                    directory=directory,
+                    base_url=base_url,
+                )
+                or {}
+            )
+            active = statuses.get(sid)
+            busy = bool(active and active.get("type") != "idle")
+            completed = bool(infos) and all(
+                (info.get("time") or {}).get("completed") or info.get("error")
+                for info in infos
+            )
+            with RUN_LOCK:
+                pending = RUN_STATE.get("steer_pending", 0)
+                generation = RUN_STATE.get("steer_count", 0)
+            if not busy and completed and pending == 0:
+                time.sleep(quiet_s)
+                with RUN_LOCK:
+                    stable = (
+                        RUN_STATE.get("steer_pending", 0) == 0
+                        and RUN_STATE.get("steer_count", 0) == generation
+                        and not RUN_STATE.get("cancel")
+                    )
+                if stable:
+                    # One final read captures the last text snapshot after idle.
+                    messages = _server_call(
+                        "GET",
+                        f"/session/{sid}/message",
+                        timeout=5,
+                        directory=directory,
+                        base_url=base_url,
+                    ) or []
+                    trails, _ = server_messages(messages, baseline, acc, seen)
+                    if live is not None and trails:
+                        live["trail"].extend(trails)
+                    break
+            time.sleep(poll_s)
+
+        # Abort can race the last model write; retain whatever was persisted.
+        try:
+            messages = _server_call(
+                "GET",
+                f"/session/{sid}/message",
+                timeout=5,
+                directory=directory,
+                base_url=base_url,
+            ) or []
+            server_messages(messages, baseline, acc, seen)
+        except Exception as e:
+            log(f"server final transcript: {e}")
+
+        with RUN_LOCK:
+            steer_errors = list(RUN_STATE.get("steer_errors") or [])
+            RUN_STATE["server_sid"] = None
+            RUN_STATE["server_directory"] = None
+            RUN_STATE["server_url"] = None
+            RUN_STATE["steer_pending"] = 0
+            RUN_STATE["steer_errors"] = []
+            cancelled = bool(RUN_STATE.pop("cancel", False)) or cancelled
         answer = "\n\n".join(
             acc["parts"][pid] for pid in acc["order"] if acc["parts"].get(pid)
         ).strip()
-        cancelled = RUN_STATE.pop("cancel", False)
         if timed_out and answer:
             return (
                 sid,
@@ -1045,11 +1235,41 @@ def run_agent_server(cfg, session_id, prompt, live=None):
             return sid, answer + "\n\n🛑 (cancelled — partial answer)", None
         if cancelled:
             return sid, None, CANCEL_MSG
+        if steer_errors:
+            detail = steer_errors[-1][-300:]
+            if answer:
+                return (
+                    sid,
+                    answer + "\n\n⚠️ (a mid-run steering message failed to deliver)",
+                    None,
+                )
+            return sid, None, f"steering delivery failed: {detail}"
+        if acc["errors"]:
+            detail = json.dumps(acc["errors"][-1], ensure_ascii=False)[-500:]
+            if answer:
+                return sid, answer + "\n\n⚠️ (agent turn ended with an error)", None
+            return sid, None, f"server agent error: {detail}"
         if not answer:
             return sid, None, "agent returned no text"
         return sid, answer, None
     except Exception as e:
-        return session_id, None, f"server runner error: {e}"
+        return sid, None, f"server runner error: {e}"
+    finally:
+        with RUN_LOCK:
+            if RUN_STATE.get("server_sid") == sid:
+                RUN_STATE["server_sid"] = None
+                RUN_STATE["server_directory"] = None
+                RUN_STATE["server_url"] = None
+                RUN_STATE["steer_pending"] = 0
+                RUN_STATE["steer_errors"] = []
+                RUN_STATE.pop("cancel", None)
+
+
+SERVER_RUNNERS["opencode"] = {
+    "run": run_agent_server,
+    "healthy": server_ok,
+    "feature": "mid-run steering",
+}
 
 
 def multipart(fields, file_field, filename, data, ctype):
@@ -1507,15 +1727,83 @@ def selftest():
     if server_event({"type": "session.updated", "data": {}}, acc, seen) is not None:
         fails.append("server ignore other events")
 
+    # Poll snapshots exclude prior turns, preserve new message/part order, and
+    # surface assistant completion metadata for the quiescence check.
+    poll_acc = {"parts": {}, "order": [], "thinking": None, "errors": []}
+    poll_seen = set()
+    trails, infos = server_messages(
+        [
+            {
+                "info": {"id": "old", "role": "assistant", "time": {}},
+                "parts": [{"id": "oldp", "type": "text", "text": "ignore"}],
+            },
+            {
+                "info": {
+                    "id": "new",
+                    "role": "assistant",
+                    "time": {"completed": 123},
+                },
+                "parts": [
+                    {
+                        "id": "tool",
+                        "type": "tool",
+                        "tool": "bash",
+                        "state": {"input": {"command": "pwd"}},
+                    },
+                    {"id": "text", "type": "text", "text": "new answer"},
+                ],
+            },
+        ],
+        {"old"},
+        poll_acc,
+        poll_seen,
+    )
+    if (
+        trails != ["🔧 bash: pwd"]
+        or [i.get("id") for i in infos] != ["new"]
+        or poll_acc["order"] != ["text"]
+        or poll_acc["parts"].get("text") != "new answer"
+    ):
+        fails.append("server message polling")
+    if _server_poll_interval({"server_poll_s": 0}) != 0.1:
+        fails.append("server poll minimum")
+    if _server_poll_interval({"server_poll_s": "bad"}) != SERVER_POLL_S:
+        fails.append("server poll fallback")
+    if (
+        runner_mode({}) != "cli"
+        or runner_mode({"server_runner": True}) != "server"
+        or runner_mode({"server_runner": True, "runner_mode": "cli"}) != "cli"
+        or "opencode" not in SERVER_RUNNERS
+    ):
+        fails.append("runner transport config")
+
     # steering route: only a same-chat message during a server-mode run steers
-    RUN_STATE["busy"] = True
-    RUN_STATE["server_sid"] = "s9"
-    RUN_STATE["current"] = {"chat": 7}
+    with RUN_LOCK:
+        RUN_STATE["busy"] = True
+        RUN_STATE["server_sid"] = "s9"
+        RUN_STATE["server_directory"] = "/tmp/project"
+        RUN_STATE["server_url"] = "http://127.0.0.1:4096"
+        RUN_STATE["server_run_id"] = 4
+        RUN_STATE["steer_pending"] = 0
+        RUN_STATE["current"] = {"chat": 7}
     if not should_steer(7) or should_steer(8) or should_steer(11):
         fails.append("steer route")
-    RUN_STATE["busy"] = False
-    RUN_STATE["server_sid"] = None
-    RUN_STATE["current"] = None
+    if _begin_steer(7) != (
+        "s9",
+        4,
+        "/tmp/project",
+        "http://127.0.0.1:4096",
+    ):
+        fails.append("steer reservation")
+    with RUN_LOCK:
+        if RUN_STATE["steer_pending"] != 1:
+            fails.append("steer pending")
+        RUN_STATE["busy"] = False
+        RUN_STATE["server_sid"] = None
+        RUN_STATE["server_directory"] = None
+        RUN_STATE["server_url"] = None
+        RUN_STATE["steer_pending"] = 0
+        RUN_STATE["current"] = None
     if should_steer(7):
         fails.append("steer route idle")
     # An allowed group member can prompt. Human group messages are captured by
@@ -1597,20 +1885,30 @@ def worker(cfg, state):
         chat_id = message_id = prompt = None
         try:
             chat_id, message_id, prompt = unpack_entry(entry)
-            RUN_STATE["busy"] = True
-            RUN_STATE["current"] = {
-                "chat": chat_id,
-                "since": time.time(),
-                "prompt": prompt[:60],
-            }
+            with RUN_LOCK:
+                RUN_STATE["busy"] = True
+                RUN_STATE["current"] = {
+                    "chat": chat_id,
+                    "since": time.time(),
+                    "prompt": prompt[:60],
+                }
             with STATE_LOCK:
                 session_id = state.get("sessions", {}).get(str(chat_id))
+            rname = cfg.get("runner", "opencode")
+            mode = runner_mode(cfg)
             outbox = outbox_dir(cfg)
             prompt = prompt + (
                 f"\n\n(To give files to the user, write them into {outbox}/ "
                 "— they are delivered automatically after this run.)"
             )
-            audit("run_start", chat_id=chat_id, chars=len(prompt), session=session_id)
+            audit(
+                "run_start",
+                chat_id=chat_id,
+                chars=len(prompt),
+                session=session_id,
+                runner=rname,
+                mode=mode,
+            )
             react(cfg, chat_id, message_id, "👀")
             status = api(
                 cfg["bot_token"],
@@ -1636,29 +1934,46 @@ def worker(cfg, state):
                 daemon=True,
             ).start()
             log(
-                f"chat={chat_id} run start (session={session_id}, q={PROMPT_Q.qsize()})"
+                f"chat={chat_id} run start (runner={rname}/{mode}, "
+                f"session={session_id}, q={PROMPT_Q.qsize()})"
             )
             try:
-                # server_runner is opt-in WIP: steering works end-to-end but the
-                # server's event stream does not deliver assistant events yet
-                # (see issue #3) — until solved, quiescence detection hangs.
-                if (
-                    cfg.get("server_runner")
-                    and server_ok()
-                    and cfg.get("runner", "opencode") == "opencode"
-                ):
-                    new_sid, answer, err = run_agent_server(
-                        cfg, session_id, prompt, live
-                    )
-                else:
+                if mode == "server":
+                    adapter = SERVER_RUNNERS.get(rname)
+                    if not adapter:
+                        new_sid, answer, err = (
+                            session_id,
+                            None,
+                            f"runner {rname!r} has no server transport; "
+                            "use runner_mode='cli'",
+                        )
+                    elif not adapter["healthy"](cfg):
+                        new_sid, answer, err = (
+                            session_id,
+                            None,
+                            f"{rname} server unavailable at {server_url(cfg)}; "
+                            "start its local server or use runner_mode='cli'",
+                        )
+                    else:
+                        new_sid, answer, err = adapter["run"](
+                            cfg, session_id, prompt, live
+                        )
+                elif mode == "cli":
                     new_sid, answer, err = run_agent(cfg, session_id, prompt, live)
+                else:
+                    new_sid, answer, err = (
+                        session_id,
+                        None,
+                        f"unknown runner_mode {mode!r} (available: cli, server)",
+                    )
             except Exception as e:
                 err = f"bridge error: {e}"
                 new_sid, answer = session_id, None
             finally:
                 stop_typing.set()
-                RUN_STATE["busy"] = False
-                RUN_STATE["current"] = None
+                with RUN_LOCK:
+                    RUN_STATE["busy"] = False
+                    RUN_STATE["current"] = None
             if err and session_id and "failed rc=" in err and err != CANCEL_MSG:
                 live["trail"].append("♻️ stale session — retrying fresh")
                 new_sid, answer, err = run_agent(cfg, None, prompt, live)
@@ -1881,9 +2196,13 @@ def handle_update(cfg, state, upd):
         send(cfg["bot_token"], chat_id, "session cleared. next message starts fresh.")
         return
     if cmd == "/cancel":
-        proc = RUN_STATE.get("proc")
-        cur = RUN_STATE.get("current")
-        if RUN_STATE.get("server_sid"):
+        with RUN_LOCK:
+            proc = RUN_STATE.get("proc")
+            cur = RUN_STATE.get("current")
+            server_sid = RUN_STATE.get("server_sid")
+            server_directory = RUN_STATE.get("server_directory")
+            active_server_url = RUN_STATE.get("server_url")
+        if server_sid:
             if not cur:
                 send(cfg["bot_token"], chat_id, "nothing running")
                 return
@@ -1894,11 +2213,18 @@ def handle_update(cfg, state, upd):
                     f"run belongs to chat {cur['chat']} — cancel from there",
                 )
                 return
+            with RUN_LOCK:
+                RUN_STATE["cancel"] = True
             try:
-                _server_call("POST", f"/session/{RUN_STATE['server_sid']}/interrupt")
-            except Exception:
-                pass
-            RUN_STATE["cancel"] = True
+                _server_call(
+                    "POST",
+                    f"/session/{server_sid}/abort",
+                    timeout=5,
+                    directory=server_directory,
+                    base_url=active_server_url,
+                )
+            except Exception as e:
+                log(f"server abort request: {e}")
             audit("cancel_requested", by_chat=chat_id, run_chat=cur["chat"])
             send(cfg["bot_token"], chat_id, "🛑 stopping current run…")
             return
@@ -1917,7 +2243,8 @@ def handle_update(cfg, state, upd):
         except Exception:
             pass
         kill_after(proc, 5)
-        RUN_STATE["cancel"] = True
+        with RUN_LOCK:
+            RUN_STATE["cancel"] = True
         audit("cancel_requested", by_chat=chat_id, run_chat=cur["chat"])
         send(cfg["bot_token"], chat_id, "🛑 stopping current run…")
         return
@@ -1927,18 +2254,22 @@ def handle_update(cfg, state, upd):
             pending = sum(
                 1 for e in state.get("at", {}).values() if e.get("chat_id") == chat_id
             )
+        with RUN_LOCK:
+            c = RUN_STATE.get("current")
         cur = ""
-        if RUN_STATE.get("current"):
-            c = RUN_STATE["current"]
+        if c:
             cur = f"\nrunning: {c['prompt']}… ({int(time.time() - c['since'])}s)"
         runner_name = cfg.get("runner", "opencode")
-        runner_mode = (
-            "yolo" if runner_name == "codex" and cfg.get("codex_yolo") else "default"
-        )
+        mode = runner_mode(cfg)
+        capability = (SERVER_RUNNERS.get(runner_name) or {}).get("feature")
+        mode_label = f"{mode}: {capability}" if mode == "server" and capability else mode
+        if runner_name == "codex":
+            policy = "yolo" if cfg.get("codex_yolo") else "default permissions"
+            mode_label += f", {policy}"
         send(
             cfg["bot_token"],
             chat_id,
-            f"chat {chat_id}\nrunner: {runner_name} ({runner_mode})\n"
+            f"chat {chat_id}\nrunner: {runner_name} ({mode_label})\n"
             f"session: {info}\ncwd: {cfg['workdir']}\n"
             f"queued: {PROMPT_Q.qsize()}\nscheduled: {pending}{cur}",
         )
@@ -1994,19 +2325,19 @@ def handle_update(cfg, state, upd):
 
     audit("enqueue", chat_id=chat_id, user_id=user_id, chars=len(text.strip()))
     prompt_text = text.strip()
-    if should_steer(chat_id):
-        RUN_STATE["steer_pending"] += 1
-        RUN_STATE["steer_count"] = RUN_STATE.get("steer_count", 0) + 1
-        sid = RUN_STATE["server_sid"]
+    steer_target = _begin_steer(chat_id)
+    if steer_target:
+        sid, run_id, directory, base_url = steer_target
+        audit("steer_received", chat_id=chat_id, session=sid, chars=len(prompt_text))
         threading.Thread(
             target=_steer_deliver,
-            args=(sid, prompt_text),
+            args=(sid, run_id, directory, base_url, prompt_text),
             daemon=True,
         ).start()
         send(
             cfg["bot_token"],
             chat_id,
-            "🧭 steered — the agent absorbs this at its next gap",
+            "🧭 steering queued — the agent absorbs it at its next turn",
         )
         return
     if chat_type != "private" and cfg.get("capture_group_context", True):
@@ -2098,6 +2429,21 @@ def run(cfg):
             warn = f"⚠️ startup check: {e} — commands work, runs will error"
         except Exception as e:
             log(f"startup runner check: {e}")
+    mode = runner_mode(cfg)
+    if not warn and mode not in ("cli", "server"):
+        warn = f"⚠️ unknown runner_mode {mode!r} (available: cli, server)"
+    if not warn and mode == "server":
+        adapter = SERVER_RUNNERS.get(rname)
+        if not adapter:
+            warn = (
+                f"⚠️ runner {rname!r} has no server transport — "
+                "use runner_mode='cli'"
+            )
+        elif not adapter["healthy"](cfg):
+            warn = (
+                f"⚠️ {rname} server unavailable at {server_url(cfg)} — "
+                "start it before prompting or use runner_mode='cli'"
+            )
     if warn and hc:
         send(cfg["bot_token"], hc, warn)
 
@@ -2153,10 +2499,25 @@ def main():
     try:
         run(cfg)
     except BridgeStop:
-        p = RUN_STATE.get("proc")
+        with RUN_LOCK:
+            p = RUN_STATE.get("proc")
+            server_sid = RUN_STATE.get("server_sid")
+            server_directory = RUN_STATE.get("server_directory")
+            active_server_url = RUN_STATE.get("server_url")
         if p is not None and p.poll() is None:
             try:
                 p.terminate()  # don't orphan a burning agent run
+            except Exception:
+                pass
+        if server_sid:
+            try:
+                _server_call(
+                    "POST",
+                    f"/session/{server_sid}/abort",
+                    timeout=5,
+                    directory=server_directory,
+                    base_url=active_server_url,
+                )
             except Exception:
                 pass
         audit("stop", reason="signal")
