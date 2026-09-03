@@ -40,6 +40,7 @@ AUDIT_PATH = os.path.join(CONFIG_DIR, "audit.jsonl")
 OPENCODE = os.environ.get(
     "OPENCODE_BIN", os.path.expanduser("~/.local/share/mise/shims/opencode")
 )
+OPENCODE_SERVER = os.environ.get("OPENCODE_SERVER", "http://localhost:4096")
 RUN_TIMEOUT_S = 900
 CHUNK = 3900
 CANCEL_MSG = "🛑 cancelled by user"
@@ -47,7 +48,14 @@ CANCEL_MSG = "🛑 cancelled by user"
 PROMPT_Q = queue.Queue()
 STATE_LOCK = threading.Lock()
 AUDIT_LOCK = threading.Lock()
-RUN_STATE: dict = {"busy": False, "current": None, "proc": None, "cancel": False}
+RUN_STATE: dict = {
+    "busy": False,
+    "current": None,
+    "proc": None,
+    "cancel": False,
+    "server_sid": None,
+    "steer_pending": 0,
+}
 
 
 def log(msg):
@@ -206,7 +214,9 @@ def _wrap_markdown_tables(text):
                 cells.append("")
             cells = cells[: len(headers)]
             raw_heading = next((c for c in cells if c), f"Row {index}")
-            bullets = [f"• {h}: {v}" for h, v in zip(headers, cells) if v != raw_heading]
+            bullets = [
+                f"• {h}: {v}" for h, v in zip(headers, cells) if v != raw_heading
+            ]
             # headings flatten inner bold (hermes _convert_header): a bold
             # cell would render <b><b>…</b></b>, same-type nesting Telegram
             # refuses — which would demote the whole chunk to plain text
@@ -314,9 +324,7 @@ def md_to_html(md, in_pre=False, pre_lang=""):
     if in_pre:
         # continuation chunk reopens the carried fence with its language tag
         out.append(
-            f'<pre><code class="language-{esc(pre_lang)}">'
-            if pre_lang
-            else "<pre>"
+            f'<pre><code class="language-{esc(pre_lang)}">' if pre_lang else "<pre>"
         )
     lines = md.split("\n")
     i = 0
@@ -331,9 +339,7 @@ def md_to_html(md, in_pre=False, pre_lang=""):
                 # language tag -> Telegram's <code class="language-x">,
                 # rendered with syntax highlighting in official clients
                 out.append(
-                    f'<pre><code class="language-{esc(lang)}">'
-                    if lang
-                    else "<pre>"
+                    f'<pre><code class="language-{esc(lang)}">' if lang else "<pre>"
                 )
             in_pre = not in_pre
             pre_lang = lang
@@ -831,6 +837,212 @@ def run_agent(cfg, session_id, prompt, live=None):
     return sid, "\n".join(acc["texts"]).strip(), None
 
 
+def _server_call(method, path, body=None, timeout=15):
+    """JSON call to the local opencode server; returns parsed body or None.
+
+    POST /session/{id}/message blocks until that message's turn completes, so
+    callers that must not block (steering, prompt firing) wrap it in a thread."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        OPENCODE_SERVER + path,
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"} if data else {},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+    return json.loads(raw) if raw.strip() else None
+
+
+def server_ok():
+    try:
+        with urllib.request.urlopen(
+            OPENCODE_SERVER + "/api/session/active", timeout=2
+        ) as r:
+            return r.getcode() == 200
+    except OSError:
+        return False
+
+
+def server_event(ev, acc, seen):
+    """Fold one /api/event object into the accumulator; parts arrive as full
+    snapshots keyed by part id (text replaces its previous revision). Returns
+    a trail line on first sighting of a tool part, else None."""
+    data = ev.get("data") or {}
+    if ev.get("type") != "message.part.updated":
+        return None
+    part = data.get("part") or {}
+    pid = part.get("id")
+    pt = part.get("type")
+    if pt == "text" and part.get("text") is not None and pid:
+        acc["parts"][pid] = part["text"]
+        if pid not in seen:
+            seen.add(pid)
+            acc["order"].append(pid)
+    elif pt == "reasoning" and part.get("text"):
+        acc["thinking"] = part["text"]
+    elif pt == "tool" and part.get("tool") and pid not in seen:
+        seen.add(pid)
+        inp = (part.get("state") or {}).get("input") or {}
+        summary = ""
+        for v in inp.values():
+            if isinstance(v, str) and len(v) > len(summary):
+                summary = v
+        summary = summary.replace("\n", " ")[:60]
+        return f"🔧 {part['tool']}: {summary}" if summary else f"🔧 {part['tool']}"
+    return None
+
+
+def should_steer(chat_id):
+    """A same-chat message arriving during a server-mode run becomes live
+    steering instead of a queued follow-up run."""
+    cur = RUN_STATE.get("current")
+    return bool(
+        RUN_STATE.get("busy")
+        and RUN_STATE.get("server_sid")
+        and cur
+        and cur.get("chat") == chat_id
+    )
+
+
+def _steer_deliver(sid, text):
+    """POST a steering message; counters were raised at receipt, so a failed
+    delivery rolls them back — the run may otherwise wait for a turn that
+    never comes."""
+    try:
+        _server_call(
+            "POST",
+            f"/session/{sid}/message",
+            {
+                "parts": [
+                    {
+                        "type": "text",
+                        "text": "(steering from the human, mid-run — adjust course "
+                        "accordingly)\n" + text,
+                    }
+                ]
+            },
+        )
+    except Exception as e:
+        RUN_STATE["steer_count"] = max(0, RUN_STATE.get("steer_count", 1) - 1)
+        log(f"steer deliver: {e}")
+    finally:
+        RUN_STATE["steer_pending"] = max(0, RUN_STATE.get("steer_pending", 1) - 1)
+
+
+def run_agent_server(cfg, session_id, prompt, live=None):
+    """Server-mode run: POST the prompt to a live opencode session and stream
+    /api/event until quiescent. The message POST blocks until its turn ends,
+    so it fires on a side thread; the worker thread streams events. Steering
+    messages posted mid-run are queued server-side and consumed at the next
+    gap — the run ends only when a turn completes with no steer following it."""
+    try:
+        if session_id:
+            sid = session_id
+        else:
+            created = _server_call(
+                "POST", "/session", {"title": time.strftime("tg %Y%m%d-%H%M")}
+            )
+            sid = (created or {}).get("id")
+            if not sid:
+                return session_id, None, "server: could not create session"
+        body: dict = {"parts": [{"type": "text", "text": prompt}]}
+        model = cfg.get("model")
+        if model and "/" in model:
+            prov, _, mid = model.partition("/")
+            body["model"] = {"providerID": prov, "modelID": mid}
+        RUN_STATE["server_sid"] = sid
+        RUN_STATE["steer_count"] = 0
+        RUN_STATE["steer_pending"] = 0
+        RUN_STATE["current"]["session"] = sid
+        threading.Thread(
+            target=_server_call,
+            args=("POST", f"/session/{sid}/message", body),
+            daemon=True,
+        ).start()
+        timeout_s = run_timeout(cfg)
+        timed_out = []
+        killer = threading.Timer(
+            timeout_s,
+            lambda: _server_call("POST", f"/session/{sid}/interrupt"),
+        )
+        killer.daemon = True
+        killer.start()
+        acc = {"parts": {}, "order": [], "thinking": None}
+        seen = set()
+        last_seen = 0
+        try:
+            with urllib.request.urlopen(
+                OPENCODE_SERVER + "/api/event", timeout=120
+            ) as stream:
+                for raw in stream:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data: "):
+                        continue
+                    try:
+                        ev = json.loads(line[6:])
+                    except json.JSONDecodeError:
+                        continue
+                    if RUN_STATE.get("cancel"):
+                        break
+                    if (ev.get("data") or {}).get("sessionID") != sid:
+                        continue
+                    if ev.get("type") == "message.updated":
+                        info = (ev.get("data") or {}).get("info") or {}
+                        if info.get("role") == "assistant" and (
+                            info.get("time") or {}
+                        ).get("completed"):
+                            if (
+                                RUN_STATE["steer_pending"] == 0
+                                and RUN_STATE["steer_count"] == last_seen
+                            ):
+                                time.sleep(0.75)  # grace: a steer may be in flight
+                                if (
+                                    RUN_STATE["steer_pending"] == 0
+                                    and RUN_STATE["steer_count"] == last_seen
+                                ):
+                                    break  # turn done, nothing steered: quiescent
+                            last_seen = RUN_STATE["steer_count"]
+                    trail = server_event(ev, acc, seen)
+                    if live is not None:
+                        if trail:
+                            live["trail"].append(trail)
+                            edit_status(cfg, live)
+                        if acc["thinking"]:
+                            live["thinking"] = acc["thinking"]
+                            edit_status(cfg, live)
+                        if acc["order"]:
+                            last = acc["parts"].get(acc["order"][-1])
+                            if last:
+                                live["preview"] = last
+                                edit_status(cfg, live)
+        finally:
+            killer.cancel()
+            RUN_STATE["server_sid"] = None
+            RUN_STATE["steer_pending"] = 0
+        answer = "\n\n".join(
+            acc["parts"][pid] for pid in acc["order"] if acc["parts"].get(pid)
+        ).strip()
+        cancelled = RUN_STATE.pop("cancel", False)
+        if timed_out and answer:
+            return (
+                sid,
+                answer + "\n\n⚠️ (partial — hit the %ss timeout)" % timeout_s,
+                None,
+            )
+        if timed_out:
+            return sid, None, "agent timed out after %ss" % timeout_s
+        if cancelled and answer:
+            return sid, answer + "\n\n🛑 (cancelled — partial answer)", None
+        if cancelled:
+            return sid, None, CANCEL_MSG
+        if not answer:
+            return sid, None, "agent returned no text"
+        return sid, answer, None
+    except Exception as e:
+        return session_id, None, f"server runner error: {e}"
+
+
 def multipart(fields, file_field, filename, data, ctype):
     b = "----tgbridge" + os.urandom(12).hex()
     body = bytearray()
@@ -950,11 +1162,7 @@ def selftest():
         fails.append("md italic guards")
     # list markers -> native bullet glyph
     h, pre, _lang = md_to_html("- one\n* two\n+ three\nplain - dash")
-    if (
-        h
-        != "• one\n• two\n• three\nplain - dash"
-        or pre
-    ):
+    if h != "• one\n• two\n• three\nplain - dash" or pre:
         fails.append("md bullets")
     # header flattens inner bold (no <b><b> nesting Telegram refuses)
     h, pre, _lang = md_to_html("## **Title** here")
@@ -970,7 +1178,7 @@ def selftest():
         fails.append("md blockquote merge")
     # expandable quote: **> opener + trailing || closer (hermes)
     h, pre, _lang = md_to_html("**> details\n> more||\nafter")
-    if h != '<blockquote expandable>details\nmore</blockquote>\nafter' or pre:
+    if h != "<blockquote expandable>details\nmore</blockquote>\nafter" or pre:
         fails.append("md blockquote expandable")
     # blockquote chars in prose text are NOT blockquotes
     h, pre, _lang = md_to_html("a > b implies")
@@ -996,8 +1204,7 @@ def selftest():
     if (
         pre
         or lang
-        or h
-        != 'a\n<pre><code class="language-py">\nx &lt; y\n</code></pre>\nb'
+        or h != 'a\n<pre><code class="language-py">\nx &lt; y\n</code></pre>\nb'
     ):
         fails.append("md fence")
     # fence split across chunks stays balanced per chunk, carrying the
@@ -1011,7 +1218,7 @@ def selftest():
         or lang2
         or "</code></pre>" not in h1
         or h2.count("<pre>") != 1
-        or 'language-py' not in h2
+        or "language-py" not in h2
     ):
         fails.append("md fence continuation")
     # _balanced: valid vs broken chunks
@@ -1026,7 +1233,9 @@ def selftest():
     if "<b><b>" in md_to_html("## **T** x")[0] + md_to_html("***x***")[0]:
         fails.append("no same-type nesting")
     # _strip_html_markup: fallback text has no raw markup syntax left
-    plain = _strip_html_markup("# Head\n\n**hi** `x <y>` [t](http://e/x)\n> q\n```py\ncode\n```")
+    plain = _strip_html_markup(
+        "# Head\n\n**hi** `x <y>` [t](http://e/x)\n> q\n```py\ncode\n```"
+    )
     if (
         "**" in plain
         or "`" in plain
@@ -1039,9 +1248,10 @@ def selftest():
     tc = "😀" * 10
     if utf16_len(tc) != 20:
         fails.append("utf16 len")
-    if len(split_chunks(tc + "x", limit=15)) != 2 or "".join(
-        split_chunks(tc + "x", limit=15)
-    ) != tc + "x":
+    if (
+        len(split_chunks(tc + "x", limit=15)) != 2
+        or "".join(split_chunks(tc + "x", limit=15)) != tc + "x"
+    ):
         fails.append("utf16 chunk content")
     # inline-code split avoidance: cut lands outside the backtick span
     parts = split_chunks("word " + "z" * 40 + " `code span` tail", limit=20)
@@ -1070,11 +1280,7 @@ def selftest():
     finally:
         globals()["api"] = orig_api
     # fallback resend is clean plain text, never the raw markdown
-    if (
-        len(sent) != 2
-        or "parse_mode" in sent[1]
-        or sent[1]["text"] != "hi there"
-    ):
+    if len(sent) != 2 or "parse_mode" in sent[1] or sent[1]["text"] != "hi there":
         fails.append("send fallback shape")
 
     # table markdown flows through send() as converted bullet HTML
@@ -1211,6 +1417,86 @@ def selftest():
     strict_cfg = {"allowed_chats": [-10022], "allowed_user_ids": [11]}
     if is_authorized(strict_cfg, -10022, "supergroup", 99):
         fails.append("auth strict group")
+
+    # server-mode event folding: tool trail dedupe, text snapshot replace
+    acc = {"parts": {}, "order": [], "thinking": None}
+    seen = set()
+    t1 = server_event(
+        {
+            "type": "message.part.updated",
+            "data": {
+                "part": {
+                    "id": "p1",
+                    "type": "tool",
+                    "tool": "bash",
+                    "state": {"input": {"command": "ls /x"}},
+                }
+            },
+        },
+        acc,
+        seen,
+    )
+    if t1 != "🔧 bash: ls /x" or seen != {"p1"}:
+        fails.append("server tool trail")
+    t2 = server_event(
+        {
+            "type": "message.part.updated",
+            "data": {
+                "part": {
+                    "id": "p1",
+                    "type": "tool",
+                    "tool": "bash",
+                    "state": {"input": {"command": "ls /y"}},
+                }
+            },
+        },
+        acc,
+        seen,
+    )
+    if t2 is not None:
+        fails.append("server tool dedupe")
+    server_event(
+        {
+            "type": "message.part.updated",
+            "data": {"part": {"id": "p2", "type": "text", "text": "par"}},
+        },
+        acc,
+        seen,
+    )
+    server_event(
+        {
+            "type": "message.part.updated",
+            "data": {"part": {"id": "p2", "type": "text", "text": "partial answer"}},
+        },
+        acc,
+        seen,
+    )
+    if acc["parts"].get("p2") != "partial answer" or acc["order"] != ["p2"]:
+        fails.append("server text snapshot")
+    server_event(
+        {
+            "type": "message.part.updated",
+            "data": {"part": {"id": "p3", "type": "reasoning", "text": "hmm"}},
+        },
+        acc,
+        seen,
+    )
+    if acc["thinking"] != "hmm":
+        fails.append("server reasoning")
+    if server_event({"type": "session.updated", "data": {}}, acc, seen) is not None:
+        fails.append("server ignore other events")
+
+    # steering route: only a same-chat message during a server-mode run steers
+    RUN_STATE["busy"] = True
+    RUN_STATE["server_sid"] = "s9"
+    RUN_STATE["current"] = {"chat": 7}
+    if not should_steer(7) or should_steer(8) or should_steer(11):
+        fails.append("steer route")
+    RUN_STATE["busy"] = False
+    RUN_STATE["server_sid"] = None
+    RUN_STATE["current"] = None
+    if should_steer(7):
+        fails.append("steer route idle")
     # An allowed group member can prompt. Human group messages are captured by
     # default for ambient context, but the bot still speaks only when mentioned.
     auth_state = {
@@ -1218,6 +1504,7 @@ def selftest():
         "sessions": {"-10022": "keep-me"},
         "hints": {"-10022": time.time()},
     }
+
     def auth_api(token, method, **params):
         return {"ok": True, "result": {"message_id": 1}}
 
@@ -1276,7 +1563,7 @@ def selftest():
     print(
         "selftest OK:",
         ", ".join(sorted(RUNNERS)),
-        "runners + unpack + render + chunker + announce + kill + timeout + botcmd + auth",
+        "runners + unpack + render + chunker + announce + kill + timeout + botcmd + auth + steer",
     )
 
 
@@ -1331,7 +1618,19 @@ def worker(cfg, state):
                 f"chat={chat_id} run start (session={session_id}, q={PROMPT_Q.qsize()})"
             )
             try:
-                new_sid, answer, err = run_agent(cfg, session_id, prompt, live)
+                # server_runner is opt-in WIP: steering works end-to-end but the
+                # server's event stream does not deliver assistant events yet
+                # (see issue #3) — until solved, quiescence detection hangs.
+                if (
+                    cfg.get("server_runner")
+                    and server_ok()
+                    and cfg.get("runner", "opencode") == "opencode"
+                ):
+                    new_sid, answer, err = run_agent_server(
+                        cfg, session_id, prompt, live
+                    )
+                else:
+                    new_sid, answer, err = run_agent(cfg, session_id, prompt, live)
             except Exception as e:
                 err = f"bridge error: {e}"
                 new_sid, answer = session_id, None
@@ -1563,6 +1862,25 @@ def handle_update(cfg, state, upd):
     if cmd == "/cancel":
         proc = RUN_STATE.get("proc")
         cur = RUN_STATE.get("current")
+        if RUN_STATE.get("server_sid"):
+            if not cur:
+                send(cfg["bot_token"], chat_id, "nothing running")
+                return
+            if chat_type != "private" and cur["chat"] != chat_id:
+                send(
+                    cfg["bot_token"],
+                    chat_id,
+                    f"run belongs to chat {cur['chat']} — cancel from there",
+                )
+                return
+            try:
+                _server_call("POST", f"/session/{RUN_STATE['server_sid']}/interrupt")
+            except Exception:
+                pass
+            RUN_STATE["cancel"] = True
+            audit("cancel_requested", by_chat=chat_id, run_chat=cur["chat"])
+            send(cfg["bot_token"], chat_id, "🛑 stopping current run…")
+            return
         if not (proc and cur and proc.poll() is None):
             send(cfg["bot_token"], chat_id, "nothing running")
             return
@@ -1651,6 +1969,21 @@ def handle_update(cfg, state, upd):
 
     audit("enqueue", chat_id=chat_id, user_id=user_id, chars=len(text.strip()))
     prompt_text = text.strip()
+    if should_steer(chat_id):
+        RUN_STATE["steer_pending"] += 1
+        RUN_STATE["steer_count"] = RUN_STATE.get("steer_count", 0) + 1
+        sid = RUN_STATE["server_sid"]
+        threading.Thread(
+            target=_steer_deliver,
+            args=(sid, prompt_text),
+            daemon=True,
+        ).start()
+        send(
+            cfg["bot_token"],
+            chat_id,
+            "🧭 steered — the agent absorbs this at its next gap",
+        )
+        return
     if chat_type != "private" and cfg.get("capture_group_context", True):
         with STATE_LOCK:
             buf = (state.get("context") or {}).pop(str(chat_id), None) or []
