@@ -18,6 +18,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -34,11 +35,12 @@ OPENCODE = os.environ.get(
 )
 RUN_TIMEOUT_S = 900
 CHUNK = 3900
+CANCEL_MSG = "🛑 cancelled by user"
 
 PROMPT_Q = queue.Queue()
 STATE_LOCK = threading.Lock()
 AUDIT_LOCK = threading.Lock()
-RUN_STATE: dict = {"busy": False, "current": None}
+RUN_STATE: dict = {"busy": False, "current": None, "proc": None, "cancel": False}
 
 
 def log(msg):
@@ -103,9 +105,11 @@ def api(token, method, **params):
     return None
 
 
-def react(token, chat_id, message_id, emoji):
+def react(cfg, chat_id, message_id, emoji):
+    if not cfg.get("reactions", True):
+        return
     api(
-        token,
+        cfg["bot_token"],
         "setMessageReaction",
         chat_id=chat_id,
         message_id=message_id,
@@ -133,9 +137,9 @@ def split_chunks(text, limit=CHUNK):
     return [c for c in chunks if c] or [""]
 
 
-def send(token, chat_id, text, reply_to=None):
+def send(token, chat_id, text, reply_to=None, chunk_limit=CHUNK):
     ok = True
-    for i, chunk in enumerate(split_chunks(text)):
+    for i, chunk in enumerate(split_chunks(text, chunk_limit)):
         params = {"chat_id": chat_id, "text": chunk}
         if i == 0 and reply_to:
             params["reply_parameters"] = json.dumps({"message_id": reply_to})
@@ -143,6 +147,93 @@ def send(token, chat_id, text, reply_to=None):
         if not res or not res.get("ok"):
             ok = False
     return ok
+
+
+def send_retry(cfg, chat_id, text, reply_to=None):
+    """One retry with backoff for must-not-lose payloads (the run's answer).
+
+    A failed sendMessage otherwise silently deletes a 6-minute agent run. If
+    both attempts fail: audit + log loudly + persist to undelivered/ so the
+    content survives even though Telegram never saw it."""
+    limit = cfg.get("chunk") or CHUNK
+    for attempt in (1, 2):
+        if send(cfg["bot_token"], chat_id, text, reply_to=reply_to, chunk_limit=limit):
+            return True
+        if attempt == 1:
+            time.sleep(2)
+    audit("delivery_failed", chat_id=chat_id, chars=len(text or ""))
+    log(f"chat={chat_id} DELIVERY FAILED after retry ({len(text or '')} chars)")
+    try:
+        d = os.path.expanduser("~/.config/tgbridge/undelivered")
+        os.makedirs(d, exist_ok=True)
+        with open(
+            os.path.join(d, time.strftime("%Y%m%d-%H%M%S") + f"-{chat_id}.txt"), "w"
+        ) as f:
+            f.write(text or "")
+        log("saved undelivered payload")
+    except OSError:
+        pass
+    return False
+
+
+def _post(url, data, timeout):
+    req = urllib.request.Request(url, data=data)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        r.read()
+
+
+def announce_all(cfg, text, post=_post):
+    """Best-effort death notice to every allowed chat. 3s timeout each,
+    never raises — usable from crash paths and signal handlers."""
+    for chat_id in cfg.get("allowed_chats") or []:
+        if chat_id is None:
+            continue
+        try:
+            post(
+                f"https://api.telegram.org/bot{cfg['bot_token']}/sendMessage",
+                urllib.parse.urlencode(
+                    {"chat_id": chat_id, "text": str(text)[:3500]}
+                ).encode(),
+                3,
+            )
+        except Exception as e:
+            log(f"announce {chat_id}: {e}")
+
+
+def kill_after(proc, delay):
+    """Escalate to SIGKILL if proc hasn't exited after delay seconds."""
+
+    def _k():
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    t = threading.Timer(delay, _k)
+    t.daemon = True
+    t.start()
+
+
+def run_timeout(cfg):
+    try:
+        return int(cfg.get("run_timeout_s", RUN_TIMEOUT_S))
+    except (TypeError, ValueError):
+        return RUN_TIMEOUT_S
+
+
+def outbox_dir(cfg):
+    return cfg.get("outbox_dir") or os.path.join(cfg["workdir"], ".tgbridge-outbox")
+
+
+def home_chat(cfg):
+    """The DM chat: an allowed_chats entry that is also an allowed user id."""
+    users = cfg.get("allowed_user_ids") or []
+    for c in cfg.get("allowed_chats") or []:
+        if c in users:
+            return c
+    ch = cfg.get("allowed_chats") or []
+    return ch[0] if ch else None
 
 
 def typing_loop(token, chat_id, stop_event):
@@ -208,6 +299,7 @@ def runner(name):
     def deco(fn):
         RUNNERS[name] = fn
         return fn
+
     return deco
 
 
@@ -216,13 +308,20 @@ class RunnerError(Exception):
 
 
 @runner("opencode")
-def _opencode(session_id, prompt):
+def _opencode(session_id, prompt, model=None):
     """opencode run --format json. Events: sessionID / tool_use / text / reasoning."""
-    cmd = [OPENCODE, "run", "--format", "json"]
+    p = OPENCODE if os.path.exists(OPENCODE) else shutil.which("opencode")
+    if not p:
+        raise RunnerError(
+            "runner 'opencode' not found; install opencode or set OPENCODE_BIN"
+        )
+    cmd = [p, "run", "--format", "json"]
     if session_id:
         cmd += ["--session", session_id]
     else:
         cmd += ["--title", time.strftime("tg %Y%m%d-%H%M")]
+    if model:
+        cmd += ["--model", model]  # flag verified live against opencode CLI
     cmd.append(prompt)
 
     def parse(ev, acc):
@@ -246,12 +345,20 @@ def _opencode(session_id, prompt):
 
 
 @runner("claude")
-def _claude(session_id, prompt):
+def _claude(session_id, prompt, model=None):
     """claude -p --output-format stream-json (resume via --resume)."""
-    cmd = [_bin("CLAUDE_BIN", "claude"), "-p", prompt,
-           "--output-format", "stream-json", "--verbose"]
+    cmd = [
+        _bin("CLAUDE_BIN", "claude"),
+        "-p",
+        prompt,
+        "--output-format",
+        "stream-json",
+        "--verbose",
+    ]
     if session_id:
         cmd += ["--resume", session_id]
+    if model:
+        cmd += ["--model", model]
 
     def parse(ev, acc):
         t = ev.get("type")
@@ -264,8 +371,7 @@ def _claude(session_id, prompt):
                 if bt == "tool_use":
                     inp = blk.get("input") or {}
                     s = next((v for v in inp.values() if isinstance(v, str)), "")
-                    trail = (f"🔧 {blk.get('tool', '?')}: "
-                             + s.replace("\n", " ")[:60])
+                    trail = f"🔧 {blk.get('tool', '?')}: " + s.replace("\n", " ")[:60]
                 elif bt == "text" and blk.get("text"):
                     acc["texts"].append(blk["text"])
                     acc["thinking"] = None
@@ -278,11 +384,13 @@ def _claude(session_id, prompt):
 
 
 @runner("codex")
-def _codex(session_id, prompt):
+def _codex(session_id, prompt, model=None):
     """codex exec --json (resume via `codex exec resume <id>`). Best-effort."""
     cmd = [_bin("CODEX_BIN", "codex"), "exec", "--json"]
     if session_id:
         cmd += ["resume", session_id]
+    if model:
+        cmd += ["--model", model]
     cmd.append(prompt)
 
     def parse(ev, acc):
@@ -312,11 +420,13 @@ def run_agent(cfg, session_id, prompt, live=None):
     rname = cfg.get("runner", "opencode")
     runner_fn = RUNNERS.get(rname)
     if not runner_fn:
-        return session_id, None, (
-            f"unknown runner {rname!r} (available: {', '.join(sorted(RUNNERS))})"
+        return (
+            session_id,
+            None,
+            (f"unknown runner {rname!r} (available: {', '.join(sorted(RUNNERS))})"),
         )
     try:
-        cmd, parse = runner_fn(session_id, prompt)
+        cmd, parse = runner_fn(session_id, prompt, cfg.get("model"))
     except RunnerError as e:
         return session_id, None, str(e)
     proc = subprocess.Popen(
@@ -326,9 +436,11 @@ def run_agent(cfg, session_id, prompt, live=None):
         text=True,
         cwd=cfg["workdir"],
     )
+    RUN_STATE["proc"] = proc  # exposed for /cancel and the shutdown path
     assert proc.stdout and proc.stderr  # guaranteed: both opened with PIPE
+    timeout_s = run_timeout(cfg)
     timed_out = []
-    killer = threading.Timer(RUN_TIMEOUT_S, lambda: (timed_out.append(1), proc.kill()))
+    killer = threading.Timer(timeout_s, lambda: (timed_out.append(1), proc.kill()))
     killer.daemon = True
     killer.start()
     errbuf = []
@@ -337,7 +449,14 @@ def run_agent(cfg, session_id, prompt, live=None):
         target=lambda: errbuf.append(stderr.read() or ""), daemon=True
     )
     drain.start()
-    acc = {"sid": session_id, "texts": [], "thinking": None, "cost": 0.0, "tokens": None}
+    acc = {
+        "sid": session_id,
+        "texts": [],
+        "thinking": None,
+        "cost": 0.0,
+        "tokens": None,
+    }
+    sid = session_id
     try:
         for line in proc.stdout:
             line = line.strip()
@@ -362,6 +481,8 @@ def run_agent(cfg, session_id, prompt, live=None):
         proc.wait()
     finally:
         killer.cancel()
+        RUN_STATE["proc"] = None
+    cancelled = RUN_STATE.pop("cancel", False)
     if timed_out:
         partial = "\n".join(acc["texts"]).strip()
         if partial:
@@ -369,13 +490,22 @@ def run_agent(cfg, session_id, prompt, live=None):
                 sid,
                 partial
                 + "\n\n⚠️ (partial answer — hit the %ss timeout and was killed)"
-                % RUN_TIMEOUT_S,
+                % timeout_s,
                 None,
             )
-        return sid, None, "agent timed out after %ss and was killed" % RUN_TIMEOUT_S
+        return sid, None, "agent timed out after %ss and was killed" % timeout_s
+    if cancelled and proc.returncode != 0:
+        partial = "\n".join(acc["texts"]).strip()
+        if partial:
+            return sid, partial + "\n\n🛑 (cancelled by user — partial answer)", None
+        return sid, None, CANCEL_MSG
     if proc.returncode != 0:
         tail = (errbuf[0] if errbuf else "").strip()[-600:]
-        return sid, None, f"opencode failed rc={proc.returncode}\n{tail}"
+        return (
+            sid,
+            None,
+            f"{cfg.get('runner', 'opencode')} failed rc={proc.returncode}\n{tail}",
+        )
     if not acc["texts"]:
         return sid, None, "agent returned no text"
     return sid, "\n".join(acc["texts"]).strip(), None
@@ -477,34 +607,101 @@ def selftest():
     # every runner builds a cmd and parses a synthetic event
     for name, fn in RUNNERS.items():
         try:
-            cmd, parse = fn(None, "hi")
+            cmd, parse = fn(None, "hi", None)
             assert cmd and callable(parse), f"{name}: bad cmd/parse"
+            cmd2, _ = fn(None, "hi", "test-model")
+            i = cmd2.index("--model")
+            if cmd2[i + 1] != "test-model":
+                fails.append(f"{name} model flag")
         except RunnerError:
             pass  # binary not installed — acceptable, runtime reports it
         except Exception as e:
             fails.append(f"{name} cmd: {e}")
 
-    ev = {"sessionID": "s1", "type": "tool_use",
-          "part": {"tool": "bash", "state": {"input": {"command": "ls"}}}}
-    cmd, parse = RUNNERS["opencode"](None, "hi")
+    ev = {
+        "sessionID": "s1",
+        "type": "tool_use",
+        "part": {"tool": "bash", "state": {"input": {"command": "ls"}}},
+    }
+    cmd, parse = RUNNERS["opencode"](None, "hi", None)
     acc = {"sid": None, "texts": [], "thinking": None, "cost": 0.0, "tokens": None}
     if parse(ev, acc) is None or acc["sid"] != "s1":
         fails.append("opencode parse")
 
-    cmd, parse = RUNNERS["claude"](None, "hi")
+    cmd, parse = RUNNERS["claude"](None, "hi", None)
     acc = {"sid": None, "texts": [], "thinking": None, "cost": 0.0, "tokens": None}
     parse({"type": "system", "session_id": "s2"}, acc)
-    parse({"type": "assistant", "message": {"content": [
-        {"type": "tool_use", "tool": "Bash", "input": {"command": "ls"}},
-        {"type": "text", "text": "ok"}]}}, acc)
+    parse(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "tool": "Bash", "input": {"command": "ls"}},
+                    {"type": "text", "text": "ok"},
+                ]
+            },
+        },
+        acc,
+    )
     if acc["sid"] != "s2" or acc["texts"] != ["ok"]:
         fails.append("claude parse")
+
+    # death announcement: one call per chat, one bad chat must not raise
+    calls = []
+
+    def fake_post(url, data, timeout):
+        calls.append((url, timeout))
+        if "-100999" in url:
+            raise OSError("boom")
+
+    announce_all(
+        {"bot_token": "t", "allowed_chats": [1, -100999, 2]}, "bye", post=fake_post
+    )
+    if len(calls) != 3:
+        fails.append("announce per-chat")
+    if any(t > 5 for _, t in calls):
+        fails.append("announce timeout>5s")
+
+    # /cancel kill paths against a real Popen
+    for name, kill in (
+        ("terminate path", lambda p: p.terminate()),
+        ("kill_after escalation", lambda p: kill_after(p, 0.2)),
+    ):
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+        kill(p)
+        time.sleep(0.6)
+        if p.poll() is None:
+            fails.append(name)
+            p.kill()
+        p.wait()
+
+    # run_timeout config plumbing
+    for cfg_case, want in (
+        ({}, RUN_TIMEOUT_S),
+        ({"run_timeout_s": "5"}, 5),
+        ({"run_timeout_s": "abc"}, RUN_TIMEOUT_S),
+        ({"run_timeout_s": None}, RUN_TIMEOUT_S),
+    ):
+        if run_timeout(cfg_case) != want:
+            fails.append(f"run_timeout {cfg_case}")
+
+    # botcmd: command routing incl. new commands and @BotName suffix
+    if (
+        botcmd("/cancel@Bot") != ("/cancel", "")
+        or botcmd("/at@B 5m hi") != ("/at", "5m hi")
+        or botcmd("plain words") != (None, "")
+    ):
+        fails.append("botcmd")
 
     if fails:
         for f in fails:
             print(f"SELFTEST FAIL: {f}")
         sys.exit(1)
-    print("selftest OK:", ", ".join(sorted(RUNNERS)), "runners + unpack + chunker")
+    print(
+        "selftest OK:",
+        ", ".join(sorted(RUNNERS)),
+        "runners + unpack + chunker + announce + kill + timeout + botcmd",
+    )
 
 
 def worker(cfg, state):
@@ -524,25 +721,20 @@ def worker(cfg, state):
             }
             with STATE_LOCK:
                 session_id = state.get("sessions", {}).get(str(chat_id))
-                pending = state.get("pending", [])
-                for i, e in enumerate(pending):
-                    if e.get("message_id") == message_id and e.get("chat_id") == chat_id:
-                        del pending[i]
-                        break
-            outbox = os.path.join(cfg["workdir"], ".tgbridge-outbox")
+            outbox = outbox_dir(cfg)
             prompt = prompt + (
                 f"\n\n(To give files to the user, write them into {outbox}/ "
                 "— they are delivered automatically after this run.)"
             )
             audit("run_start", chat_id=chat_id, chars=len(prompt), session=session_id)
-            react(cfg["bot_token"], chat_id, message_id, "👀")
+            react(cfg, chat_id, message_id, "👀")
             status = api(
                 cfg["bot_token"],
                 "sendMessage",
                 chat_id=chat_id,
                 text="⚙️ working… 0s",
-                reply_parameters=json.dumps({"message_id": message_id}),
                 disable_notification=True,
+                reply_parameters=json.dumps({"message_id": message_id}),
             )
             live = {
                 "chat_id": chat_id,
@@ -559,7 +751,9 @@ def worker(cfg, state):
                 args=(cfg["bot_token"], chat_id, stop_typing),
                 daemon=True,
             ).start()
-            log(f"chat={chat_id} run start (session={session_id}, q={PROMPT_Q.qsize()})")
+            log(
+                f"chat={chat_id} run start (session={session_id}, q={PROMPT_Q.qsize()})"
+            )
             try:
                 new_sid, answer, err = run_agent(cfg, session_id, prompt, live)
             except Exception as e:
@@ -569,7 +763,7 @@ def worker(cfg, state):
                 stop_typing.set()
                 RUN_STATE["busy"] = False
                 RUN_STATE["current"] = None
-            if err and session_id and "opencode failed" in err:
+            if err and session_id and "failed rc=" in err and err != CANCEL_MSG:
                 live["trail"].append("♻️ stale session — retrying fresh")
                 new_sid, answer, err = run_agent(cfg, None, prompt, live)
             if live["status_id"]:
@@ -578,21 +772,27 @@ def worker(cfg, state):
                 if new_sid and new_sid != session_id:
                     state.setdefault("sessions", {})[str(chat_id)] = new_sid
                 save_json(STATE_PATH, state)
-            if err:
-                react(cfg["bot_token"], chat_id, message_id, "👎")
-                send(cfg["bot_token"], chat_id, f"⚠️ {err}")
+            if err == CANCEL_MSG:
+                audit("run_cancelled", chat_id=chat_id)
+                send_retry(cfg, chat_id, CANCEL_MSG)
+                log(f"chat={chat_id} cancelled")
+            elif err:
+                react(cfg, chat_id, message_id, "👎")
+                send_retry(cfg, chat_id, f"⚠️ {err}")
                 audit("run_error", chat_id=chat_id, err=err[:200])
                 log(f"chat={chat_id} error: {err[:120]}")
             else:
-                react(cfg["bot_token"], chat_id, message_id, "👍")
-                send(cfg["bot_token"], chat_id, answer or "", reply_to=message_id)
+                react(cfg, chat_id, message_id, "👍")
+                send_retry(cfg, chat_id, answer or "", reply_to=message_id)
                 audit(
                     "run_done",
                     chat_id=chat_id,
                     chars=len(answer or ""),
                     secs=int(time.time() - live["start"]),
                 )
-                log(f"chat={chat_id} done ({len(answer or '')} chars, session={new_sid})")
+                log(
+                    f"chat={chat_id} done ({len(answer or '')} chars, session={new_sid})"
+                )
         except Exception as e:
             log(f"worker item error: {e}")
             audit("worker_error", err=str(e)[:200])
@@ -600,7 +800,7 @@ def worker(cfg, state):
                 send(cfg["bot_token"], chat_id, f"⚠️ bridge error: {e}")
         finally:
             try:
-                outbox = os.path.join(cfg["workdir"], ".tgbridge-outbox")
+                outbox = outbox_dir(cfg)
                 for fn in sorted(os.listdir(outbox)):
                     p = os.path.join(outbox, fn)
                     if os.path.isfile(p):
@@ -717,11 +917,13 @@ def handle_update(cfg, state, upd):
             if text.strip() and not text.lstrip().startswith("/"):
                 with STATE_LOCK:
                     buf = state.setdefault("context", {}).setdefault(str(chat_id), [])
-                    buf.append({
-                        "who": (msg.get("from") or {}).get("first_name") or "?",
-                        "t": time.strftime("%H:%M"),
-                        "text": text.strip()[:200],
-                    })
+                    buf.append(
+                        {
+                            "who": (msg.get("from") or {}).get("first_name") or "?",
+                            "t": time.strftime("%H:%M"),
+                            "text": text.strip()[:200],
+                        }
+                    )
                     del buf[:-20]
                 now = time.time()
                 hints = state.get("hints", {})
@@ -743,11 +945,41 @@ def handle_update(cfg, state, upd):
             text = (text + f"\n[attachment saved: {doc_path}]").strip()
 
     cmd, rest = botcmd(text)
+    if cmd == "/help":
+        send(
+            cfg["bot_token"],
+            chat_id,
+            "commands: /new reset session · /status state · /at 30m <prompt> "
+            "schedule · /cancel abort current run · anything else goes to the agent",
+        )
+        return
     if cmd == "/new":
         with STATE_LOCK:
             state.setdefault("sessions", {}).pop(str(chat_id), None)
             save_json(STATE_PATH, state)
         send(cfg["bot_token"], chat_id, "session cleared. next message starts fresh.")
+        return
+    if cmd == "/cancel":
+        proc = RUN_STATE.get("proc")
+        cur = RUN_STATE.get("current")
+        if not (proc and cur and proc.poll() is None):
+            send(cfg["bot_token"], chat_id, "nothing running")
+            return
+        if chat_type != "private" and cur["chat"] != chat_id:
+            send(
+                cfg["bot_token"],
+                chat_id,
+                f"run belongs to chat {cur['chat']} — cancel from there",
+            )
+            return
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        kill_after(proc, 5)
+        RUN_STATE["cancel"] = True
+        audit("cancel_requested", by_chat=chat_id, run_chat=cur["chat"])
+        send(cfg["bot_token"], chat_id, "🛑 stopping current run…")
         return
     if cmd == "/status":
         with STATE_LOCK:
@@ -762,7 +994,8 @@ def handle_update(cfg, state, upd):
         send(
             cfg["bot_token"],
             chat_id,
-            f"chat {chat_id}\nsession: {info}\ncwd: {cfg['workdir']}\n"
+            f"chat {chat_id}\nrunner: {cfg.get('runner', 'opencode')}\n"
+            f"session: {info}\ncwd: {cfg['workdir']}\n"
             f"queued: {PROMPT_Q.qsize()}\nscheduled: {pending}{cur}",
         )
         return
@@ -806,7 +1039,7 @@ def handle_update(cfg, state, upd):
             return
         text, err = transcribe(cfg, cfg["bot_token"], msg["voice"].get("file_id"))
         if err:
-            react(cfg["bot_token"], chat_id, message_id, "👎")
+            react(cfg, chat_id, message_id, "👎")
             send(cfg["bot_token"], chat_id, f"⚠️ {err}")
             return
         audit("voice", chat_id=chat_id, chars=len(text or ""))
@@ -821,9 +1054,7 @@ def handle_update(cfg, state, upd):
         with STATE_LOCK:
             buf = (state.get("context") or {}).pop(str(chat_id), None) or []
         if buf:
-            digest = "\n".join(
-                f"- {e['who']} {e['t']}: {e['text']}" for e in buf[-20:]
-            )
+            digest = "\n".join(f"- {e['who']} {e['t']}: {e['text']}" for e in buf[-20:])
             prompt_text = (
                 "[group messages since your last turn — passive context, "
                 "nobody asked you anything yet:\n" + digest + "\n]\n\n" + prompt_text
@@ -855,15 +1086,15 @@ def cli_send(args):
     log(f"--send -> {chat_id} ({len(args[1])} chars)")
 
 
-def main():
-    if "--selftest" in sys.argv:
-        selftest()
-        return
-    selftest()  # regression gate — a bridge that fails checks must not go live
+class BridgeStop(Exception):
+    """Raised by the SIGTERM/SIGINT handler — a graceful stop, not a crash."""
 
-    cfg = load_json(CONFIG_PATH, None)
-    if not cfg:
-        sys.exit(f"missing config {CONFIG_PATH}")
+
+def on_stop(signum, frame):
+    raise BridgeStop(signum)
+
+
+def run(cfg):
     state = load_json(STATE_PATH, {})
     me = api(cfg["bot_token"], "getMe")
     if not me or not me.get("ok"):
@@ -878,17 +1109,46 @@ def main():
                 {"command": "new", "description": "Reset session for this chat"},
                 {"command": "status", "description": "Show session info"},
                 {"command": "at", "description": "Schedule a prompt: /at 30m <text>"},
+                {"command": "cancel", "description": "Abort the current run"},
+                {"command": "help", "description": "List commands"},
             ]
         ),
     )
     log(f"tgbridge up as @{state['bot_username']}, chats={cfg['allowed_chats']}")
 
-    threading.Thread(target=worker, args=(cfg, state), daemon=True).start()
+    # Startup sanity: a missing runner binary must not kill the bridge —
+    # commands still work; warn once in the home chat, runs report the error.
+    rname = cfg.get("runner", "opencode")
+    hc = home_chat(cfg)
+    warn = None
+    if rname not in RUNNERS:
+        warn = (
+            f"⚠️ unknown runner {rname!r} (available: {', '.join(sorted(RUNNERS))}) "
+            "— commands work, runs will fail until config.json is fixed"
+        )
+    else:
+        try:
+            RUNNERS[rname](None, "sanity", None)
+        except RunnerError as e:
+            warn = f"⚠️ startup check: {e} — commands work, runs will error"
+        except Exception as e:
+            log(f"startup runner check: {e}")
+    if warn and hc:
+        send(cfg["bot_token"], hc, warn)
+
+    worker_t = threading.Thread(target=worker, args=(cfg, state), daemon=True)
+    worker_t.start()
     rearm_at(cfg, state)
 
     offset = state.get("offset")
     backoff = 3
     while True:
+        if not worker_t.is_alive():
+            log("worker thread died — respawning")
+            audit("worker_respawn")
+            announce_all(cfg, "💀 bridge worker thread died — respawned")
+            worker_t = threading.Thread(target=worker, args=(cfg, state), daemon=True)
+            worker_t.start()
         params = {"timeout": 50, "allowed_updates": json.dumps(["message"])}
         if offset:
             params["offset"] = offset
@@ -911,6 +1171,39 @@ def main():
             with STATE_LOCK:
                 state["offset"] = offset
                 save_json(STATE_PATH, state)
+
+
+def main():
+    if "--selftest" in sys.argv:
+        selftest()
+        return
+    selftest()  # regression gate — a bridge that fails checks must not go live
+
+    cfg = load_json(CONFIG_PATH, None)
+    if not cfg:
+        sys.exit(f"missing config {CONFIG_PATH}")
+    signal.signal(signal.SIGTERM, on_stop)
+    signal.signal(signal.SIGINT, on_stop)
+    try:
+        run(cfg)
+    except BridgeStop:
+        p = RUN_STATE.get("proc")
+        if p is not None and p.poll() is None:
+            try:
+                p.terminate()  # don't orphan a burning agent run
+            except Exception:
+                pass
+        audit("stop", reason="signal")
+        announce_all(cfg, "💀 bridge stopping")
+        log("bridge stopped by signal")
+        sys.exit(0)
+    except SystemExit as e:
+        announce_all(cfg, f"💀 bridge exited: {e.code or ''}".rstrip())
+        raise
+    except BaseException as e:
+        audit("crash", err=str(e)[:300])
+        announce_all(cfg, f"💀 bridge crashed: {e} — restarting")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 A minimal Telegram bridge for a local [opencode](https://opencode.ai) agent.
 
-~590 lines of Python, **zero dependencies** (stdlib only). No webhooks, no
+~1210 lines of Python, **zero dependencies** (stdlib only). No webhooks, no
 public ports, no databases: Bot API long-poll in, `opencode run` out.
 
 ## Features
@@ -14,11 +14,15 @@ public ports, no databases: Bot API long-poll in, `opencode run` out.
 - **Scheduled prompts** — `/at 30m <prompt>` (also `s`/`h`); persisted in state and re-armed on restart
 - **Agent-initiated outbound** — `python3 tgbridge.py --send <chat_id> <text>` posts to allowlisted chats only, so the agent can proactively notify the group
 - **Audit log** — every enqueue/run/send/schedule event appended to `~/.config/tgbridge/audit.jsonl`
+- **Never dies silently** — any fatal crash or SIGTERM announces `💀 …` to every allowed chat (best-effort, 3s each) before systemd restarts it; a dead worker thread is detected and respawned; a failed answer delivery retries once, then is audited and saved to `~/.config/tgbridge/undelivered/` instead of vanishing; a missing runner binary warns at startup instead of crashing
+- **`/cancel`** — abort the running agent (SIGTERM, SIGKILL after 5s); the run reports `🛑 cancelled by user`
+- **Slash-command menu** — `/new`, `/status`, `/at`, `/cancel`, `/help` registered via `setMyCommands`
+- **Chat + user allowlist** — double gate; unknown chats/users are dropped silently
+- **Selftest gate** — `python3 tgbridge.py --selftest` runs at every startup; a bridge that fails its own checks does not go live
 - **Emoji lifecycle** — 👀 received → ✅ done / 🔴 error, via `setMessageReaction`
 - **Typing indicator** — `sendChatAction` keep-alive for the whole run (re-fired every 4s)
 - **Paragraph-aware chunking** — replies split at `\n\n` > `\n` > space, first chunk reply-threaded to your message
 - **Rate-limit friendly** — honors Telegram 429 `retry_after`; poll failures back off exponentially (3s → 30s)
-- **Slash-command menu** — `/new`, `/status`, `/at` registered via `setMyCommands`
 - **Chat + user allowlist** — double gate; unknown chats/users are dropped silently
 
 ## Setup
@@ -105,6 +109,11 @@ To post to Telegram yourself: python3 /path/to/tgbridge/tgbridge.py --send <chat
 | `allowed_chats` | Chat IDs the bridge listens in (DM + groups); also gates `--send` |
 | `workdir` | Working directory for the agent |
 | `runner` | `opencode` (default), `claude`, or `codex` |
+| `run_timeout_s` | Per-run timeout in seconds (default `900`); partial answers are kept |
+| `chunk` | Outgoing reply chunk size (default `3900`, Telegram caps at 4096) |
+| `outbox_dir` | Where agents drop files for auto-delivery (default `workdir/.tgbridge-outbox`) |
+| `reactions` | `false` disables 👀/👍/👎 emoji lifecycle (default `true`) |
+| `model` | Optional model override passed to the runner (`--model` on all three CLIs); empty = runner default |
 | `transcribe_base_url` | OpenAI-compatible base URL for transcription (default `https://api.openai.com/v1`) |
 | `transcribe_key` | API key; absent = voice notes disabled |
 | `transcribe_model` | Whisper model name (default `whisper-1`; Groq: `whisper-large-v3-turbo`) |
@@ -159,7 +168,7 @@ and Anthropic's official [claude-plugins-official telegram plugin](https://githu
 
 - One run at a time (messages queue via Telegram's offset while the agent works)
 - Voice → text only; photos/documents are not ingested
-- 15-minute per-run timeout
+- Per-run timeout via `run_timeout_s` (default 15 minutes)
 - No message history — Telegram's Bot API doesn't expose any; sessions are how context persists
 
 ## License

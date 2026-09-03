@@ -4,6 +4,10 @@
   "allowed_user_ids": [123456789],
   "allowed_chats": [123456789, -1001234567890],
   "workdir": "/home/you/your-project",
+  "run_timeout_s": 900,
+  "chunk": 3900,
+  "reactions": true,
+  "model": "",
   "transcribe_base_url": "https://api.openai.com/v1",
   "transcribe_key": "sk-REPLACE-OR-REMOVE",
   "transcribe_model": "whisper-1"
