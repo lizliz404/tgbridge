@@ -1,6 +1,6 @@
 # tgbridge
 
-A minimal Telegram bridge for a local opencode, Claude, or Codex agent.
+A minimal Telegram bridge for a local OpenCode, Claude, or Codex agent.
 
 A single Python file with **zero dependencies** (stdlib only). No webhooks,
 public ports, or databases: Bot API long-poll in, local CLI agent out.
@@ -9,7 +9,8 @@ public ports, or databases: Bot API long-poll in, local CLI agent out.
 
 - **DM + group chats** — groups are mention-triggered (@bot or reply-to-bot), DMs always answer
 - **Per-chat sessions** — each chat maps to one native runner session (`/new` forgets the mapping, `/status` inspects it)
-- **Live progress** — one status message, edited in place: elapsed seconds, real-time tool-call trail, tail of the answer as it streams (agent stdout is read live via `Popen`, not buffered)
+- **Optional mid-run steering** — OpenCode's local server transport accepts a new @mention while a run is active, consumes it at the next agent turn, and returns one combined reply; CLI transports keep the existing queued-message behavior
+- **Live progress** — one status message, edited in place: elapsed seconds, real-time tool-call trail, and answer tail, read from CLI stdout or the server's persisted transcript
 - **Voice notes** — auto-transcribed via any OpenAI-compatible `/audio/transcriptions` API (Groq Whisper, OpenAI, self-hosted) and fed to the agent as text; opt-in via config
 - **Scheduled prompts** — `/at 30m <prompt>` (also `s`/`h`); persisted in state and re-armed on restart
 - **Agent-initiated outbound** — `python3 tgbridge.py --send <chat_id> <text>` posts to allowlisted chats only, so the agent can proactively notify the group
@@ -33,7 +34,8 @@ public ports, or databases: Bot API long-poll in, local CLI agent out.
 
 ```json
 {
-  "runner": "codex",
+  "runner": "opencode",
+  "runner_mode": "cli",
   "codex_yolo": false,
   "bot_token": "123456:ABC-DEF...",
   "allowed_user_ids": [YOUR_TELEGRAM_USER_ID],
@@ -123,6 +125,9 @@ To post to Telegram yourself: python3 /path/to/tgbridge/tgbridge.py --send <chat
 | `workdir` | Working directory for the agent |
 | `runner` | `opencode` (default), `claude`, or `codex` |
 | `codex_yolo` | Pass Codex `--dangerously-bypass-approvals-and-sandbox`; grants authorized Telegram users unsandboxed access as the local OS user (default `false`) |
+| `runner_mode` | `cli` (portable default) or `server`; server adapters are capability-based and currently OpenCode implements mid-run steering |
+| `server_url` | Local runner server URL (default `http://127.0.0.1:4096`; `OPENCODE_SERVER` remains supported) |
+| `server_poll_s` | Local transcript polling interval in server mode (default `0.5`, clamped to `0.1`–`5.0`) |
 | `run_timeout_s` | Per-run timeout in seconds (default `900`); partial answers are kept |
 | `chunk` | Outgoing reply chunk size (default `3900`, Telegram caps at 4096) |
 | `outbox_dir` | Where agents drop files for auto-delivery (default `workdir/.tgbridge-outbox`) |
@@ -132,7 +137,10 @@ To post to Telegram yourself: python3 /path/to/tgbridge/tgbridge.py --send <chat
 | `transcribe_key` | API key; absent = voice notes disabled |
 | `transcribe_model` | Whisper model name (default `whisper-1`; Groq: `whisper-large-v3-turbo`) |
 
-Env: `OPENCODE_BIN` overrides the opencode binary path (default: mise shim).
+Env: `OPENCODE_BIN` overrides the opencode binary path (default: mise shim);
+`OPENCODE_SERVER` overrides the default server URL. An explicit `server_url` in
+config wins over the environment value. The older `server_runner: true` key is
+still accepted as `runner_mode: "server"` for backward compatibility.
 
 Runtime files (never committed) live under `~/.config/tgbridge/` with private
 permissions: `state.json` (session index, Telegram offset, scheduled prompts),
@@ -176,6 +184,16 @@ All runners share the same bridge surface: per-chat sessions, live tool
 trail, reactions, chunking. Sessions are titled with a time slug
 (`tg 20260903-0958`) on first message.
 
+The default `runner_mode: "cli"` works with all three runners and on both
+systemd and launchd installs. True mid-run steering needs a runner transport
+that can accept prompts while busy. Today that is OpenCode server mode: start
+`opencode serve --hostname 127.0.0.1 --port 4096`, set `runner` to `opencode`
+and `runner_mode` to `server`. The bridge polls the server's persisted message
+transcript, passes `workdir` on every API call, reports the active mode in
+`/status`, and writes steering delivery/failure events to the audit log. An
+unsupported runner/mode combination fails explicitly rather than silently
+pretending to steer.
+
 By default, human group messages that do not @mention or reply to this bot are
 buffered (last 20, with sender, time, and up to 200 characters) and injected
 into its next mention-triggered run. The agent can therefore hear the room but
@@ -213,7 +231,7 @@ and Anthropic's official [claude-plugins-official telegram plugin](https://githu
 
 ## Limitations
 
-- One run at a time (messages queue via Telegram's offset while the agent works)
+- One run at a time; cross-chat messages queue, and same-chat messages steer only when the selected server transport supports it
 - Bots cannot receive other bots' messages; peer-agent reports need an external shared event channel
 - Voice → text only; photos/documents are not ingested
 - Per-run timeout via `run_timeout_s` (default 15 minutes)

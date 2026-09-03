@@ -1,5 +1,8 @@
 {
   "runner": "opencode",
+  "runner_mode": "cli",
+  "server_url": "http://127.0.0.1:4096",
+  "server_poll_s": 0.5,
   "codex_yolo": false,
   "bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2P1sQ9tXyZ",
   "allowed_user_ids": [123456789],
