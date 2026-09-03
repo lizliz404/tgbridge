@@ -17,6 +17,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -191,18 +192,131 @@ def edit_status(cfg, live, final=None):
         )
 
 
-def run_agent(cfg, session_id, prompt, live=None):
-    """Stream opencode's JSON events live (Popen) instead of buffering them.
+def _bin(env_key, name):
+    p = os.environ.get(env_key) or shutil.which(name)
+    if not p:
+        raise RunnerError(
+            f"runner {name!r} not found on PATH; install it or set {env_key}"
+        )
+    return p
 
-    A watchdog Timer enforces RUN_TIMEOUT_S without blocking the read loop;
-    stderr is drained on a side thread so the pipe can never fill and deadlock.
-    """
+
+RUNNERS = {}
+
+
+def runner(name):
+    def deco(fn):
+        RUNNERS[name] = fn
+        return fn
+    return deco
+
+
+class RunnerError(Exception):
+    pass
+
+
+@runner("opencode")
+def _opencode(session_id, prompt):
+    """opencode run --format json. Events: sessionID / tool_use / text / reasoning."""
     cmd = [OPENCODE, "run", "--format", "json"]
     if session_id:
         cmd += ["--session", session_id]
     else:
         cmd += ["--title", time.strftime("tg %Y%m%d-%H%M")]
     cmd.append(prompt)
+
+    def parse(ev, acc):
+        part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
+        if ev.get("sessionID"):
+            acc["sid"] = ev["sessionID"]
+        t = ev.get("type")
+        if t == "tool_use":
+            return trail_line(part)
+        if t == "text" and part.get("text"):
+            acc["texts"].append(part["text"])
+            acc["thinking"] = None
+        elif t == "reasoning" and part.get("text"):
+            acc["thinking"] = part["text"]
+        elif t == "step_finish":
+            acc["cost"] = acc.get("cost", 0.0) + (part.get("cost") or 0.0)
+            acc["tokens"] = (part.get("tokens") or {}).get("total")
+        return None
+
+    return cmd, parse
+
+
+@runner("claude")
+def _claude(session_id, prompt):
+    """claude -p --output-format stream-json (resume via --resume)."""
+    cmd = [_bin("CLAUDE_BIN", "claude"), "-p", prompt,
+           "--output-format", "stream-json", "--verbose"]
+    if session_id:
+        cmd += ["--resume", session_id]
+
+    def parse(ev, acc):
+        t = ev.get("type")
+        if t == "system" and ev.get("session_id"):
+            acc["sid"] = ev["session_id"]
+        if t == "assistant":
+            for blk in (ev.get("message") or {}).get("content") or []:
+                bt = blk.get("type")
+                if bt == "tool_use":
+                    inp = blk.get("input") or {}
+                    s = next((v for v in inp.values() if isinstance(v, str)), "")
+                    return (f"🔧 {blk.get('tool', '?')}: "
+                            + s.replace("\n", " ")[:60])
+                if bt == "text" and blk.get("text"):
+                    acc["texts"].append(blk["text"])
+                    acc["thinking"] = None
+                elif bt == "thinking" and blk.get("thinking"):
+                    acc["thinking"] = blk["thinking"]
+        return None
+
+    return cmd, parse
+
+
+@runner("codex")
+def _codex(session_id, prompt):
+    """codex exec --json (resume via `codex exec resume <id>`). Best-effort."""
+    cmd = [_bin("CODEX_BIN", "codex"), "exec", "--json"]
+    if session_id:
+        cmd += ["resume", session_id]
+    cmd.append(prompt)
+
+    def parse(ev, acc):
+        t = ev.get("type")
+        if t == "thread.started" and ev.get("thread_id"):
+            acc["sid"] = ev["thread_id"]
+        item = ev.get("item") or {}
+        it = item.get("type")
+        if t in ("item.started", "item.completed") and it == "command_execution":
+            return "🔧 bash: " + (item.get("command") or "")[:60]
+        if it == "reasoning":
+            acc["thinking"] = (item.get("text") or "")[:200] or acc.get("thinking")
+        if it == "agent_message" and item.get("text"):
+            acc["texts"].append(item["text"])
+            acc["thinking"] = None
+        return None
+
+    return cmd, parse
+
+
+def run_agent(cfg, session_id, prompt, live=None):
+    """Stream the runner's JSON events live (Popen).
+
+    A watchdog Timer enforces RUN_TIMEOUT_S without blocking the read loop;
+    stderr is drained on a side thread so the pipe can never fill and deadlock.
+    """
+    rname = cfg.get("runner", "opencode")
+    runner_fn = RUNNERS.get(rname)
+    if not runner_fn:
+        return session_id, None, (
+            f"unknown runner {rname!r} (available: {', '.join(sorted(RUNNERS))})"
+        )
+    try:
+        cmd, parse = runner_fn(session_id, prompt)
+    except RunnerError as e:
+        return session_id, None, str(e)
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -221,7 +335,7 @@ def run_agent(cfg, session_id, prompt, live=None):
         target=lambda: errbuf.append(stderr.read() or ""), daemon=True
     )
     drain.start()
-    sid, texts = session_id, []
+    acc = {"sid": session_id, "texts": [], "thinking": None, "cost": 0.0, "tokens": None}
     try:
         for line in proc.stdout:
             line = line.strip()
@@ -231,30 +345,23 @@ def run_agent(cfg, session_id, prompt, live=None):
                 ev = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            sid = ev.get("sessionID") or sid
-            part = ev.get("part") or {}
-            if ev.get("type") == "tool_use" and live is not None:
-                live["trail"].append(trail_line(part if isinstance(part, dict) else {}))
-                edit_status(cfg, live)
-            elif ev.get("type") == "text":
-                if isinstance(part, dict) and part.get("text"):
-                    texts.append(part["text"])
-                    if live is not None:
-                        live["preview"] = part["text"]
-                        edit_status(cfg, live)
-            elif ev.get("type") == "reasoning" and live is not None:
-                if isinstance(part, dict) and part.get("text"):
-                    live["thinking"] = part["text"]
+            trail = parse(ev, acc)
+            sid = acc["sid"]
+            if live is not None:
+                if trail:
+                    live["trail"].append(trail)
                     edit_status(cfg, live)
-            elif ev.get("type") == "step_finish" and live is not None:
-                if isinstance(part, dict):
-                    live["cost"] = live.get("cost", 0.0) + (part.get("cost") or 0.0)
-                    live["tokens"] = (part.get("tokens") or {}).get("total")
+                if acc.get("thinking"):
+                    live["thinking"] = acc["thinking"]
+                    edit_status(cfg, live)
+                if acc["texts"]:
+                    live["preview"] = acc["texts"][-1]
+                    edit_status(cfg, live)
         proc.wait()
     finally:
         killer.cancel()
     if timed_out:
-        partial = "\n".join(texts).strip()
+        partial = "\n".join(acc["texts"]).strip()
         if partial:
             return (
                 sid,
@@ -267,9 +374,9 @@ def run_agent(cfg, session_id, prompt, live=None):
     if proc.returncode != 0:
         tail = (errbuf[0] if errbuf else "").strip()[-600:]
         return sid, None, f"opencode failed rc={proc.returncode}\n{tail}"
-    if not texts:
+    if not acc["texts"]:
         return sid, None, "agent returned no text"
-    return sid, "\n".join(texts).strip(), None
+    return sid, "\n".join(acc["texts"]).strip(), None
 
 
 def multipart(fields, file_field, filename, data, ctype):
@@ -542,6 +649,14 @@ def handle_update(cfg, state, upd):
         replied_to_bot = (reply.get("from") or {}).get("username") == bot_username
         if f"@{bot_username}" not in text and not replied_to_bot:
             if text.strip() and not text.lstrip().startswith("/"):
+                with STATE_LOCK:
+                    buf = state.setdefault("context", {}).setdefault(str(chat_id), [])
+                    buf.append({
+                        "who": (msg.get("from") or {}).get("first_name") or "?",
+                        "t": time.strftime("%H:%M"),
+                        "text": text.strip()[:200],
+                    })
+                    del buf[:-20]
                 now = time.time()
                 hints = state.get("hints", {})
                 if now - hints.get(str(chat_id), 0) > 1800:
@@ -635,7 +750,19 @@ def handle_update(cfg, state, upd):
         return
 
     audit("enqueue", chat_id=chat_id, user_id=user_id, chars=len(text.strip()))
-    PROMPT_Q.put((chat_id, message_id, text.strip()))
+    prompt_text = text.strip()
+    if chat_type != "private":
+        with STATE_LOCK:
+            buf = (state.get("context") or {}).pop(str(chat_id), None) or []
+        if buf:
+            digest = "\n".join(
+                f"- {e['who']} {e['t']}: {e['text']}" for e in buf[-20:]
+            )
+            prompt_text = (
+                "[group messages since your last turn — passive context, "
+                "nobody asked you anything yet:\n" + digest + "\n]\n\n" + prompt_text
+            )
+    PROMPT_Q.put((chat_id, message_id, prompt_text))
     if RUN_STATE["busy"]:
         send(
             cfg["bot_token"],

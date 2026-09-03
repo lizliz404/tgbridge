@@ -103,7 +103,8 @@ To post to Telegram yourself: python3 /path/to/tgbridge/tgbridge.py --send <chat
 | `bot_token` | Bot token from BotFather |
 | `allowed_user_ids` | Telegram user IDs allowed to talk (groups check the *sender*, not the chat) |
 | `allowed_chats` | Chat IDs the bridge listens in (DM + groups); also gates `--send` |
-| `workdir` | Working directory for `opencode run` |
+| `workdir` | Working directory for the agent |
+| `runner` | `opencode` (default), `claude`, or `codex` |
 | `transcribe_base_url` | OpenAI-compatible base URL for transcription (default `https://api.openai.com/v1`) |
 | `transcribe_key` | API key; absent = voice notes disabled |
 | `transcribe_model` | Whisper model name (default `whisper-1`; Groq: `whisper-large-v3-turbo`) |
@@ -112,6 +113,25 @@ Env: `OPENCODE_BIN` overrides the opencode binary path (default: mise shim).
 
 State files (both machines, never committed): `~/.config/tgbridge/state.json`
 (sessions, offset, scheduled prompts) and `audit.jsonl`.
+
+## Runners
+
+The bridge drives any of three agent CLIs (config key `runner`):
+
+| runner | non-interactive | resume | notes |
+|---|---|---|---|
+| `opencode` | `opencode run --format json` | `--session` | default; live tool trail + thinking + cost |
+| `claude` | `claude -p --output-format stream-json` | `--resume` | set `CLAUDE_BIN` if not on PATH |
+| `codex` | `codex exec --json` | `exec resume <id>` | best-effort; set `CODEX_BIN` |
+
+All runners share the same bridge surface: per-chat sessions, live tool
+trail, reactions, chunking. Sessions are titled with a time slug
+(`tg 20260903-0958`) on first message.
+
+Group messages that don't @mention the bot are buffered (last 20, with
+sender + time) and injected as passive context into the next
+mention-triggered run — so the agent isn't deaf to the conversation,
+but only speaks when spoken to.
 
 ## Design notes
 
