@@ -11,6 +11,11 @@ trail and answer preview (claudegram/xhyu/OpenClaw pattern).
 
 Extra surfaces: `tgbridge.py --send <chat_id> <text>` lets the agent itself
 post to allowlisted chats (Telegram-Bridge-MCP idea, no MCP protocol).
+
+Outbound rendering borrows from Hermes' own gateway (hermes-agent sources):
+UTF-16-aware chunk limits, inline-code split avoidance, GFM table
+conversion, placeholder-stashed HTML conversion, and a clean-markup
+plain-text fallback.
 """
 
 import json
@@ -117,43 +122,121 @@ def react(cfg, chat_id, message_id, emoji):
     )
 
 
-def split_chunks(text, limit=CHUNK):
-    if len(text) <= limit:
-        return [text]
-    chunks, rest = [], text
-    while rest:
-        if len(rest) <= limit:
-            chunks.append(rest)
-            break
-        cut = rest.rfind("\n\n", 0, limit)
-        if cut < 1:
-            cut = rest.rfind("\n", 0, limit)
-        if cut < 1:
-            cut = rest.rfind(" ", 0, limit)
-        if cut < 1:
-            cut = limit
-        chunks.append(rest[:cut].rstrip())
-        rest = rest[cut:].lstrip()
-    return [c for c in chunks if c] or [""]
+def utf16_len(s):
+    """Telegram's 4096 cap counts UTF-16 code units, not Python codepoints
+    (astral emoji cost 2). Ported from hermes-agent gateway/platforms/base.py."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def _prefix_within_utf16_limit(s, limit):
+    """Longest prefix whose UTF-16 length <= limit; the codepoint-slice never
+    lands mid-character (hermes-agent gateway/platforms/base.py)."""
+    if utf16_len(s) <= limit:
+        return s
+    lo, hi = 0, len(s)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if utf16_len(s[:mid]) <= limit:
+            lo = mid
+        else:
+            hi = mid - 1
+    return s[:lo]
+
+
+def _wrap_markdown_tables(text):
+    """Rewrite GFM pipe tables into bold-heading + bullet groups.
+
+    Telegram HTML has no table entity, so raw pipe rows render as escape
+    noise. Ported from hermes-agent gateway/platforms/helpers.py
+    convert_table_to_bullets: tables inside fenced code blocks are left alone.
+    """
+    if "|" not in text or "-" not in text:
+        return text
+
+    def _split_row(line):
+        s = line.strip()
+        if s.startswith("|"):
+            s = s[1:]
+        if s.endswith("|"):
+            s = s[:-1]
+        return [c.strip() for c in s.split("|")]
+
+    def _render_block(block):
+        headers = _split_row(block[0])
+        if len(headers) < 2:
+            return "\n".join(block)
+        groups = []
+        for index, row in enumerate(block[2:], start=1):
+            cells = _split_row(row)
+            while len(cells) < len(headers):
+                cells.append("")
+            cells = cells[: len(headers)]
+            heading = next((c for c in cells if c), f"Row {index}")
+            bullets = [f"• {h}: {v}" for h, v in zip(headers, cells) if v != heading]
+            groups.append("\n".join([f"**{heading}**", *bullets]))
+        return "\n\n".join(groups)
+
+    sep = re.compile(r"^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?\s*$")
+    out, in_fence, lines, i = [], False, text.split("\n"), 0
+    while i < len(lines):
+        line = lines[i]
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            out.append(line)
+            i += 1
+            continue
+        if (
+            not in_fence
+            and "|" in line
+            and i + 1 < len(lines)
+            and sep.match(lines[i + 1])
+        ):
+            block = [line, lines[i + 1]]
+            j = i + 2
+            while j < len(lines) and lines[j].strip() and "|" in lines[j]:
+                block.append(lines[j])
+                j += 1
+            out.append(_render_block(block))
+            i = j
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
 
 
 def esc(s):
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+MD_LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+
+
 def inline_html(line):
     """One markdown line -> Telegram HTML. Line-local by design: no entity
     ever spans lines, so per-chunk conversion stays balanced even when a
-    chunk boundary lands mid-paragraph."""
+    chunk boundary lands mid-paragraph. Converted code spans and links are
+    stashed hermes-style (format_message placeholders) so later substitutions
+    never touch their contents."""
     s = esc(line)
+    stash = []
+
+    def _keep(m):
+        key = f"\x00tg{len(stash)}\x00"
+        stash.append((key, m.group(0)))
+        return key
+
     s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
-    s = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", s)
+    s = re.sub(r"<code>[^<]*</code>", _keep, s)
     s = MD_LINK.sub(r'<a href="\2">\1</a>', s)
+    s = re.sub(r"<a href=[^>]*>[^<]*</a>", _keep, s)
+    s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+    s = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"<i>\1</i>", s)
+    s = re.sub(r"~~(.+?)~~", r"<s>\1</s>", s)
+    s = re.sub(r"\|\|(.+?)\|\|", r"<tg-spoiler>\1</tg-spoiler>", s)
     s = re.sub(r"^#{1,6}\s+(.*)", r"<b>\1</b>", s)
+    for key, val in stash:
+        s = s.replace(key, val)
     return s
-
-
-MD_LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
 
 
 def md_to_html(md, in_pre=False):
@@ -165,34 +248,112 @@ def md_to_html(md, in_pre=False):
             out.append("</pre>" if in_pre else "<pre>")
             in_pre = not in_pre
             continue
-        out.append(esc(line) if in_pre else inline_html(line))
+        ls = line.lstrip()
+        if in_pre:
+            out.append(esc(line))
+        elif ls.startswith(">") and (len(ls) == 1 or ls[1] in " >"):
+            out.append(
+                "<blockquote>"
+                + inline_html(ls.lstrip("> ").rstrip())
+                + "</blockquote>"
+            )
+        else:
+            out.append(inline_html(line))
     if in_pre:
         out.append("</pre>")
     return "\n".join(out), in_pre
 
 
+def _strip_html_markup(md):
+    """Markdown -> clean plain text for the fallback send (hermes-agent's
+    _strip_mdv2 contract: the resend must never show raw **/```/[]()
+    syntax that the failed formatted attempt would have consumed)."""
+    s = re.sub(r"```[^\n]*\n?", "", md)
+    s = re.sub(r"``([^`]+)``", r"\1", s)
+    s = re.sub(r"`([^`]+)`", r"\1", s)
+    s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)
+    s = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"\1", s)
+    s = re.sub(r"~~(.+?)~~", r"\1", s)
+    s = re.sub(r"\|\|(.+?)\|\|", r"\1", s)
+    s = MD_LINK.sub(r"\1 (\2)", s)
+    s = re.sub(r"^#{1,6}\s+", "", s, flags=re.MULTILINE)
+    s = re.sub(r"^> ?", "", s, flags=re.MULTILINE)
+    return s.rstrip()
+
+
+def _balanced(html):
+    """True when every <tag> in the chunk is closed and nesting matches —
+    an unbalanced chunk must never be offered to Telegram as HTML."""
+    stack = []
+    for m in re.finditer(r"<(/?)([a-z][a-z0-9-]*)(?:\s[^>]*)?>", html):
+        if m.group(1):
+            if not stack or stack[-1] != m.group(2):
+                return False
+            stack.pop()
+        else:
+            stack.append(m.group(2))
+    return not stack
+
+
+def split_chunks(text, limit=CHUNK):
+    if utf16_len(text) <= limit:
+        return [text]
+    chunks, rest = [], text
+    while rest:
+        if utf16_len(rest) <= limit:
+            chunks.append(rest)
+            break
+        region = _prefix_within_utf16_limit(rest, limit)
+        cut = region.rfind("\n\n")
+        if cut < 1:
+            cut = region.rfind("\n")
+        if cut < 1:
+            cut = region.rfind(" ")
+        if cut < 1:
+            cut = len(region)
+        # Never cut inside an inline code span: an odd number of unescaped
+        # backticks means the split lands in an open span (hermes-agent
+        # truncate_message); pull the cut back before the unpaired backtick.
+        candidate = rest[:cut]
+        if (candidate.count("`") - candidate.count("\\`")) % 2 == 1:
+            last = candidate.rfind("`")
+            while last > 0 and candidate[last - 1] == "\\":
+                last = candidate.rfind("`", 0, last)
+            safe = max(candidate.rfind("\n", 0, last), candidate.rfind(" ", 0, last))
+            if safe >= 1 and safe >= cut // 4:
+                cut = safe
+        if cut < 1:
+            cut = 1  # degenerate budget: always consume one codepoint
+        chunks.append(rest[:cut].rstrip())
+        rest = rest[cut:].lstrip()
+    return [c for c in chunks if c] or [""]
+
+
 def send(token, chat_id, text, reply_to=None, chunk_limit=CHUNK):
     """Send markdown text rendered as Telegram HTML; any chunk Telegram
     refuses (bad entity, overlong tag) falls back to plain text so a
-    formatting bug can never drop the payload."""
+    formatting bug can never drop the payload. Chunks whose HTML is
+    unbalanced locally skip the doomed HTML attempt entirely."""
     ok = True
     in_pre = False
+    text = _wrap_markdown_tables(text or "")
     for i, chunk in enumerate(split_chunks(text, chunk_limit)):
         html, in_pre = md_to_html(chunk, in_pre)
         params = {
             "chat_id": chat_id,
             "text": html,
-            "parse_mode": "HTML",
             "link_preview_options": json.dumps({"is_disabled": True}),
         }
+        if _balanced(html):
+            params["parse_mode"] = "HTML"
         if i == 0 and reply_to:
             params["reply_parameters"] = json.dumps({"message_id": reply_to})
-        res = api(token, "sendMessage", **params)
+        res = api(token, "sendMessage", **params) if "parse_mode" in params else None
         if not res or not res.get("ok"):
             log("html send failed — resending chunk as plain text")
             params.pop("parse_mode", None)
             params.pop("link_preview_options", None)
-            params["text"] = chunk
+            params["text"] = _strip_html_markup(chunk) or chunk
             res = api(token, "sendMessage", **params)
         if not res or not res.get("ok"):
             ok = False
@@ -665,6 +826,28 @@ def selftest():
         or pre
     ):
         fails.append("md inline")
+    # new inline entities: italic / strikethrough / spoiler; bold wins over
+    # inner single asterisks (hermes format_message parity)
+    h, pre = md_to_html("*it* ~~gone~~ ||shh|| **b*bold*i**")
+    if h != "<i>it</i> <s>gone</s> <tg-spoiler>shh</tg-spoiler> <b>b*bold*i</b>" or pre:
+        fails.append("md inline rich")
+    # blockquote line
+    h, pre = md_to_html("text\n> quoted line\nafter")
+    if h != "text\n<blockquote>quoted line</blockquote>\nafter" or pre:
+        fails.append("md blockquote")
+    # blockquote chars in prose text are NOT blockquotes
+    h, pre = md_to_html("a > b implies")
+    if "<blockquote>" in h:
+        fails.append("md blockquote false positive")
+    # tables convert to bullets exactly like hermes convert_table_to_bullets:
+    # heading = first non-empty cell, bullet duplicating the heading is dropped
+    h = _wrap_markdown_tables("| a | b |\n|---|---|\n| 1 | 2 |")
+    if "**1**" not in h or "• b: 2" not in h or "|" in h:
+        fails.append("md table")
+    h = _wrap_markdown_tables("```\n| a | b |\n|---|---|\n| 1 | 2 |\n```")
+    if "| 1 | 2 |" not in h:
+        fails.append("md table in fence")
+    # fenced block with language
     h, pre = md_to_html("a\n```py\nx < y\n```\nb")
     if pre or h != "a\n<pre>\nx &lt; y\n</pre>\nb":
         fails.append("md fence")
@@ -678,6 +861,38 @@ def selftest():
         or h2.count("<pre>") != 1
     ):
         fails.append("md fence continuation")
+    # _balanced: valid vs broken chunks
+    if not _balanced("<b>a<code>b</code></b> &amp; <i>c</i>"):
+        fails.append("balanced ok")
+    if _balanced("<b>a<code>b</b>") or _balanced("</b>") or _balanced("ok <b>"):
+        fails.append("balanced broken")
+    # _strip_html_markup: fallback text has no raw markup syntax left
+    plain = _strip_html_markup("# Head\n\n**hi** `x <y>` [t](http://e/x)\n> q\n```py\ncode\n```")
+    if (
+        "**" in plain
+        or "`" in plain
+        or "```" in plain
+        or "](" in plain
+        or plain != "Head\n\nhi x <y> t (http://e/x)\nq\ncode"
+    ):
+        fails.append("strip markup")
+    # utf16 chunking: astral chars counted as 2 units, never split mid-char
+    tc = "😀" * 10
+    if utf16_len(tc) != 20:
+        fails.append("utf16 len")
+    if len(split_chunks(tc + "x", limit=15)) != 2 or "".join(
+        split_chunks(tc + "x", limit=15)
+    ) != tc + "x":
+        fails.append("utf16 chunk content")
+    # inline-code split avoidance: cut lands outside the backtick span
+    parts = split_chunks("word " + "z" * 40 + " `code span` tail", limit=20)
+    joined = "\n".join(parts)
+    if joined.count("`") % 2 != 0:
+        fails.append("chunk inline code")
+    # chunk content is preserved across all chunks
+    if split_chunks("a" * 45, limit=20) != ["a" * 20, "a" * 20, "a" * 5]:
+        fails.append("chunk preserve")
+    # table conversion integrates with send path (via fake_api below)
 
     # send(): HTML refused -> plain-text fallback, never lost
     sent = []
@@ -695,8 +910,35 @@ def selftest():
             fails.append("send fallback ok")
     finally:
         globals()["api"] = orig_api
-    if len(sent) != 2 or "parse_mode" in sent[1] or sent[1]["text"] != "hi **there**":
+    # fallback resend is clean plain text, never the raw markdown
+    if (
+        len(sent) != 2
+        or "parse_mode" in sent[1]
+        or sent[1]["text"] != "hi there"
+    ):
         fails.append("send fallback shape")
+
+    # table markdown flows through send() as converted bullet HTML
+    sent.clear()
+
+    def fake_api2(token, method, **params):
+        sent.append(params)
+        return {"ok": True}
+
+    globals()["api"] = fake_api2
+    try:
+        if not send("t", 1, "| a | b |\n|---|---|\n| 1 | 2 |"):
+            fails.append("send table ok")
+    finally:
+        globals()["api"] = orig_api
+    if (
+        len(sent) != 1
+        or sent[0].get("parse_mode") != "HTML"
+        or "<b>1</b>" not in sent[0]["text"]
+        or "• b: 2" not in sent[0]["text"]
+        or "|" in sent[0]["text"]
+    ):
+        fails.append("send table shape")
 
     # every runner builds a cmd and parses a synthetic event
     for name, fn in RUNNERS.items():
@@ -794,7 +1036,7 @@ def selftest():
     print(
         "selftest OK:",
         ", ".join(sorted(RUNNERS)),
-        "runners + unpack + chunker + announce + kill + timeout + botcmd",
+        "runners + unpack + render + chunker + announce + kill + timeout + botcmd",
     )
 
 
