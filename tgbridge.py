@@ -33,9 +33,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-CONFIG_PATH = os.path.expanduser("~/.config/tgbridge/config.json")
-STATE_PATH = os.path.expanduser("~/.config/tgbridge/state.json")
-AUDIT_PATH = os.path.expanduser("~/.config/tgbridge/audit.jsonl")
+CONFIG_DIR = os.path.expanduser("~/.config/tgbridge")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+STATE_PATH = os.path.join(CONFIG_DIR, "state.json")
+AUDIT_PATH = os.path.join(CONFIG_DIR, "audit.jsonl")
 OPENCODE = os.environ.get(
     "OPENCODE_BIN", os.path.expanduser("~/.local/share/mise/shims/opencode")
 )
@@ -53,12 +54,34 @@ def log(msg):
     print(time.strftime("%H:%M:%S"), msg, flush=True)
 
 
+def ensure_private_dir(path):
+    """Create private runtime storage and repair permissive existing modes."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+def ensure_private_storage():
+    ensure_private_dir(CONFIG_DIR)
+    for path in (
+        CONFIG_PATH,
+        STATE_PATH,
+        AUDIT_PATH,
+        os.path.join(CONFIG_DIR, "tgbridge.log"),
+    ):
+        if os.path.isfile(path):
+            os.chmod(path, 0o600)
+
+
 def audit(event, **fields):
     """Append-only JSONL trail of bridge actions (claude-code-telegram pattern)."""
     rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "event": event, **fields}
     try:
-        with AUDIT_LOCK, open(AUDIT_PATH, "a") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        ensure_private_dir(CONFIG_DIR)
+        with AUDIT_LOCK:
+            fd = os.open(AUDIT_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            os.chmod(AUDIT_PATH, 0o600)
+            with os.fdopen(fd, "a") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except OSError:
         pass
 
@@ -72,10 +95,20 @@ def load_json(path, default):
 
 
 def save_json(path, data):
+    ensure_private_dir(os.path.dirname(path) or ".")
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, path)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def api(token, method, **params):
@@ -450,12 +483,13 @@ def send_retry(cfg, chat_id, text, reply_to=None):
     audit("delivery_failed", chat_id=chat_id, chars=len(text or ""))
     log(f"chat={chat_id} DELIVERY FAILED after retry ({len(text or '')} chars)")
     try:
-        d = os.path.expanduser("~/.config/tgbridge/undelivered")
-        os.makedirs(d, exist_ok=True)
-        with open(
-            os.path.join(d, time.strftime("%Y%m%d-%H%M%S") + f"-{chat_id}.txt"), "w"
-        ) as f:
+        d = os.path.join(CONFIG_DIR, "undelivered")
+        ensure_private_dir(d)
+        path = os.path.join(d, time.strftime("%Y%m%d-%H%M%S") + f"-{chat_id}.txt")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             f.write(text or "")
+        os.chmod(path, 0o600)
         log("saved undelivered payload")
     except OSError:
         pass
@@ -1157,6 +1191,7 @@ def selftest():
     # authorization: chats are always explicit; DMs always require a user ID.
     # Group-wide trust is opt-in and applies only inside an allowed group.
     auth_cfg = {
+        "bot_token": "t",
         "allowed_chats": [11, -10022],
         "allowed_user_ids": [11],
         "allow_all_users_in_allowed_groups": True,
@@ -1176,6 +1211,90 @@ def selftest():
     strict_cfg = {"allowed_chats": [-10022], "allowed_user_ids": [11]}
     if is_authorized(strict_cfg, -10022, "supergroup", 99):
         fails.append("auth strict group")
+    if not is_operator(auth_cfg, 11) or is_operator(auth_cfg, 99):
+        fails.append("operator fallback")
+    explicit_ops = {**auth_cfg, "operator_user_ids": [42]}
+    if is_operator(explicit_ops, 11) or not is_operator(explicit_ops, 42):
+        fails.append("operator explicit")
+
+    # An allowed group member can prompt, but passive group text is private by
+    # default and shared-state commands remain operator-only.
+    auth_state = {"bot_username": "Bot", "sessions": {"-10022": "keep-me"}}
+    auth_sent = []
+
+    def auth_api(token, method, **params):
+        auth_sent.append((method, params))
+        return {"ok": True, "result": {"message_id": 1}}
+
+    orig_audit = audit
+    globals()["api"] = auth_api
+    globals()["audit"] = lambda *args, **kwargs: None
+    try:
+        handle_update(
+            auth_cfg,
+            auth_state,
+            {
+                "message": {
+                    "chat": {"id": -10022, "type": "supergroup"},
+                    "from": {"id": 99, "first_name": "member"},
+                    "message_id": 1,
+                    "text": "background conversation",
+                }
+            },
+        )
+        if auth_state.get("context"):
+            fails.append("group context default private")
+        capture_state = {
+            "bot_username": "Bot",
+            "hints": {"-10022": time.time()},
+        }
+        handle_update(
+            {**auth_cfg, "capture_group_context": True},
+            capture_state,
+            {
+                "message": {
+                    "chat": {"id": -10022, "type": "supergroup"},
+                    "from": {"id": 99, "first_name": "member"},
+                    "message_id": 2,
+                    "text": "explicitly captured context",
+                }
+            },
+        )
+        if len((capture_state.get("context") or {}).get("-10022", [])) != 1:
+            fails.append("group context opt-in")
+        handle_update(
+            auth_cfg,
+            auth_state,
+            {
+                "message": {
+                    "chat": {"id": -10022, "type": "supergroup"},
+                    "from": {"id": 99, "first_name": "member"},
+                    "message_id": 3,
+                    "text": "/new@Bot",
+                }
+            },
+        )
+    finally:
+        globals()["api"] = orig_api
+        globals()["audit"] = orig_audit
+    if auth_state["sessions"].get("-10022") != "keep-me":
+        fails.append("operator-only new")
+    if not any("restricted to bridge operators" in p.get("text", "") for _, p in auth_sent):
+        fails.append("operator denial reply")
+
+    # Runtime metadata may contain prompts/session IDs, so modes are repaired
+    # even when a permissive umask or an older version created the files.
+    import stat as _stat
+    import tempfile as _tempfile
+
+    with _tempfile.TemporaryDirectory() as private_dir:
+        os.chmod(private_dir, 0o755)
+        private_state = os.path.join(private_dir, "state.json")
+        save_json(private_state, {"sessions": {}})
+        if _stat.S_IMODE(os.stat(private_dir).st_mode) != 0o700:
+            fails.append("private dir mode")
+        if _stat.S_IMODE(os.stat(private_state).st_mode) != 0o600:
+            fails.append("private state mode")
 
     if fails:
         for f in fails:
@@ -1331,12 +1450,13 @@ def save_document(cfg, msg):
     fp = (r or {}).get("result", {}).get("file_path")
     if not fp:
         return None
-    inbox = os.path.expanduser("~/.config/tgbridge/inbox")
-    os.makedirs(inbox, exist_ok=True)
+    inbox = os.path.join(CONFIG_DIR, "inbox")
+    ensure_private_dir(inbox)
     dest = os.path.join(inbox, time.strftime("%Y%m%d-%H%M%S") + "-" + name)
     url = f"https://api.telegram.org/file/bot{cfg['bot_token']}/{fp}"
     try:
         urllib.request.urlretrieve(url, dest)
+        os.chmod(dest, 0o600)
     except Exception as e:
         log(f"download {name}: {e}")
         return None
@@ -1400,6 +1520,18 @@ def is_authorized(cfg, chat_id, chat_type, user_id):
     return user_id in (cfg.get("allowed_user_ids") or [])
 
 
+def is_operator(cfg, user_id):
+    """Operators may mutate shared bridge/session state.
+
+    Backward compatible: existing installs use allowed_user_ids until an
+    explicit operator_user_ids list is configured.
+    """
+    operators = cfg.get("operator_user_ids")
+    if operators is None:
+        operators = cfg.get("allowed_user_ids") or []
+    return user_id in operators
+
+
 def handle_update(cfg, state, upd):
     msg = upd.get("message")
     if not msg:
@@ -1418,7 +1550,11 @@ def handle_update(cfg, state, upd):
         reply = msg.get("reply_to_message") or {}
         replied_to_bot = (reply.get("from") or {}).get("username") == bot_username
         if f"@{bot_username}" not in text and not replied_to_bot:
-            if text.strip() and not text.lstrip().startswith("/"):
+            if (
+                cfg.get("capture_group_context", False)
+                and text.strip()
+                and not text.lstrip().startswith("/")
+            ):
                 with STATE_LOCK:
                     buf = state.setdefault("context", {}).setdefault(str(chat_id), [])
                     buf.append(
@@ -1456,6 +1592,10 @@ def handle_update(cfg, state, upd):
             "commands: /new reset session · /status state · /at 30m <prompt> "
             "schedule · /cancel abort current run · anything else goes to the agent",
         )
+        return
+    if cmd in ("/new", "/cancel", "/at") and not is_operator(cfg, user_id):
+        audit("operator_denied", chat_id=chat_id, user_id=user_id, command=cmd)
+        send(cfg["bot_token"], chat_id, f"{cmd} is restricted to bridge operators")
         return
     if cmd == "/new":
         with STATE_LOCK:
@@ -1554,7 +1694,7 @@ def handle_update(cfg, state, upd):
 
     audit("enqueue", chat_id=chat_id, user_id=user_id, chars=len(text.strip()))
     prompt_text = text.strip()
-    if chat_type != "private":
+    if chat_type != "private" and cfg.get("capture_group_context", False):
         with STATE_LOCK:
             buf = (state.get("context") or {}).pop(str(chat_id), None) or []
         if buf:
@@ -1576,6 +1716,7 @@ def cli_send(args):
     """Agent-initiated outbound: tgbridge.py --send <chat_id> <text>."""
     if len(args) < 2:
         sys.exit("usage: tgbridge.py --send <chat_id> <text>")
+    ensure_private_storage()
     cfg = load_json(CONFIG_PATH, None)
     if not cfg:
         sys.exit(f"missing config {CONFIG_PATH}")
@@ -1600,6 +1741,9 @@ def on_stop(signum, frame):
 
 def run(cfg):
     state = load_json(STATE_PATH, {})
+    if not cfg.get("capture_group_context", False):
+        state.pop("context", None)
+        state.pop("hints", None)
     me = api(cfg["bot_token"], "getMe")
     if not me or not me.get("ok"):
         sys.exit("getMe failed: bad token?")
@@ -1683,6 +1827,7 @@ def main():
         return
     selftest()  # regression gate — a bridge that fails checks must not go live
 
+    ensure_private_storage()
     cfg = load_json(CONFIG_PATH, None)
     if not cfg:
         sys.exit(f"missing config {CONFIG_PATH}")

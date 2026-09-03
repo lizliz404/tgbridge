@@ -4,6 +4,8 @@
   "allowed_user_ids": [123456789],
   "allowed_chats": [123456789, -1001234567890],
   "allow_all_users_in_allowed_groups": false,
+  "operator_user_ids": [123456789],
+  "capture_group_context": false,
   "workdir": "/home/you/your-project",
   "run_timeout_s": 900,
   "chunk": 3900,
