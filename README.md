@@ -33,6 +33,8 @@ public ports, or databases: Bot API long-poll in, local CLI agent out.
 
 ```json
 {
+  "runner": "codex",
+  "codex_yolo": false,
   "bot_token": "123456:ABC-DEF...",
   "allowed_user_ids": [YOUR_TELEGRAM_USER_ID],
   "allowed_chats": [YOUR_TELEGRAM_USER_ID, -1000000000000],
@@ -120,6 +122,7 @@ To post to Telegram yourself: python3 /path/to/tgbridge/tgbridge.py --send <chat
 | `capture_group_context` | Buffer the last 20 eligible human group messages for the next prompt (default `true`) |
 | `workdir` | Working directory for the agent |
 | `runner` | `opencode` (default), `claude`, or `codex` |
+| `codex_yolo` | Pass Codex `--dangerously-bypass-approvals-and-sandbox`; grants authorized Telegram users unsandboxed access as the local OS user (default `false`) |
 | `run_timeout_s` | Per-run timeout in seconds (default `900`); partial answers are kept |
 | `chunk` | Outgoing reply chunk size (default `3900`, Telegram caps at 4096) |
 | `outbox_dir` | Where agents drop files for auto-delivery (default `workdir/.tgbridge-outbox`) |
@@ -153,6 +156,21 @@ The bridge drives any of three agent CLIs (config key `runner`):
 | `opencode` | `opencode run --format json` | `--session` | default; live tool trail + thinking + cost |
 | `claude` | `claude -p --output-format stream-json` | `--resume` | set `CLAUDE_BIN` if not on PATH |
 | `codex` | `codex exec --json` | `exec resume <id>` | best-effort; set `CODEX_BIN` |
+
+### Codex permission mode
+
+Codex CLI policy is read-only in some non-interactive environments. The bridge
+does not silently override that default. Set `codex_yolo` to `true` only when
+the bot token, every allowed chat, and every human authorized in those chats are
+trusted to control the host machine. The bridge then adds
+`--dangerously-bypass-approvals-and-sandbox` to both new and resumed Codex runs.
+
+This is actual host authority, not merely a more capable chat mode: prompts may
+read or modify files, run commands, use locally available credentials, start or
+stop processes, and trigger external side effects as the service's OS user.
+Discovering the bot ID alone still does not bypass the chat/sender gates, but an
+authorized member of a group configured with
+`allow_all_users_in_allowed_groups: true` receives this authority.
 
 All runners share the same bridge surface: per-chat sessions, live tool
 trail, reactions, chunking. Sessions are titled with a time slug

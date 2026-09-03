@@ -1,5 +1,6 @@
 {
   "runner": "opencode",
+  "codex_yolo": false,
   "bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2P1sQ9tXyZ",
   "allowed_user_ids": [123456789],
   "allowed_chats": [123456789, -1001234567890],
