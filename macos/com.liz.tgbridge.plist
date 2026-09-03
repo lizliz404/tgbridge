@@ -17,7 +17,8 @@
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/tgbridge.log</string>
-  <key>StandardErrorPath</key><string>/tmp/tgbridge.log</string>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardOutPath</key><string>/Users/YOU/.config/tgbridge/tgbridge.log</string>
+  <key>StandardErrorPath</key><string>/Users/YOU/.config/tgbridge/tgbridge.log</string>
 </dict>
 </plist>

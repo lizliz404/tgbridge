@@ -1,29 +1,29 @@
 # tgbridge
 
-A minimal Telegram bridge for a local [opencode](https://opencode.ai) agent.
+A minimal Telegram bridge for a local opencode, Claude, or Codex agent.
 
-~1210 lines of Python, **zero dependencies** (stdlib only). No webhooks, no
-public ports, no databases: Bot API long-poll in, `opencode run` out.
+A single Python file with **zero dependencies** (stdlib only). No webhooks,
+public ports, or databases: Bot API long-poll in, local CLI agent out.
 
 ## Features
 
 - **DM + group chats** — groups are mention-triggered (@bot or reply-to-bot), DMs always answer
-- **Per-chat sessions** — each chat gets its own persistent opencode session (`/new` to reset, `/status` to inspect)
+- **Per-chat sessions** — each chat maps to one native runner session (`/new` forgets the mapping, `/status` inspects it)
 - **Live progress** — one status message, edited in place: elapsed seconds, real-time tool-call trail, tail of the answer as it streams (agent stdout is read live via `Popen`, not buffered)
 - **Voice notes** — auto-transcribed via any OpenAI-compatible `/audio/transcriptions` API (Groq Whisper, OpenAI, self-hosted) and fed to the agent as text; opt-in via config
 - **Scheduled prompts** — `/at 30m <prompt>` (also `s`/`h`); persisted in state and re-armed on restart
 - **Agent-initiated outbound** — `python3 tgbridge.py --send <chat_id> <text>` posts to allowlisted chats only, so the agent can proactively notify the group
 - **Audit log** — every enqueue/run/send/schedule event appended to `~/.config/tgbridge/audit.jsonl`
 - **Never dies silently** — any fatal crash or SIGTERM announces `💀 …` to every allowed chat (best-effort, 3s each) before systemd restarts it; a dead worker thread is detected and respawned; a failed answer delivery retries once, then is audited and saved to `~/.config/tgbridge/undelivered/` instead of vanishing; a missing runner binary warns at startup instead of crashing
-- **`/cancel`** — abort the running agent (SIGTERM, SIGKILL after 5s); the run reports `🛑 cancelled by user`
+- **Ambient group context** — hears recent human conversation but only runs when explicitly @mentioned or replied to
 - **Slash-command menu** — `/new`, `/status`, `/at`, `/cancel`, `/help` registered via `setMyCommands`
-- **Chat + user allowlist** — double gate; unknown chats/users are dropped silently
+- **Chat + sender policy** — double allowlist by default; optionally trust all members of specifically allowlisted groups while keeping DMs user-allowlisted
+- **Private runtime state** — config, session index, audit log, attachments, and undelivered replies are kept under `~/.config/tgbridge` with private permissions
 - **Selftest gate** — `python3 tgbridge.py --selftest` runs at every startup; a bridge that fails its own checks does not go live
 - **Emoji lifecycle** — 👀 received → ✅ done / 🔴 error, via `setMessageReaction`
 - **Typing indicator** — `sendChatAction` keep-alive for the whole run (re-fired every 4s)
 - **Paragraph-aware chunking** — replies split at `\n\n` > `\n` > space (UTF-16 aware, never mid-emoji or mid-code-span), first chunk reply-threaded to your message. Markdown renders as Telegram HTML — code fences with syntax highlighting, tables as bullet groups, merged blockquotes (incl. expandable), bold/italic/strike/spoiler/links — with an automatic clean-plain-text fallback if Telegram ever refuses the HTML
 - **Rate-limit friendly** — honors Telegram 429 `retry_after`; poll failures back off exponentially (3s → 30s)
-- **Chat + user allowlist** — double gate; unknown chats/users are dropped silently
 
 ## Setup
 
@@ -36,6 +36,8 @@ public ports, no databases: Bot API long-poll in, `opencode run` out.
   "bot_token": "123456:ABC-DEF...",
   "allowed_user_ids": [YOUR_TELEGRAM_USER_ID],
   "allowed_chats": [YOUR_TELEGRAM_USER_ID, -1000000000000],
+  "allow_all_users_in_allowed_groups": false,
+  "capture_group_context": true,
   "workdir": "/home/you/project",
   "transcribe_base_url": "https://api.groq.com/openai/v1",
   "transcribe_key": "gsk_...",
@@ -64,10 +66,10 @@ journalctl --user -u tgbridge -f
 macOS (launchd):
 
 ```sh
-# edit macos/com.liz.tgbridge.plist: WorkingDirectory + OPENCODE_BIN paths
+# edit macos/com.liz.tgbridge.plist: user, WorkingDirectory, and runner paths
 cp macos/com.liz.tgbridge.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.liz.tgbridge.plist
-tail -f /tmp/tgbridge.log
+tail -f ~/.config/tgbridge/tgbridge.log
 ```
 
 or just run it inside `tmux`: `OPENCODE_BIN=$(which opencode) python3 tgbridge.py`
@@ -79,10 +81,17 @@ a group admin, so it can see plain messages.
 ### Multiple agents in one group
 
 One bridge per machine, one bot per bridge (a bot token allows exactly one
-poller). Each collaborator creates their own bot, runs their own bridge against
-their own local opencode, and adds their bot to the shared group. Put **all**
-human user IDs in every config's `allowed_user_ids` — the gate checks the
-*sender*, so anyone allowlisted can talk to any bot in the group.
+poller). Each collaborator can create their own bot, run their own bridge
+against their local agent, and add their bot to the shared group. By default,
+put **all** human user IDs in every config's `allowed_user_ids` — the gate checks
+the *sender*, so anyone allowlisted can talk to any bot in the group.
+
+If membership of one private, explicitly allowlisted group is the trust boundary,
+set `allow_all_users_in_allowed_groups` to `true`. Then any member of that group
+may @mention or reply to the bot, while private chats still require an entry in
+`allowed_user_ids` and every other group remains blocked. Keep the setting off
+for public or loosely controlled groups. Merely discovering the bot username or
+numeric bot ID never bypasses the allowed-chat gate.
 
 ## Agent-initiated messages
 
@@ -105,8 +114,10 @@ To post to Telegram yourself: python3 /path/to/tgbridge/tgbridge.py --send <chat
 | Key | Meaning |
 |---|---|
 | `bot_token` | Bot token from BotFather |
-| `allowed_user_ids` | Telegram user IDs allowed to talk (groups check the *sender*, not the chat) |
+| `allowed_user_ids` | Users allowed in DMs and in the default strict group policy |
 | `allowed_chats` | Chat IDs the bridge listens in (DM + groups); also gates `--send` |
+| `allow_all_users_in_allowed_groups` | If `true`, trust members of allowlisted groups without listing every user ID; DMs remain user-allowlisted (default `false`) |
+| `capture_group_context` | Buffer the last 20 eligible human group messages for the next prompt (default `true`) |
 | `workdir` | Working directory for the agent |
 | `runner` | `opencode` (default), `claude`, or `codex` |
 | `run_timeout_s` | Per-run timeout in seconds (default `900`); partial answers are kept |
@@ -120,8 +131,18 @@ To post to Telegram yourself: python3 /path/to/tgbridge/tgbridge.py --send <chat
 
 Env: `OPENCODE_BIN` overrides the opencode binary path (default: mise shim).
 
-State files (both machines, never committed): `~/.config/tgbridge/state.json`
-(sessions, offset, scheduled prompts) and `audit.jsonl`.
+Runtime files (never committed) live under `~/.config/tgbridge/` with private
+permissions: `state.json` (session index, Telegram offset, scheduled prompts),
+`audit.jsonl`, downloaded attachments, and undelivered replies.
+
+### Session storage model
+
+The bridge treats its session map as a disposable index, not as the source of
+truth. `state.json` stores `chat_id -> runner session ID`; the runner owns the
+actual transcript in its native storage. A group has one shared session, while
+each DM or other group gets a different one. `/new` only forgets the mapping so
+the next prompt creates a fresh session; it deliberately does not delete the
+runner's historical transcript.
 
 ## Runners
 
@@ -137,10 +158,18 @@ All runners share the same bridge surface: per-chat sessions, live tool
 trail, reactions, chunking. Sessions are titled with a time slug
 (`tg 20260903-0958`) on first message.
 
-Group messages that don't @mention the bot are buffered (last 20, with
-sender + time) and injected as passive context into the next
-mention-triggered run — so the agent isn't deaf to the conversation,
-but only speaks when spoken to.
+By default, human group messages that do not @mention or reply to this bot are
+buffered (last 20, with sender, time, and up to 200 characters) and injected
+into its next mention-triggered run. The agent can therefore hear the room but
+only speaks when addressed. Set `capture_group_context` to `false` to ignore
+non-mention traffic.
+
+Telegram itself never delivers messages authored by one bot to another bot,
+regardless of admin or privacy mode. Consequently, this ambient context includes
+human messages but cannot include another agent bot's progress or final report.
+Cross-machine peer-agent report visibility needs a separate shared event channel;
+the Telegram group alone cannot provide it. See the
+[Telegram Bot FAQ](https://core.telegram.org/bots/faq#why-doesnt-my-bot-see-messages-from-other-bots).
 
 ## Design notes
 
@@ -167,6 +196,7 @@ and Anthropic's official [claude-plugins-official telegram plugin](https://githu
 ## Limitations
 
 - One run at a time (messages queue via Telegram's offset while the agent works)
+- Bots cannot receive other bots' messages; peer-agent reports need an external shared event channel
 - Voice → text only; photos/documents are not ingested
 - Per-run timeout via `run_timeout_s` (default 15 minutes)
 - No message history — Telegram's Bot API doesn't expose any; sessions are how context persists
