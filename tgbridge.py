@@ -258,18 +258,20 @@ def _claude(session_id, prompt):
         if t == "system" and ev.get("session_id"):
             acc["sid"] = ev["session_id"]
         if t == "assistant":
+            trail = None
             for blk in (ev.get("message") or {}).get("content") or []:
                 bt = blk.get("type")
                 if bt == "tool_use":
                     inp = blk.get("input") or {}
                     s = next((v for v in inp.values() if isinstance(v, str)), "")
-                    return (f"🔧 {blk.get('tool', '?')}: "
-                            + s.replace("\n", " ")[:60])
-                if bt == "text" and blk.get("text"):
+                    trail = (f"🔧 {blk.get('tool', '?')}: "
+                             + s.replace("\n", " ")[:60])
+                elif bt == "text" and blk.get("text"):
                     acc["texts"].append(blk["text"])
                     acc["thinking"] = None
                 elif bt == "thinking" and blk.get("thinking"):
                     acc["thinking"] = blk["thinking"]
+            return trail
         return None
 
     return cmd, parse
@@ -445,106 +447,170 @@ def transcribe(cfg, token, file_id):
     return text, None
 
 
+def unpack_entry(entry):
+    """Queue items arrive as (chat_id, message_id, prompt) tuples (prompt path)
+    or dicts (scheduled /at jobs). Accept both — never crash the worker."""
+    if isinstance(entry, dict):
+        return entry["chat_id"], entry["message_id"], entry["prompt"]
+    return entry
+
+
+def selftest():
+    """Regression gate: cheap checks that catch the bugs we actually shipped."""
+    import json as _json
+
+    fails = []
+
+    # worker unpack: both queue shapes
+    if unpack_entry((1, 2, "p")) != (1, 2, "p"):
+        fails.append("unpack tuple")
+    if unpack_entry({"chat_id": 1, "message_id": 2, "prompt": "p"}) != (1, 2, "p"):
+        fails.append("unpack dict")
+
+    # chunker
+    if split_chunks("a" * 100, limit=10)[0] != "a" * 10:
+        fails.append("chunk hard cut")
+    parts = split_chunks("x\n\n" + "y" * 100, limit=20)
+    if parts[0] != "x" or len(parts) < 2:
+        fails.append("chunk boundary")
+
+    # every runner builds a cmd and parses a synthetic event
+    for name, fn in RUNNERS.items():
+        try:
+            cmd, parse = fn(None, "hi")
+            assert cmd and callable(parse), f"{name}: bad cmd/parse"
+        except RunnerError:
+            pass  # binary not installed — acceptable, runtime reports it
+        except Exception as e:
+            fails.append(f"{name} cmd: {e}")
+
+    ev = {"sessionID": "s1", "type": "tool_use",
+          "part": {"tool": "bash", "state": {"input": {"command": "ls"}}}}
+    cmd, parse = RUNNERS["opencode"](None, "hi")
+    acc = {"sid": None, "texts": [], "thinking": None, "cost": 0.0, "tokens": None}
+    if parse(ev, acc) is None or acc["sid"] != "s1":
+        fails.append("opencode parse")
+
+    cmd, parse = RUNNERS["claude"](None, "hi")
+    acc = {"sid": None, "texts": [], "thinking": None, "cost": 0.0, "tokens": None}
+    parse({"type": "system", "session_id": "s2"}, acc)
+    parse({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "tool": "Bash", "input": {"command": "ls"}},
+        {"type": "text", "text": "ok"}]}}, acc)
+    if acc["sid"] != "s2" or acc["texts"] != ["ok"]:
+        fails.append("claude parse")
+
+    if fails:
+        for f in fails:
+            print(f"SELFTEST FAIL: {f}")
+        sys.exit(1)
+    print("selftest OK:", ", ".join(sorted(RUNNERS)), "runners + unpack + chunker")
+
+
 def worker(cfg, state):
-    """Serial agent-run consumer; poll loop stays live for commands."""
+    """Serial agent-run consumer; poll loop stays live for commands.
+
+    One item = one try/except: a bad item must never kill the thread."""
     while True:
         entry = PROMPT_Q.get()
-        chat_id, message_id, prompt = (
-            entry["chat_id"],
-            entry["message_id"],
-            entry["prompt"],
-        )
-        RUN_STATE["busy"] = True
-        RUN_STATE["current"] = {
-            "chat": chat_id,
-            "since": time.time(),
-            "prompt": prompt[:60],
-        }
-        with STATE_LOCK:
-            session_id = state.get("sessions", {}).get(str(chat_id))
-            pending = state.get("pending", [])
-            for i, e in enumerate(pending):
-                if e.get("message_id") == message_id and e.get("chat_id") == chat_id:
-                    del pending[i]
-                    break
-        outbox = os.path.join(cfg["workdir"], ".tgbridge-outbox")
-        prompt = prompt + (
-            f"\n\n(To give files to the user, write them into {outbox}/ "
-            "— they are delivered automatically after this run.)"
-        )
-        audit("run_start", chat_id=chat_id, chars=len(prompt), session=session_id)
-        react(cfg["bot_token"], chat_id, message_id, "👀")
-        status = api(
-            cfg["bot_token"],
-            "sendMessage",
-            chat_id=chat_id,
-            text="⚙️ working… 0s",
-            reply_parameters=json.dumps({"message_id": message_id}),
-            disable_notification=True,
-        )
-        live = {
-            "chat_id": chat_id,
-            "status_id": (status.get("result") or {}).get("message_id")
-            if status
-            else None,
-            "trail": [],
-            "start": time.time(),
-            "last_edit": 0,
-            "cost": 0.0,
-            "tokens": None,
-        }
-        with STATE_LOCK:
-            state["running"] = dict(entry, status_id=live["status_id"])
-            save_json(STATE_PATH, state)
-        stop_typing = threading.Event()
-        threading.Thread(
-            target=typing_loop,
-            args=(cfg["bot_token"], chat_id, stop_typing),
-            daemon=True,
-        ).start()
-        log(f"chat={chat_id} run start (session={session_id}, q={PROMPT_Q.qsize()})")
+        chat_id = message_id = prompt = None
         try:
-            new_sid, answer, err = run_agent(cfg, session_id, prompt, live)
-        except Exception as e:
-            err = f"bridge error: {e}"
-            new_sid, answer = session_id, None
-        finally:
-            stop_typing.set()
-            RUN_STATE["busy"] = False
-            RUN_STATE["current"] = None
-        if err and session_id and "opencode failed" in err:
-            live["trail"].append("♻️ stale session — retrying fresh")
-            new_sid, answer, err = run_agent(cfg, None, prompt, live)
-        if live["status_id"]:
-            edit_status(cfg, live, final="✅ done" if not err else "🔴 failed")
-        with STATE_LOCK:
-            if new_sid and new_sid != session_id:
-                state.setdefault("sessions", {})[str(chat_id)] = new_sid
-            save_json(STATE_PATH, state)
-        if err:
-            audit("run_error", chat_id=chat_id, err=err[:200])
-            react(cfg["bot_token"], chat_id, message_id, "👎")
-            send(cfg["bot_token"], chat_id, f"⚠️ {err}")
-            log(f"chat={chat_id} error: {err[:120]}")
-        else:
-            audit(
-                "run_done",
-                chat_id=chat_id,
-                chars=len(answer or ""),
-                secs=int(time.time() - live["start"]),
+            chat_id, message_id, prompt = unpack_entry(entry)
+            RUN_STATE["busy"] = True
+            RUN_STATE["current"] = {
+                "chat": chat_id,
+                "since": time.time(),
+                "prompt": prompt[:60],
+            }
+            with STATE_LOCK:
+                session_id = state.get("sessions", {}).get(str(chat_id))
+                pending = state.get("pending", [])
+                for i, e in enumerate(pending):
+                    if e.get("message_id") == message_id and e.get("chat_id") == chat_id:
+                        del pending[i]
+                        break
+            outbox = os.path.join(cfg["workdir"], ".tgbridge-outbox")
+            prompt = prompt + (
+                f"\n\n(To give files to the user, write them into {outbox}/ "
+                "— they are delivered automatically after this run.)"
             )
-            react(cfg["bot_token"], chat_id, message_id, "👍")
-            send(cfg["bot_token"], chat_id, answer or "", reply_to=message_id)
-            log(f"chat={chat_id} done ({len(answer or '')} chars, session={new_sid})")
-        try:
-            for fn in sorted(os.listdir(outbox)):
-                p = os.path.join(outbox, fn)
-                if os.path.isfile(p):
-                    send_document(cfg["bot_token"], chat_id, p)
-                    os.remove(p)
-        except FileNotFoundError:
-            pass
-        PROMPT_Q.task_done()
+            audit("run_start", chat_id=chat_id, chars=len(prompt), session=session_id)
+            react(cfg["bot_token"], chat_id, message_id, "👀")
+            status = api(
+                cfg["bot_token"],
+                "sendMessage",
+                chat_id=chat_id,
+                text="⚙️ working… 0s",
+                reply_parameters=json.dumps({"message_id": message_id}),
+                disable_notification=True,
+            )
+            live = {
+                "chat_id": chat_id,
+                "status_id": (status.get("result") or {}).get("message_id")
+                if status
+                else None,
+                "trail": [],
+                "start": time.time(),
+                "last_edit": 0,
+            }
+            stop_typing = threading.Event()
+            threading.Thread(
+                target=typing_loop,
+                args=(cfg["bot_token"], chat_id, stop_typing),
+                daemon=True,
+            ).start()
+            log(f"chat={chat_id} run start (session={session_id}, q={PROMPT_Q.qsize()})")
+            try:
+                new_sid, answer, err = run_agent(cfg, session_id, prompt, live)
+            except Exception as e:
+                err = f"bridge error: {e}"
+                new_sid, answer = session_id, None
+            finally:
+                stop_typing.set()
+                RUN_STATE["busy"] = False
+                RUN_STATE["current"] = None
+            if err and session_id and "opencode failed" in err:
+                live["trail"].append("♻️ stale session — retrying fresh")
+                new_sid, answer, err = run_agent(cfg, None, prompt, live)
+            if live["status_id"]:
+                edit_status(cfg, live, final="✅ done" if not err else "🔴 failed")
+            with STATE_LOCK:
+                if new_sid and new_sid != session_id:
+                    state.setdefault("sessions", {})[str(chat_id)] = new_sid
+                save_json(STATE_PATH, state)
+            if err:
+                react(cfg["bot_token"], chat_id, message_id, "👎")
+                send(cfg["bot_token"], chat_id, f"⚠️ {err}")
+                audit("run_error", chat_id=chat_id, err=err[:200])
+                log(f"chat={chat_id} error: {err[:120]}")
+            else:
+                react(cfg["bot_token"], chat_id, message_id, "👍")
+                send(cfg["bot_token"], chat_id, answer or "", reply_to=message_id)
+                audit(
+                    "run_done",
+                    chat_id=chat_id,
+                    chars=len(answer or ""),
+                    secs=int(time.time() - live["start"]),
+                )
+                log(f"chat={chat_id} done ({len(answer or '')} chars, session={new_sid})")
+        except Exception as e:
+            log(f"worker item error: {e}")
+            audit("worker_error", err=str(e)[:200])
+            if chat_id:
+                send(cfg["bot_token"], chat_id, f"⚠️ bridge error: {e}")
+        finally:
+            try:
+                outbox = os.path.join(cfg["workdir"], ".tgbridge-outbox")
+                for fn in sorted(os.listdir(outbox)):
+                    p = os.path.join(outbox, fn)
+                    if os.path.isfile(p):
+                        send_document(cfg["bot_token"], chat_id, p)
+                        os.remove(p)
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                log(f"outbox delivery: {e}")
+            PROMPT_Q.task_done()
 
 
 def fire_at(cfg, state, due):
@@ -790,6 +856,11 @@ def cli_send(args):
 
 
 def main():
+    if "--selftest" in sys.argv:
+        selftest()
+        return
+    selftest()  # regression gate — a bridge that fails checks must not go live
+
     cfg = load_json(CONFIG_PATH, None)
     if not cfg:
         sys.exit(f"missing config {CONFIG_PATH}")
