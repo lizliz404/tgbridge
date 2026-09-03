@@ -1211,24 +1211,17 @@ def selftest():
     strict_cfg = {"allowed_chats": [-10022], "allowed_user_ids": [11]}
     if is_authorized(strict_cfg, -10022, "supergroup", 99):
         fails.append("auth strict group")
-    if not is_operator(auth_cfg, 11) or is_operator(auth_cfg, 99):
-        fails.append("operator fallback")
-    explicit_ops = {**auth_cfg, "operator_user_ids": [42]}
-    if is_operator(explicit_ops, 11) or not is_operator(explicit_ops, 42):
-        fails.append("operator explicit")
-
-    # An allowed group member can prompt, but passive group text is private by
-    # default and shared-state commands remain operator-only.
-    auth_state = {"bot_username": "Bot", "sessions": {"-10022": "keep-me"}}
-    auth_sent = []
-
+    # An allowed group member can prompt. Human group messages are captured by
+    # default for ambient context, but the bot still speaks only when mentioned.
+    auth_state = {
+        "bot_username": "Bot",
+        "sessions": {"-10022": "keep-me"},
+        "hints": {"-10022": time.time()},
+    }
     def auth_api(token, method, **params):
-        auth_sent.append((method, params))
         return {"ok": True, "result": {"message_id": 1}}
 
-    orig_audit = audit
     globals()["api"] = auth_api
-    globals()["audit"] = lambda *args, **kwargs: None
     try:
         handle_update(
             auth_cfg,
@@ -1242,45 +1235,25 @@ def selftest():
                 }
             },
         )
-        if auth_state.get("context"):
-            fails.append("group context default private")
-        capture_state = {
-            "bot_username": "Bot",
-            "hints": {"-10022": time.time()},
-        }
+        if len((auth_state.get("context") or {}).get("-10022", [])) != 1:
+            fails.append("group context default")
+        private_state = {"bot_username": "Bot"}
         handle_update(
-            {**auth_cfg, "capture_group_context": True},
-            capture_state,
+            {**auth_cfg, "capture_group_context": False},
+            private_state,
             {
                 "message": {
                     "chat": {"id": -10022, "type": "supergroup"},
                     "from": {"id": 99, "first_name": "member"},
                     "message_id": 2,
-                    "text": "explicitly captured context",
+                    "text": "explicitly ignored context",
                 }
             },
         )
-        if len((capture_state.get("context") or {}).get("-10022", [])) != 1:
-            fails.append("group context opt-in")
-        handle_update(
-            auth_cfg,
-            auth_state,
-            {
-                "message": {
-                    "chat": {"id": -10022, "type": "supergroup"},
-                    "from": {"id": 99, "first_name": "member"},
-                    "message_id": 3,
-                    "text": "/new@Bot",
-                }
-            },
-        )
+        if private_state.get("context"):
+            fails.append("group context opt-out")
     finally:
         globals()["api"] = orig_api
-        globals()["audit"] = orig_audit
-    if auth_state["sessions"].get("-10022") != "keep-me":
-        fails.append("operator-only new")
-    if not any("restricted to bridge operators" in p.get("text", "") for _, p in auth_sent):
-        fails.append("operator denial reply")
 
     # Runtime metadata may contain prompts/session IDs, so modes are repaired
     # even when a permissive umask or an older version created the files.
@@ -1504,7 +1477,7 @@ def botcmd(text):
 def is_authorized(cfg, chat_id, chat_type, user_id):
     """Gate access without weakening DMs or admitting messages from other chats.
 
-    By default, both the chat and sender must be allowlisted. Operators may
+    By default, both the chat and sender must be allowlisted. An installation may
     explicitly trust membership of an allowlisted group instead, which lets
     collaborators in that one group use the bot without collecting every
     member's Telegram user ID. Private chats always keep the sender allowlist.
@@ -1518,18 +1491,6 @@ def is_authorized(cfg, chat_id, chat_type, user_id):
     ):
         return True
     return user_id in (cfg.get("allowed_user_ids") or [])
-
-
-def is_operator(cfg, user_id):
-    """Operators may mutate shared bridge/session state.
-
-    Backward compatible: existing installs use allowed_user_ids until an
-    explicit operator_user_ids list is configured.
-    """
-    operators = cfg.get("operator_user_ids")
-    if operators is None:
-        operators = cfg.get("allowed_user_ids") or []
-    return user_id in operators
 
 
 def handle_update(cfg, state, upd):
@@ -1551,7 +1512,7 @@ def handle_update(cfg, state, upd):
         replied_to_bot = (reply.get("from") or {}).get("username") == bot_username
         if f"@{bot_username}" not in text and not replied_to_bot:
             if (
-                cfg.get("capture_group_context", False)
+                cfg.get("capture_group_context", True)
                 and text.strip()
                 and not text.lstrip().startswith("/")
             ):
@@ -1592,10 +1553,6 @@ def handle_update(cfg, state, upd):
             "commands: /new reset session · /status state · /at 30m <prompt> "
             "schedule · /cancel abort current run · anything else goes to the agent",
         )
-        return
-    if cmd in ("/new", "/cancel", "/at") and not is_operator(cfg, user_id):
-        audit("operator_denied", chat_id=chat_id, user_id=user_id, command=cmd)
-        send(cfg["bot_token"], chat_id, f"{cmd} is restricted to bridge operators")
         return
     if cmd == "/new":
         with STATE_LOCK:
@@ -1694,7 +1651,7 @@ def handle_update(cfg, state, upd):
 
     audit("enqueue", chat_id=chat_id, user_id=user_id, chars=len(text.strip()))
     prompt_text = text.strip()
-    if chat_type != "private" and cfg.get("capture_group_context", False):
+    if chat_type != "private" and cfg.get("capture_group_context", True):
         with STATE_LOCK:
             buf = (state.get("context") or {}).pop(str(chat_id), None) or []
         if buf:
@@ -1741,7 +1698,7 @@ def on_stop(signum, frame):
 
 def run(cfg):
     state = load_json(STATE_PATH, {})
-    if not cfg.get("capture_group_context", False):
+    if not cfg.get("capture_group_context", True):
         state.pop("context", None)
         state.pop("hints", None)
     me = api(cfg["bot_token"], "getMe")

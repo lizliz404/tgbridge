@@ -15,7 +15,7 @@ public ports, or databases: Bot API long-poll in, local CLI agent out.
 - **Agent-initiated outbound** — `python3 tgbridge.py --send <chat_id> <text>` posts to allowlisted chats only, so the agent can proactively notify the group
 - **Audit log** — every enqueue/run/send/schedule event appended to `~/.config/tgbridge/audit.jsonl`
 - **Never dies silently** — any fatal crash or SIGTERM announces `💀 …` to every allowed chat (best-effort, 3s each) before systemd restarts it; a dead worker thread is detected and respawned; a failed answer delivery retries once, then is audited and saved to `~/.config/tgbridge/undelivered/` instead of vanishing; a missing runner binary warns at startup instead of crashing
-- **Operator controls** — `/new`, `/cancel`, and `/at` are restricted to `operator_user_ids`; ordinary trusted group members can still prompt
+- **Ambient group context** — hears recent human conversation but only runs when explicitly @mentioned or replied to
 - **Slash-command menu** — `/new`, `/status`, `/at`, `/cancel`, `/help` registered via `setMyCommands`
 - **Chat + sender policy** — double allowlist by default; optionally trust all members of specifically allowlisted groups while keeping DMs user-allowlisted
 - **Private runtime state** — config, session index, audit log, attachments, and undelivered replies are kept under `~/.config/tgbridge` with private permissions
@@ -37,8 +37,7 @@ public ports, or databases: Bot API long-poll in, local CLI agent out.
   "allowed_user_ids": [YOUR_TELEGRAM_USER_ID],
   "allowed_chats": [YOUR_TELEGRAM_USER_ID, -1000000000000],
   "allow_all_users_in_allowed_groups": false,
-  "operator_user_ids": [YOUR_TELEGRAM_USER_ID],
-  "capture_group_context": false,
+  "capture_group_context": true,
   "workdir": "/home/you/project",
   "transcribe_base_url": "https://api.groq.com/openai/v1",
   "transcribe_key": "gsk_...",
@@ -94,11 +93,6 @@ may @mention or reply to the bot, while private chats still require an entry in
 for public or loosely controlled groups. Merely discovering the bot username or
 numeric bot ID never bypasses the allowed-chat gate.
 
-Shared-group access does not have to grant shared administration. Set
-`operator_user_ids` to the people allowed to reset sessions, cancel a run, or
-schedule prompts. If omitted, it falls back to `allowed_user_ids` for backward
-compatibility.
-
 ## Agent-initiated messages
 
 The agent can post to any allowlisted chat without a human prompt, e.g. to
@@ -120,11 +114,10 @@ To post to Telegram yourself: python3 /path/to/tgbridge/tgbridge.py --send <chat
 | Key | Meaning |
 |---|---|
 | `bot_token` | Bot token from BotFather |
-| `allowed_user_ids` | Users allowed in DMs and in the default strict group policy; also the backward-compatible operator fallback |
+| `allowed_user_ids` | Users allowed in DMs and in the default strict group policy |
 | `allowed_chats` | Chat IDs the bridge listens in (DM + groups); also gates `--send` |
 | `allow_all_users_in_allowed_groups` | If `true`, trust members of allowlisted groups without listing every user ID; DMs remain user-allowlisted (default `false`) |
-| `operator_user_ids` | Users allowed to run `/new`, `/cancel`, and `/at`; defaults to `allowed_user_ids` |
-| `capture_group_context` | Buffer the last 20 non-mention group messages for the next prompt; privacy-safe default is `false` |
+| `capture_group_context` | Buffer the last 20 eligible human group messages for the next prompt (default `true`) |
 | `workdir` | Working directory for the agent |
 | `runner` | `opencode` (default), `claude`, or `codex` |
 | `run_timeout_s` | Per-run timeout in seconds (default `900`); partial answers are kept |
@@ -165,11 +158,18 @@ All runners share the same bridge surface: per-chat sessions, live tool
 trail, reactions, chunking. Sessions are titled with a time slug
 (`tg 20260903-0958`) on first message.
 
-By default, group messages that do not @mention or reply to the bot are ignored.
-Set `capture_group_context` to `true` to buffer the last 20 messages (sender,
-time, and up to 200 characters) and inject them into the next mention-triggered
-run. This is useful for a private working group but expands what is persisted
-and sent to the local agent.
+By default, human group messages that do not @mention or reply to this bot are
+buffered (last 20, with sender, time, and up to 200 characters) and injected
+into its next mention-triggered run. The agent can therefore hear the room but
+only speaks when addressed. Set `capture_group_context` to `false` to ignore
+non-mention traffic.
+
+Telegram itself never delivers messages authored by one bot to another bot,
+regardless of admin or privacy mode. Consequently, this ambient context includes
+human messages but cannot include another agent bot's progress or final report.
+Cross-machine peer-agent report visibility needs a separate shared event channel;
+the Telegram group alone cannot provide it. See the
+[Telegram Bot FAQ](https://core.telegram.org/bots/faq#why-doesnt-my-bot-see-messages-from-other-bots).
 
 ## Design notes
 
@@ -196,6 +196,7 @@ and Anthropic's official [claude-plugins-official telegram plugin](https://githu
 ## Limitations
 
 - One run at a time (messages queue via Telegram's offset while the agent works)
+- Bots cannot receive other bots' messages; peer-agent reports need an external shared event channel
 - Voice → text only; photos/documents are not ingested
 - Per-run timeout via `run_timeout_s` (default 15 minutes)
 - No message history — Telegram's Bot API doesn't expose any; sessions are how context persists
