@@ -426,6 +426,18 @@ def handle_update(cfg, state, upd):
         reply = msg.get("reply_to_message") or {}
         replied_to_bot = (reply.get("from") or {}).get("username") == bot_username
         if f"@{bot_username}" not in text and not replied_to_bot:
+            if text.strip() and not text.lstrip().startswith("/"):
+                now = time.time()
+                hints = state.get("hints", {})
+                if now - hints.get(str(chat_id), 0) > 1800:
+                    with STATE_LOCK:
+                        state.setdefault("hints", {})[str(chat_id)] = now
+                        save_json(STATE_PATH, state)
+                    send(
+                        cfg["bot_token"],
+                        chat_id,
+                        f"💡 @{bot_username} at me (or reply to my messages) and I'll answer",
+                    )
             return
         text = text.replace(f"@{bot_username}", "").strip()
 
