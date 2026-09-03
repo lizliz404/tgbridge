@@ -14,8 +14,9 @@ post to allowlisted chats (Telegram-Bridge-MCP idea, no MCP protocol).
 
 Outbound rendering borrows from Hermes' own gateway (hermes-agent sources):
 UTF-16-aware chunk limits, inline-code split avoidance, GFM table
-conversion, placeholder-stashed HTML conversion, and a clean-markup
-plain-text fallback.
+conversion, placeholder-stashed HTML conversion, a clean-markup plain-text
+fallback, fence-language carry across chunks, one-element blockquote
+merging (incl. expandable), and native bullet markers.
 """
 
 import json
@@ -171,8 +172,12 @@ def _wrap_markdown_tables(text):
             while len(cells) < len(headers):
                 cells.append("")
             cells = cells[: len(headers)]
-            heading = next((c for c in cells if c), f"Row {index}")
-            bullets = [f"• {h}: {v}" for h, v in zip(headers, cells) if v != heading]
+            raw_heading = next((c for c in cells if c), f"Row {index}")
+            bullets = [f"• {h}: {v}" for h, v in zip(headers, cells) if v != raw_heading]
+            # headings flatten inner bold (hermes _convert_header): a bold
+            # cell would render <b><b>…</b></b>, same-type nesting Telegram
+            # refuses — which would demote the whole chunk to plain text
+            heading = re.sub(r"\*\*(.+?)\*\*", r"\1", raw_heading)
             groups.append("\n".join([f"**{heading}**", *bullets]))
         return "\n\n".join(groups)
 
@@ -229,39 +234,108 @@ def inline_html(line):
     s = re.sub(r"<code>[^<]*</code>", _keep, s)
     s = MD_LINK.sub(r'<a href="\2">\1</a>', s)
     s = re.sub(r"<a href=[^>]*>[^<]*</a>", _keep, s)
+    # headers flatten inner bold (hermes _convert_header strips redundant
+    # bold markers — <b><b>…</b></b> is same-type nesting Telegram refuses,
+    # which would demote the whole chunk to plain text)
+    s = re.sub(
+        r"^#{1,6}\s+(.*)",
+        lambda m: "<b>" + re.sub(r"\*\*(.+?)\*\*", r"\1", m.group(1)) + "</b>",
+        s,
+    )
+    # markdown list markers -> Telegram's native bullet glyph (hermes tables
+    # and lists render bullets as "• ", not literal -/*/+)
+    s = re.sub(r"^(\s*)[-*+]\s+", r"\1• ", s)
+    # ***x*** must run before ** or it is eaten as bold + stray asterisks
+    s = re.sub(r"\*\*\*(.+?)\*\*\*", r"<b><i>\1</i></b>", s)
     s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
-    s = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"<i>\1</i>", s)
+    # emphasis delimiters never flank whitespace and never hug word chars
+    # (hermes format_message guards bullets via [^*\n]+; the space-flank rule
+    # also kills "a * b * c" arithmetic and "* item *" false positives)
+    s = re.sub(r"(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", s)
+    s = re.sub(r"(?<![\w_])_(?!\s)([^_\n]+?)(?<!\s)_(?![\w_])", r"<i>\1</i>", s)
     s = re.sub(r"~~(.+?)~~", r"<s>\1</s>", s)
     s = re.sub(r"\|\|(.+?)\|\|", r"<tg-spoiler>\1</tg-spoiler>", s)
-    s = re.sub(r"^#{1,6}\s+(.*)", r"<b>\1</b>", s)
     for key, val in stash:
         s = s.replace(key, val)
     return s
 
 
-def md_to_html(md, in_pre=False):
-    """Markdown -> Telegram HTML. Returns (html, in_pre_after) so a fenced
-    block split across chunks stays a valid <pre> in every chunk."""
-    out = ["<pre>"] if in_pre else []
-    for line in md.split("\n"):
+def _quote_body(line):
+    """Classify one blockquote line -> (is_quote, expandable, content).
+
+    hermes _convert_blockquote: '> text' is a plain quote, '**> text' opens
+    an expandable quote closed by a trailing '||'."""
+    ls = line.lstrip()
+    if ls.startswith("**> "):
+        return True, True, ls[4:].rstrip()
+    if ls.startswith(">") and (len(ls) == 1 or ls[1] in " >"):
+        return True, False, ls.lstrip("> ").rstrip()
+    return False, False, ""
+
+
+def md_to_html(md, in_pre=False, pre_lang=""):
+    """Markdown -> Telegram HTML. Returns (html, in_pre_after, pre_lang_after)
+    so a fenced block split across chunks stays a valid <pre> in every chunk,
+    carrying the original language tag (hermes truncate_message carry_lang)."""
+    out = []
+    if in_pre:
+        # continuation chunk reopens the carried fence with its language tag
+        out.append(
+            f'<pre><code class="language-{esc(pre_lang)}">'
+            if pre_lang
+            else "<pre>"
+        )
+    lines = md.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         if line.lstrip().startswith("```"):
-            out.append("</pre>" if in_pre else "<pre>")
+            tag = line.lstrip()[3:].strip()
+            lang = tag.split()[0] if tag else ""
+            if in_pre:
+                out.append("</code></pre>" if pre_lang else "</pre>")
+            else:
+                # language tag -> Telegram's <code class="language-x">,
+                # rendered with syntax highlighting in official clients
+                out.append(
+                    f'<pre><code class="language-{esc(lang)}">'
+                    if lang
+                    else "<pre>"
+                )
             in_pre = not in_pre
+            pre_lang = lang
+            i += 1
             continue
-        ls = line.lstrip()
         if in_pre:
             out.append(esc(line))
-        elif ls.startswith(">") and (len(ls) == 1 or ls[1] in " >"):
-            out.append(
-                "<blockquote>"
-                + inline_html(ls.lstrip("> ").rstrip())
-                + "</blockquote>"
-            )
-        else:
-            out.append(inline_html(line))
+            i += 1
+            continue
+        is_quote, expandable, _ = _quote_body(line)
+        if is_quote:
+            # merge consecutive quote lines into ONE blockquote (hermes
+            # treats quote blocks as blocks, not per-line entities — N
+            # stacked boxes is visual noise); **> makes it expandable
+            j, parts = i, []
+            while j < len(lines):
+                q_is, q_exp, q_body = _quote_body(lines[j])
+                if not q_is:
+                    break
+                expandable = expandable or q_exp
+                parts.append(q_body)
+                j += 1
+            if expandable and parts and parts[-1].endswith("||"):
+                # hermes: trailing || is the expandable-quote end marker
+                parts[-1] = parts[-1][:-2].rstrip()
+            inner = "\n".join(inline_html(p) for p in parts)
+            open_tag = "<blockquote expandable>" if expandable else "<blockquote>"
+            out.append(open_tag + inner + "</blockquote>")
+            i = j
+            continue
+        out.append(inline_html(line))
+        i += 1
     if in_pre:
-        out.append("</pre>")
-    return "\n".join(out), in_pre
+        out.append("</code></pre>" if pre_lang else "</pre>")
+    return "\n".join(out), in_pre, pre_lang
 
 
 def _strip_html_markup(md):
@@ -336,9 +410,10 @@ def send(token, chat_id, text, reply_to=None, chunk_limit=CHUNK):
     unbalanced locally skip the doomed HTML attempt entirely."""
     ok = True
     in_pre = False
+    pre_lang = ""
     text = _wrap_markdown_tables(text or "")
     for i, chunk in enumerate(split_chunks(text, chunk_limit)):
-        html, in_pre = md_to_html(chunk, in_pre)
+        html, in_pre, pre_lang = md_to_html(chunk, in_pre, pre_lang)
         params = {
             "chat_id": chat_id,
             "text": html,
@@ -816,7 +891,7 @@ def selftest():
         fails.append("chunk boundary")
 
     # markdown -> telegram HTML
-    h, pre = md_to_html("code `<b>&</b>` and **bold** [t](http://x/y)")
+    h, pre, _lang = md_to_html("code `<b>&</b>` and **bold** [t](http://x/y)")
     if (
         h
         != (
@@ -828,15 +903,43 @@ def selftest():
         fails.append("md inline")
     # new inline entities: italic / strikethrough / spoiler; bold wins over
     # inner single asterisks (hermes format_message parity)
-    h, pre = md_to_html("*it* ~~gone~~ ||shh|| **b*bold*i**")
+    h, pre, _lang = md_to_html("*it* ~~gone~~ ||shh|| **b*bold*i**")
     if h != "<i>it</i> <s>gone</s> <tg-spoiler>shh</tg-spoiler> <b>b*bold*i</b>" or pre:
         fails.append("md inline rich")
+    # ***bold italic*** renders as nested tags, not broken crossing ones
+    h, pre, _lang = md_to_html("***both***")
+    if h != "<b><i>both</i></b>" or pre:
+        fails.append("md bold italic")
+    # _x_ italics, but snake_case and bare arithmetic stay literal
+    h, pre, _lang = md_to_html("my_var and a * b and *real*")
+    if h != "my_var and a * b and <i>real</i>" or pre:
+        fails.append("md italic guards")
+    # list markers -> native bullet glyph
+    h, pre, _lang = md_to_html("- one\n* two\n+ three\nplain - dash")
+    if (
+        h
+        != "• one\n• two\n• three\nplain - dash"
+        or pre
+    ):
+        fails.append("md bullets")
+    # header flattens inner bold (no <b><b> nesting Telegram refuses)
+    h, pre, _lang = md_to_html("## **Title** here")
+    if h != "<b>Title here</b>" or pre:
+        fails.append("md header flat")
     # blockquote line
-    h, pre = md_to_html("text\n> quoted line\nafter")
+    h, pre, _lang = md_to_html("text\n> quoted line\nafter")
     if h != "text\n<blockquote>quoted line</blockquote>\nafter" or pre:
         fails.append("md blockquote")
+    # consecutive quote lines merge into ONE blockquote
+    h, pre, _lang = md_to_html("> line1\n> line2\nafter")
+    if h != "<blockquote>line1\nline2</blockquote>\nafter" or pre:
+        fails.append("md blockquote merge")
+    # expandable quote: **> opener + trailing || closer (hermes)
+    h, pre, _lang = md_to_html("**> details\n> more||\nafter")
+    if h != '<blockquote expandable>details\nmore</blockquote>\nafter' or pre:
+        fails.append("md blockquote expandable")
     # blockquote chars in prose text are NOT blockquotes
-    h, pre = md_to_html("a > b implies")
+    h, pre, _lang = md_to_html("a > b implies")
     if "<blockquote>" in h:
         fails.append("md blockquote false positive")
     # tables convert to bullets exactly like hermes convert_table_to_bullets:
@@ -844,21 +947,37 @@ def selftest():
     h = _wrap_markdown_tables("| a | b |\n|---|---|\n| 1 | 2 |")
     if "**1**" not in h or "• b: 2" not in h or "|" in h:
         fails.append("md table")
+    # bold cells are plain markdown for the renderer — the HTML must never
+    # contain redundant <b><b> (heading cells are flattened pre-wrap)
+    html, _pre, _lang = md_to_html(
+        _wrap_markdown_tables("| **a** | b |\n|---|---|\n| 1 | **2** |")
+    )
+    if "<b><b>" in html or "<b>1</b>" not in html or "• b: <b>2</b>" not in html:
+        fails.append("md table bold")
     h = _wrap_markdown_tables("```\n| a | b |\n|---|---|\n| 1 | 2 |\n```")
     if "| 1 | 2 |" not in h:
         fails.append("md table in fence")
-    # fenced block with language
-    h, pre = md_to_html("a\n```py\nx < y\n```\nb")
-    if pre or h != "a\n<pre>\nx &lt; y\n</pre>\nb":
+    # fenced block with language -> <pre><code class="language-x">
+    h, pre, lang = md_to_html("a\n```py\nx < y\n```\nb")
+    if (
+        pre
+        or lang
+        or h
+        != 'a\n<pre><code class="language-py">\nx &lt; y\n</code></pre>\nb'
+    ):
         fails.append("md fence")
-    # fence split across chunks stays balanced per chunk
-    h1, pre1 = md_to_html("intro\n```py\nprint(1)")
-    h2, pre2 = md_to_html("print(2)\n```", in_pre=pre1)
+    # fence split across chunks stays balanced per chunk, carrying the
+    # language tag (hermes truncate_message carry_lang)
+    h1, pre1, lang1 = md_to_html("intro\n```py\nprint(1)")
+    h2, pre2, lang2 = md_to_html("print(2)\n```", in_pre=pre1, pre_lang=lang1)
     if (
         pre1 is not True
         or pre2 is not False
-        or "</pre>" not in h1
+        or lang1 != "py"
+        or lang2
+        or "</code></pre>" not in h1
         or h2.count("<pre>") != 1
+        or 'language-py' not in h2
     ):
         fails.append("md fence continuation")
     # _balanced: valid vs broken chunks
@@ -866,6 +985,12 @@ def selftest():
         fails.append("balanced ok")
     if _balanced("<b>a<code>b</b>") or _balanced("</b>") or _balanced("ok <b>"):
         fails.append("balanced broken")
+    # nested <b><i> is balanced; the renderer must never emit redundant
+    # same-type nesting like <b><b> (headers/tables flatten it away)
+    if not _balanced("<b><i>x</i></b>") or _balanced("<b>a<code>b</code></i>"):
+        fails.append("balanced nesting")
+    if "<b><b>" in md_to_html("## **T** x")[0] + md_to_html("***x***")[0]:
+        fails.append("no same-type nesting")
     # _strip_html_markup: fallback text has no raw markup syntax left
     plain = _strip_html_markup("# Head\n\n**hi** `x <y>` [t](http://e/x)\n> q\n```py\ncode\n```")
     if (

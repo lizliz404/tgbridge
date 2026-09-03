@@ -21,7 +21,7 @@ public ports, no databases: Bot API long-poll in, `opencode run` out.
 - **Selftest gate** — `python3 tgbridge.py --selftest` runs at every startup; a bridge that fails its own checks does not go live
 - **Emoji lifecycle** — 👀 received → ✅ done / 🔴 error, via `setMessageReaction`
 - **Typing indicator** — `sendChatAction` keep-alive for the whole run (re-fired every 4s)
-- **Paragraph-aware chunking** — replies split at `\n\n` > `\n` > space, first chunk reply-threaded to your message
+- **Paragraph-aware chunking** — replies split at `\n\n` > `\n` > space (UTF-16 aware, never mid-emoji or mid-code-span), first chunk reply-threaded to your message. Markdown renders as Telegram HTML — code fences with syntax highlighting, tables as bullet groups, merged blockquotes (incl. expandable), bold/italic/strike/spoiler/links — with an automatic clean-plain-text fallback if Telegram ever refuses the HTML
 - **Rate-limit friendly** — honors Telegram 429 `retry_after`; poll failures back off exponentially (3s → 30s)
 - **Chat + user allowlist** — double gate; unknown chats/users are dropped silently
 
