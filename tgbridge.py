@@ -44,6 +44,7 @@ OPENCODE_SERVER = os.environ.get("OPENCODE_SERVER", "http://localhost:4096")
 RUN_TIMEOUT_S = 900
 CHUNK = 3900
 CANCEL_MSG = "🛑 cancelled by user"
+CODEX_YOLO_FLAG = "--dangerously-bypass-approvals-and-sandbox"
 
 PROMPT_Q = queue.Queue()
 STATE_LOCK = threading.Lock()
@@ -737,6 +738,13 @@ def _codex(session_id, prompt, model=None):
     return cmd, parse
 
 
+def apply_runner_policy(runner_name, cmd, cfg):
+    """Apply explicit bridge-owned runner policy after command construction."""
+    if runner_name == "codex" and cfg.get("codex_yolo", False):
+        return cmd[:2] + [CODEX_YOLO_FLAG] + cmd[2:]
+    return cmd
+
+
 def run_agent(cfg, session_id, prompt, live=None):
     """Stream the runner's JSON events live (Popen).
 
@@ -753,6 +761,7 @@ def run_agent(cfg, session_id, prompt, live=None):
         )
     try:
         cmd, parse = runner_fn(session_id, prompt, cfg.get("model"))
+        cmd = apply_runner_policy(rname, cmd, cfg)
     except RunnerError as e:
         return session_id, None, str(e)
     proc = subprocess.Popen(
@@ -1318,6 +1327,18 @@ def selftest():
             pass  # binary not installed — acceptable, runtime reports it
         except Exception as e:
             fails.append(f"{name} cmd: {e}")
+
+    codex_cmd, _ = RUNNERS["codex"](None, "hi", None)
+    yolo_cmd = apply_runner_policy("codex", codex_cmd, {"codex_yolo": True})
+    if CODEX_YOLO_FLAG not in yolo_cmd or yolo_cmd.index(CODEX_YOLO_FLAG) != 2:
+        fails.append("codex yolo flag")
+    if apply_runner_policy("codex", codex_cmd, {}) != codex_cmd:
+        fails.append("codex yolo default off")
+    if apply_runner_policy("claude", ["claude", "-p"], {"codex_yolo": True}) != [
+        "claude",
+        "-p",
+    ]:
+        fails.append("codex yolo isolation")
 
     ev = {
         "sessionID": "s1",
@@ -1910,10 +1931,14 @@ def handle_update(cfg, state, upd):
         if RUN_STATE.get("current"):
             c = RUN_STATE["current"]
             cur = f"\nrunning: {c['prompt']}… ({int(time.time() - c['since'])}s)"
+        runner_name = cfg.get("runner", "opencode")
+        runner_mode = (
+            "yolo" if runner_name == "codex" and cfg.get("codex_yolo") else "default"
+        )
         send(
             cfg["bot_token"],
             chat_id,
-            f"chat {chat_id}\nrunner: {cfg.get('runner', 'opencode')}\n"
+            f"chat {chat_id}\nrunner: {runner_name} ({runner_mode})\n"
             f"session: {info}\ncwd: {cfg['workdir']}\n"
             f"queued: {PROMPT_Q.qsize()}\nscheduled: {pending}{cur}",
         )
@@ -2053,6 +2078,8 @@ def run(cfg):
         ),
     )
     log(f"tgbridge up as @{state['bot_username']}, chats={cfg['allowed_chats']}")
+    if cfg.get("runner") == "codex" and cfg.get("codex_yolo"):
+        log("WARNING codex_yolo=true: Telegram prompts have unsandboxed OS access")
 
     # Startup sanity: a missing runner binary must not kill the bridge —
     # commands still work; warn once in the home chat, runs report the error.
