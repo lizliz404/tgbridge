@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""tgbridge - minimal Telegram bridge for local opencode agent.
+"""tgbridge - minimal Telegram bridge for a local CLI agent.
 
-Bot API long-poll -> gate (chat allowlist + user allowlist + group trigger)
--> opencode run (per-chat session, --format json) -> reply to source chat.
+Bot API long-poll -> gate (chat allowlist + sender policy + group trigger)
+-> agent run (per-chat session) -> reply to source chat.
 
 Architecture: the poll loop never blocks. Slash commands are answered inline;
 prompts are enqueued and consumed serially by a worker thread. Agent stdout
@@ -1154,6 +1154,29 @@ def selftest():
     ):
         fails.append("botcmd")
 
+    # authorization: chats are always explicit; DMs always require a user ID.
+    # Group-wide trust is opt-in and applies only inside an allowed group.
+    auth_cfg = {
+        "allowed_chats": [11, -10022],
+        "allowed_user_ids": [11],
+        "allow_all_users_in_allowed_groups": True,
+    }
+    if not is_authorized(auth_cfg, 11, "private", 11):
+        fails.append("auth allowed dm")
+    if is_authorized(auth_cfg, 12, "private", 12):
+        fails.append("auth unknown dm")
+    if not is_authorized(auth_cfg, -10022, "supergroup", 99):
+        fails.append("auth allowed group member")
+    if is_authorized(auth_cfg, -10023, "supergroup", 99):
+        fails.append("auth unknown group")
+    if is_authorized(auth_cfg, -10022, "supergroup", None):
+        fails.append("auth anonymous group sender")
+    if is_authorized(auth_cfg, -10022, "channel", 99):
+        fails.append("auth channel")
+    strict_cfg = {"allowed_chats": [-10022], "allowed_user_ids": [11]}
+    if is_authorized(strict_cfg, -10022, "supergroup", 99):
+        fails.append("auth strict group")
+
     if fails:
         for f in fails:
             print(f"SELFTEST FAIL: {f}")
@@ -1161,7 +1184,7 @@ def selftest():
     print(
         "selftest OK:",
         ", ".join(sorted(RUNNERS)),
-        "runners + unpack + render + chunker + announce + kill + timeout + botcmd",
+        "runners + unpack + render + chunker + announce + kill + timeout + botcmd + auth",
     )
 
 
@@ -1358,6 +1381,25 @@ def botcmd(text):
     return parts[0].split("@")[0].lower(), (parts[1] if len(parts) > 1 else "").strip()
 
 
+def is_authorized(cfg, chat_id, chat_type, user_id):
+    """Gate access without weakening DMs or admitting messages from other chats.
+
+    By default, both the chat and sender must be allowlisted. Operators may
+    explicitly trust membership of an allowlisted group instead, which lets
+    collaborators in that one group use the bot without collecting every
+    member's Telegram user ID. Private chats always keep the sender allowlist.
+    """
+    if chat_id not in (cfg.get("allowed_chats") or []):
+        return False
+    if (
+        chat_type in ("group", "supergroup")
+        and user_id is not None
+        and cfg.get("allow_all_users_in_allowed_groups", False)
+    ):
+        return True
+    return user_id in (cfg.get("allowed_user_ids") or [])
+
+
 def handle_update(cfg, state, upd):
     msg = upd.get("message")
     if not msg:
@@ -1368,7 +1410,7 @@ def handle_update(cfg, state, upd):
     user_id = (msg.get("from") or {}).get("id")
     text = msg.get("text") or msg.get("caption") or ""
     message_id = msg.get("message_id")
-    if chat_id not in cfg["allowed_chats"] or user_id not in cfg["allowed_user_ids"]:
+    if not is_authorized(cfg, chat_id, chat_type, user_id):
         return
     bot_username = state.get("bot_username", "")
 

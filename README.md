@@ -17,7 +17,7 @@ public ports, no databases: Bot API long-poll in, `opencode run` out.
 - **Never dies silently** — any fatal crash or SIGTERM announces `💀 …` to every allowed chat (best-effort, 3s each) before systemd restarts it; a dead worker thread is detected and respawned; a failed answer delivery retries once, then is audited and saved to `~/.config/tgbridge/undelivered/` instead of vanishing; a missing runner binary warns at startup instead of crashing
 - **`/cancel`** — abort the running agent (SIGTERM, SIGKILL after 5s); the run reports `🛑 cancelled by user`
 - **Slash-command menu** — `/new`, `/status`, `/at`, `/cancel`, `/help` registered via `setMyCommands`
-- **Chat + user allowlist** — double gate; unknown chats/users are dropped silently
+- **Chat + sender policy** — double allowlist by default; optionally trust all members of specifically allowlisted groups while keeping DMs user-allowlisted
 - **Selftest gate** — `python3 tgbridge.py --selftest` runs at every startup; a bridge that fails its own checks does not go live
 - **Emoji lifecycle** — 👀 received → ✅ done / 🔴 error, via `setMessageReaction`
 - **Typing indicator** — `sendChatAction` keep-alive for the whole run (re-fired every 4s)
@@ -36,6 +36,7 @@ public ports, no databases: Bot API long-poll in, `opencode run` out.
   "bot_token": "123456:ABC-DEF...",
   "allowed_user_ids": [YOUR_TELEGRAM_USER_ID],
   "allowed_chats": [YOUR_TELEGRAM_USER_ID, -1000000000000],
+  "allow_all_users_in_allowed_groups": false,
   "workdir": "/home/you/project",
   "transcribe_base_url": "https://api.groq.com/openai/v1",
   "transcribe_key": "gsk_...",
@@ -79,10 +80,16 @@ a group admin, so it can see plain messages.
 ### Multiple agents in one group
 
 One bridge per machine, one bot per bridge (a bot token allows exactly one
-poller). Each collaborator creates their own bot, runs their own bridge against
-their own local opencode, and adds their bot to the shared group. Put **all**
-human user IDs in every config's `allowed_user_ids` — the gate checks the
-*sender*, so anyone allowlisted can talk to any bot in the group.
+poller). Each collaborator can create their own bot, run their own bridge
+against their local agent, and add their bot to the shared group. By default,
+put **all** human user IDs in every config's `allowed_user_ids` — the gate checks
+the *sender*, so anyone allowlisted can talk to any bot in the group.
+
+If membership of one private, explicitly allowlisted group is the trust boundary,
+set `allow_all_users_in_allowed_groups` to `true`. Then any member of that group
+may @mention or reply to the bot, while private chats still require an entry in
+`allowed_user_ids` and every other group remains blocked. Keep the setting off
+for public or loosely controlled groups.
 
 ## Agent-initiated messages
 
@@ -107,6 +114,7 @@ To post to Telegram yourself: python3 /path/to/tgbridge/tgbridge.py --send <chat
 | `bot_token` | Bot token from BotFather |
 | `allowed_user_ids` | Telegram user IDs allowed to talk (groups check the *sender*, not the chat) |
 | `allowed_chats` | Chat IDs the bridge listens in (DM + groups); also gates `--send` |
+| `allow_all_users_in_allowed_groups` | If `true`, trust members of allowlisted groups without listing every user ID; DMs remain user-allowlisted (default `false`) |
 | `workdir` | Working directory for the agent |
 | `runner` | `opencode` (default), `claude`, or `codex` |
 | `run_timeout_s` | Per-run timeout in seconds (default `900`); partial answers are kept |

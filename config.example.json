@@ -3,6 +3,7 @@
   "bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2P1sQ9tXyZ",
   "allowed_user_ids": [123456789],
   "allowed_chats": [123456789, -1001234567890],
+  "allow_all_users_in_allowed_groups": false,
   "workdir": "/home/you/your-project",
   "run_timeout_s": 900,
   "chunk": 3900,
