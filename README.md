@@ -9,7 +9,9 @@ public ports, or databases: Bot API long-poll in, local CLI agent out.
 
 - **DM + group chats** — groups are mention-triggered (@bot or reply-to-bot), DMs always answer
 - **Per-chat sessions** — each chat maps to one native runner session (`/new` forgets the mapping, `/status` inspects it)
-- **Optional mid-run steering** — OpenCode's local server transport accepts a new @mention while a run is active, consumes it at the next agent turn, and returns one combined reply; CLI transports keep the existing queued-message behavior
+- **Same-turn steering where supported** — Codex app-server uses `turn/steer`; OpenCode server mode uses `prompt_async`; the bridge acknowledges the nuance immediately, then injects it without cancelling the active tool
+- **Burst coalescing** — adjacent Telegram messages are held briefly and merged, so automatic 4096-character splits do not become many separate agent runs
+- **Inbound photos + documents** — downloaded privately and passed as local paths; an unaddressed group upload is retained for the next @mention/reply, so the file itself needs no tag
 - **Live progress** — one status message, edited in place: elapsed seconds, real-time tool-call trail, and answer tail, read from CLI stdout or the server's persisted transcript
 - **Voice notes** — auto-transcribed via any OpenAI-compatible `/audio/transcriptions` API (Groq Whisper, OpenAI, self-hosted) and fed to the agent as text; opt-in via config
 - **Scheduled prompts** — `/at 30m <prompt>` (also `s`/`h`); persisted in state and re-armed on restart
@@ -42,6 +44,7 @@ public ports, or databases: Bot API long-poll in, local CLI agent out.
   "allowed_chats": [YOUR_TELEGRAM_USER_ID, -1000000000000],
   "allow_all_users_in_allowed_groups": false,
   "capture_group_context": true,
+  "input_debounce_s": 1.5,
   "workdir": "/home/you/project",
   "transcribe_base_url": "https://api.groq.com/openai/v1",
   "transcribe_key": "gsk_...",
@@ -122,17 +125,19 @@ To post to Telegram yourself: python3 /path/to/tgbridge/tgbridge.py --send <chat
 | `allowed_chats` | Chat IDs the bridge listens in (DM + groups); also gates `--send` |
 | `allow_all_users_in_allowed_groups` | If `true`, trust members of allowlisted groups without listing every user ID; DMs remain user-allowlisted (default `false`) |
 | `capture_group_context` | Buffer the last 20 eligible human group messages for the next prompt (default `true`) |
+| `input_debounce_s` | Merge adjacent Telegram messages for this many seconds before dispatch (default `1.5`, clamped to `0.2`–`5.0`) |
 | `workdir` | Working directory for the agent |
 | `runner` | `opencode` (default), `claude`, or `codex` |
 | `codex_yolo` | Pass Codex `--dangerously-bypass-approvals-and-sandbox`; grants authorized Telegram users unsandboxed access as the local OS user (default `false`) |
-| `runner_mode` | `cli` (portable default) or `server`; server adapters are capability-based and currently OpenCode implements mid-run steering |
+| `runner_mode` | `cli` (portable default) or `server`; Codex and OpenCode server adapters implement same-turn steering |
 | `server_url` | Local runner server URL (default `http://127.0.0.1:4096`; `OPENCODE_SERVER` remains supported) |
 | `server_poll_s` | Local transcript polling interval in server mode (default `0.5`, clamped to `0.1`–`5.0`) |
-| `run_timeout_s` | Per-run timeout in seconds (default `900`); partial answers are kept |
+| `run_timeout_s` | Inactivity timeout in seconds (default `900`); model/tool output and accepted steering renew the lease |
+| `run_max_s` | Absolute per-run safety cap even with activity (default `43200`, 12 hours) |
 | `chunk` | Outgoing reply chunk size (default `3900`, Telegram caps at 4096) |
 | `outbox_dir` | Where agents drop files for auto-delivery (default `workdir/.tgbridge-outbox`) |
 | `reactions` | `false` disables 👀/👍/👎 emoji lifecycle (default `true`) |
-| `model` | Optional model override passed to the runner (`--model` on all three CLIs); empty = runner default |
+| `model` | Optional `provider/model` override passed to CLI and server transports; empty = runner default |
 | `transcribe_base_url` | OpenAI-compatible base URL for transcription (default `https://api.openai.com/v1`) |
 | `transcribe_key` | API key; absent = voice notes disabled |
 | `transcribe_model` | Whisper model name (default `whisper-1`; Groq: `whisper-large-v3-turbo`) |
@@ -163,7 +168,7 @@ The bridge drives any of three agent CLIs (config key `runner`):
 |---|---|---|---|
 | `opencode` | `opencode run --format json` | `--session` | default; live tool trail + thinking + cost |
 | `claude` | `claude -p --output-format stream-json` | `--resume` | set `CLAUDE_BIN` if not on PATH |
-| `codex` | `codex exec --json` | `exec resume <id>` | best-effort; set `CODEX_BIN` |
+| `codex` | `codex exec --json` or app-server | native thread resume | use `runner_mode: "server"` for true same-turn steering; set `CODEX_BIN` if needed |
 
 ### Codex permission mode
 
@@ -185,8 +190,12 @@ trail, reactions, chunking. Sessions are titled with a time slug
 (`tg 20260903-0958`) on first message.
 
 The default `runner_mode: "cli"` works with all three runners and on both
-systemd and launchd installs. True mid-run steering needs a runner transport
-that can accept prompts while busy. Today that is OpenCode server mode: start
+systemd and launchd installs. True same-turn steering needs a runner transport
+that can accept prompts while busy. For Codex, set `runner_mode` to `server`;
+tgbridge starts the local Codex app-server transport and sends `turn/steer` with
+the exact active turn ID. This is deliberately not `codex queue`: that command
+waits for the thread to become idle and starts a later turn. OpenCode 1.17+
+server mode uses its native durable `delivery: "steer"` API: start
 `opencode serve --hostname 127.0.0.1 --port 4096`, set `runner` to `opencode`
 and `runner_mode` to `server`. The bridge polls the server's persisted message
 transcript, passes `workdir` on every API call, reports the active mode in
@@ -195,10 +204,16 @@ unsupported runner/mode combination fails explicitly rather than silently
 pretending to steer.
 
 By default, human group messages that do not @mention or reply to this bot are
-buffered (last 20, with sender, time, and up to 200 characters) and injected
+buffered (last 20, with sender, time, and up to 500 characters) and injected
 into its next mention-triggered run. The agent can therefore hear the room but
 only speaks when addressed. Set `capture_group_context` to `false` to ignore
 non-mention traffic.
+
+Photos and documents follow the same addressing rule without being lost: the
+bridge downloads them into its private inbox before checking the group trigger.
+You can upload a file first and then @mention/reply in the next message, or put
+the @mention in the upload caption. The addressed turn receives the saved local
+path. Telegram Bot API file-size limits still apply.
 
 Telegram itself never delivers messages authored by one bot to another bot,
 regardless of admin or privacy mode. Consequently, this ambient context includes
@@ -231,10 +246,10 @@ and Anthropic's official [claude-plugins-official telegram plugin](https://githu
 
 ## Limitations
 
-- One run at a time; cross-chat messages queue, and same-chat messages steer only when the selected server transport supports it
+- One worker run at a time; cross-chat messages queue, while same-chat Codex-app-server and OpenCode-server messages steer the active run
 - Bots cannot receive other bots' messages; peer-agent reports need an external shared event channel
-- Voice → text only; photos/documents are not ingested
-- Per-run timeout via `run_timeout_s` (default 15 minutes)
+- Photos/documents are passed as private local paths; the runner must support reading the file type
+- Progress-aware timeout: `run_timeout_s` is idle time, while `run_max_s` is the absolute cap
 - No message history — Telegram's Bot API doesn't expose any; sessions are how context persists
 
 ## License
