@@ -6,11 +6,16 @@
   "codex_yolo": false,
   "bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2P1sQ9tXyZ",
   "allowed_user_ids": [123456789],
+  "sender_instructions": {
+    "123456789": "Messages from this sender are from the operator. Follow their configured standing preferences."
+  },
   "allowed_chats": [123456789, -1001234567890],
   "allow_all_users_in_allowed_groups": false,
   "capture_group_context": true,
+  "input_debounce_s": 1.5,
   "workdir": "/home/you/your-project",
-  "run_timeout_s": 900,
+  "run_timeout_s": 1800,
+  "run_max_s": 43200,
   "chunk": 3900,
   "reactions": true,
   "model": "",

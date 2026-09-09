@@ -42,8 +42,10 @@ OPENCODE = os.environ.get(
 )
 OPENCODE_SERVER = os.environ.get("OPENCODE_SERVER", "http://localhost:4096")
 RUN_TIMEOUT_S = 900
+RUN_MAX_S = 43200
 SERVER_POLL_S = 0.5
 SERVER_QUIET_S = 0.75
+INPUT_DEBOUNCE_S = 1.5
 CHUNK = 3900
 CANCEL_MSG = "🛑 cancelled by user"
 CODEX_YOLO_FLAG = "--dangerously-bypass-approvals-and-sandbox"
@@ -52,6 +54,9 @@ PROMPT_Q = queue.Queue()
 STATE_LOCK = threading.Lock()
 AUDIT_LOCK = threading.Lock()
 RUN_LOCK = threading.Lock()
+INGRESS_LOCK = threading.Lock()
+CODEX_WRITE_LOCK = threading.Lock()
+PENDING_PROMPTS: dict = {}
 RUN_STATE: dict = {
     "busy": False,
     "current": None,
@@ -60,10 +65,18 @@ RUN_STATE: dict = {
     "server_sid": None,
     "server_directory": None,
     "server_url": None,
+    "server_api": None,
     "server_run_id": 0,
+    "cli_run_id": 0,
+    "codex_thread_id": None,
+    "codex_turn_id": None,
+    "codex_run_id": 0,
+    "codex_steers": {},
     "steer_count": 0,
     "steer_pending": 0,
     "steer_errors": [],
+    "run_started": None,
+    "last_progress": None,
 }
 
 
@@ -156,7 +169,7 @@ def api(token, method, **params):
             log(f"api {method} http {e.code}: {body[:150]}")
             return None
         except Exception as e:
-            log(f"api {method} error: {e}")
+            log(f"api {method} error: {type(e).__name__}: {e}")
             return None
     return None
 
@@ -535,15 +548,30 @@ def announce_all(cfg, text, post=_post):
             log(f"announce {chat_id}: {e}")
 
 
+def signal_run_process(proc, sig):
+    """Signal only the runner process group created by run_agent()."""
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, sig)
+    except (AttributeError, ProcessLookupError):
+        try:
+            proc.send_signal(sig)
+        except Exception:
+            pass
+    except Exception:
+        try:
+            proc.send_signal(sig)
+        except Exception:
+            pass
+
+
 def kill_after(proc, delay):
-    """Escalate to SIGKILL if proc hasn't exited after delay seconds."""
+    """Escalate the isolated runner process group to SIGKILL."""
 
     def _k():
         if proc.poll() is None:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            signal_run_process(proc, signal.SIGKILL)
 
     t = threading.Timer(delay, _k)
     t.daemon = True
@@ -551,10 +579,52 @@ def kill_after(proc, delay):
 
 
 def run_timeout(cfg):
+    """Idle timeout: progress and accepted steering renew this lease."""
     try:
-        return int(cfg.get("run_timeout_s", RUN_TIMEOUT_S))
+        return max(1, int(cfg.get("run_timeout_s", RUN_TIMEOUT_S)))
     except (TypeError, ValueError):
         return RUN_TIMEOUT_S
+
+
+def run_max(cfg):
+    """Absolute safety cap, independent of ongoing output."""
+    try:
+        return max(run_timeout(cfg), int(cfg.get("run_max_s", RUN_MAX_S)))
+    except (TypeError, ValueError):
+        return RUN_MAX_S
+
+
+def start_run_clock():
+    now = time.monotonic()
+    with RUN_LOCK:
+        RUN_STATE["run_started"] = now
+        RUN_STATE["last_progress"] = now
+    return now
+
+
+def mark_run_progress():
+    with RUN_LOCK:
+        RUN_STATE["last_progress"] = time.monotonic()
+
+
+def run_expiry(cfg, started):
+    """Return `idle` or `maximum` only when the matching lease expires."""
+    now = time.monotonic()
+    with RUN_LOCK:
+        last = RUN_STATE.get("last_progress") or started
+    if now - started >= run_max(cfg):
+        return "maximum"
+    if now - last >= run_timeout(cfg):
+        return "idle"
+    return None
+
+
+def input_debounce(cfg):
+    """Small merge window for Telegram's automatic multi-message splits."""
+    try:
+        return min(5.0, max(0.2, float(cfg.get("input_debounce_s", INPUT_DEBOUNCE_S))))
+    except (TypeError, ValueError):
+        return INPUT_DEBOUNCE_S
 
 
 def outbox_dir(cfg):
@@ -779,14 +849,31 @@ def run_agent(cfg, session_id, prompt, live=None):
         stderr=subprocess.PIPE,
         text=True,
         cwd=cfg["workdir"],
+        start_new_session=True,
     )
-    RUN_STATE["proc"] = proc  # exposed for /cancel and the shutdown path
+    with RUN_LOCK:
+        RUN_STATE["proc"] = proc  # exposed for /cancel and the shutdown path
+        RUN_STATE["cli_run_id"] = RUN_STATE.get("cli_run_id", 0) + 1
+        cli_run_id = RUN_STATE["cli_run_id"]
+        RUN_STATE["steer_count"] = 0
+        RUN_STATE["steer_pending"] = 0
+        RUN_STATE["steer_errors"] = []
     assert proc.stdout and proc.stderr  # guaranteed: both opened with PIPE
     timeout_s = run_timeout(cfg)
+    started = start_run_clock()
     timed_out = []
-    killer = threading.Timer(timeout_s, lambda: (timed_out.append(1), proc.kill()))
-    killer.daemon = True
-    killer.start()
+    stop_timeout = threading.Event()
+
+    def watch_timeout():
+        while not stop_timeout.wait(1.0):
+            reason = run_expiry(cfg, started)
+            if reason:
+                timed_out.append(reason)
+                signal_run_process(proc, signal.SIGKILL)
+                return
+
+    timeout_thread = threading.Thread(target=watch_timeout, daemon=True)
+    timeout_thread.start()
     errbuf = []
     stderr = proc.stderr
     drain = threading.Thread(
@@ -810,6 +897,7 @@ def run_agent(cfg, session_id, prompt, live=None):
                 ev = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            mark_run_progress()
             trail = parse(ev, acc)
             sid = acc["sid"]
             if live is not None:
@@ -824,20 +912,23 @@ def run_agent(cfg, session_id, prompt, live=None):
                     edit_status(cfg, live)
         proc.wait()
     finally:
-        killer.cancel()
-        RUN_STATE["proc"] = None
-    cancelled = RUN_STATE.pop("cancel", False)
+        stop_timeout.set()
+        with RUN_LOCK:
+            if RUN_STATE.get("cli_run_id") == cli_run_id:
+                RUN_STATE["proc"] = None
+            cancelled = RUN_STATE.pop("cancel", False)
     if timed_out:
+        reason = "idle" if timed_out[-1] == "idle" else "absolute maximum"
         partial = "\n".join(acc["texts"]).strip()
         if partial:
             return (
                 sid,
                 partial
-                + "\n\n⚠️ (partial answer — hit the %ss timeout and was killed)"
-                % timeout_s,
+                + "\n\n⚠️ (partial answer — hit the %s timeout and was killed)"
+                % reason,
                 None,
             )
-        return sid, None, "agent timed out after %ss and was killed" % timeout_s
+        return sid, None, "agent hit the %s timeout and was killed" % reason
     if cancelled and proc.returncode != 0:
         partial = "\n".join(acc["texts"]).strip()
         if partial:
@@ -963,31 +1054,53 @@ def _server_poll_interval(cfg):
 
 
 def _begin_steer(chat_id):
-    """Atomically reserve a steer delivery for a same-chat server run."""
+    """Reserve a supported same-chat steer without racing run completion."""
     with RUN_LOCK:
         cur = RUN_STATE.get("current")
-        sid = RUN_STATE.get("server_sid")
-        if not (RUN_STATE.get("busy") and sid and cur and cur.get("chat") == chat_id):
+        if not (RUN_STATE.get("busy") and cur and cur.get("chat") == chat_id):
             return None
-        RUN_STATE["steer_pending"] = RUN_STATE.get("steer_pending", 0) + 1
-        return (
-            sid,
-            RUN_STATE.get("server_run_id", 0),
-            RUN_STATE.get("server_directory"),
-            RUN_STATE.get("server_url"),
-        )
+        thread_id = RUN_STATE.get("codex_thread_id")
+        turn_id = RUN_STATE.get("codex_turn_id")
+        if thread_id and turn_id:
+            RUN_STATE["steer_pending"] = RUN_STATE.get("steer_pending", 0) + 1
+            RUN_STATE["last_progress"] = time.monotonic()
+            return {
+                "transport": "codex_turn_steer",
+                "sid": thread_id,
+                "turn_id": turn_id,
+                "run_id": RUN_STATE.get("codex_run_id", 0),
+            }
+        sid = RUN_STATE.get("server_sid")
+        if sid and RUN_STATE.get("server_api") == "v2":
+            RUN_STATE["steer_pending"] = RUN_STATE.get("steer_pending", 0) + 1
+            RUN_STATE["last_progress"] = time.monotonic()
+            return {
+                "transport": "opencode_v2_steer",
+                "sid": sid,
+                "run_id": RUN_STATE.get("server_run_id", 0),
+                "base_url": RUN_STATE.get("server_url"),
+            }
+        return None
 
 
 def should_steer(chat_id):
-    """A same-chat message arriving during a server-mode run becomes live
-    steering instead of a queued follow-up run."""
+    """Whether the active same-chat transport supports live steering."""
     with RUN_LOCK:
         cur = RUN_STATE.get("current")
         return bool(
             RUN_STATE.get("busy")
-            and RUN_STATE.get("server_sid")
             and cur
             and cur.get("chat") == chat_id
+            and (
+                (
+                    RUN_STATE.get("server_sid")
+                    and RUN_STATE.get("server_api") == "v2"
+                )
+                or (
+                    RUN_STATE.get("codex_thread_id")
+                    and RUN_STATE.get("codex_turn_id")
+                )
+            )
         )
 
 
@@ -1033,10 +1146,159 @@ def _steer_deliver(sid, run_id, directory, base_url, text):
                 )
 
 
-def run_agent_server(cfg, session_id, prompt, live=None):
-    """Run through OpenCode's local server with poll-based live steering.
+def _steer_deliver_v2(cfg, sid, run_id, base_url, text, chat_id, message_id):
+    """Admit a durable native OpenCode v2 steer at the next safe boundary."""
+    meta = {
+        "sid": sid,
+        "text": text,
+        "chat_id": chat_id,
+        "message_id": message_id,
+    }
+    err = None
+    try:
+        with RUN_LOCK:
+            if not (
+                RUN_STATE.get("server_sid") == sid
+                and RUN_STATE.get("server_run_id") == run_id
+                and RUN_STATE.get("server_api") == "v2"
+            ):
+                raise RuntimeError("active OpenCode run changed before steer delivery")
+        _server_call(
+            "POST",
+            f"/api/session/{sid}/prompt",
+            {
+                "prompt": {
+                    "text": "(steering from the human, mid-run — adjust course "
+                    "accordingly)\n" + text
+                },
+                "delivery": "steer",
+            },
+            timeout=5,
+            base_url=base_url,
+        )
+        audit(
+            "steer_delivered",
+            session=sid,
+            transport="opencode_v2_steer",
+            chars=len(text),
+        )
+    except Exception as e:
+        err = str(e)
+        audit(
+            "steer_error",
+            session=sid,
+            transport="opencode_v2_steer",
+            err=err[:200],
+        )
+        log(f"OpenCode v2 steer deliver: {e}")
+    finally:
+        with RUN_LOCK:
+            if (
+                RUN_STATE.get("server_sid") == sid
+                and RUN_STATE.get("server_run_id") == run_id
+            ):
+                if err:
+                    RUN_STATE.setdefault("steer_errors", []).append(err)
+                else:
+                    RUN_STATE["steer_count"] = RUN_STATE.get("steer_count", 0) + 1
+                RUN_STATE["steer_pending"] = max(
+                    0, RUN_STATE.get("steer_pending", 1) - 1
+                )
+        if err:
+            _steer_fallback(cfg, meta, err)
 
-    `/prompt_async` makes both the initial message and later steers non-blocking.
+
+def _codex_rpc_write(proc, payload):
+    """Write one newline-framed app-server request without interleaving writers."""
+    if not proc.stdin or proc.poll() is not None:
+        raise RuntimeError("Codex app-server is no longer running")
+    line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+    with CODEX_WRITE_LOCK:
+        proc.stdin.write(line)
+        proc.stdin.flush()
+
+
+def _steer_fallback(cfg, meta, err):
+    """Preserve a rejected live steer as a normal next turn and tell the user."""
+    chat_id = meta.get("chat_id")
+    text = meta.get("text") or ""
+    if chat_id is None:
+        return
+    PROMPT_Q.put((chat_id, meta.get("message_id"), text))
+    audit(
+        "steer_fallback_queued",
+        chat_id=chat_id,
+        session=meta.get("sid"),
+        chars=len(text),
+        err=str(err)[:200],
+    )
+    send(
+        cfg["bot_token"],
+        chat_id,
+        "⚠️ this turn could no longer accept steering; kept safely as the next turn",
+    )
+
+
+def _codex_steer_deliver(
+    cfg, sid, turn_id, run_id, text, chat_id=None, message_id=None
+):
+    """Send true same-turn steering to Codex app-server's `turn/steer`."""
+    meta = {
+        "sid": sid,
+        "text": text,
+        "chat_id": chat_id,
+        "message_id": message_id,
+    }
+    request_id = None
+    try:
+        with RUN_LOCK:
+            if not (
+                RUN_STATE.get("codex_thread_id") == sid
+                and RUN_STATE.get("codex_turn_id") == turn_id
+                and RUN_STATE.get("codex_run_id") == run_id
+            ):
+                raise RuntimeError("active Codex turn changed before steering delivery")
+            proc = RUN_STATE.get("proc")
+            seq = RUN_STATE.get("codex_request_id", 10) + 1
+            RUN_STATE["codex_request_id"] = seq
+            request_id = f"steer-{run_id}-{seq}"
+            RUN_STATE.setdefault("codex_steers", {})[request_id] = meta
+        _codex_rpc_write(
+            proc,
+            {
+                "id": request_id,
+                "method": "turn/steer",
+                "params": {
+                    "threadId": sid,
+                    "expectedTurnId": turn_id,
+                    "input": [{"type": "text", "text": text}],
+                },
+            },
+        )
+    except Exception as e:
+        with RUN_LOCK:
+            if request_id:
+                RUN_STATE.setdefault("codex_steers", {}).pop(request_id, None)
+            if RUN_STATE.get("codex_run_id") == run_id:
+                RUN_STATE["steer_pending"] = max(
+                    0, RUN_STATE.get("steer_pending", 1) - 1
+                )
+        audit(
+            "steer_error",
+            session=sid,
+            transport="codex_turn_steer",
+            err=str(e)[:200],
+        )
+        log(f"codex turn/steer write: {e}")
+        _steer_fallback(cfg, meta, e)
+
+
+def run_agent_server_v1(cfg, session_id, prompt, live=None):
+    """Compatibility transport for old OpenCode servers.
+
+    `/prompt_async` starts the initial message non-blockingly. Busy-session
+    steering is intentionally disabled: old servers can persist a prompt
+    between a tool call and its result, corrupting provider message order.
     `/session/{id}/message` is the authoritative transcript; `/session/status`
     supplies the busy/idle boundary (idle sessions are omitted by OpenCode
     1.1.12). A quiet grace prevents a just-arriving steer from being split into
@@ -1093,10 +1355,10 @@ def run_agent_server(cfg, session_id, prompt, live=None):
         )
         with RUN_LOCK:
             RUN_STATE["server_run_id"] = RUN_STATE.get("server_run_id", 0) + 1
-            run_id = RUN_STATE["server_run_id"]
             RUN_STATE["server_sid"] = sid
             RUN_STATE["server_directory"] = directory
             RUN_STATE["server_url"] = base_url
+            RUN_STATE["server_api"] = "v1"
             RUN_STATE["steer_count"] = 0
             RUN_STATE["steer_pending"] = 0
             RUN_STATE["steer_errors"] = []
@@ -1104,7 +1366,9 @@ def run_agent_server(cfg, session_id, prompt, live=None):
             if RUN_STATE.get("current"):
                 RUN_STATE["current"]["session"] = sid
         timeout_s = run_timeout(cfg)
-        deadline = time.monotonic() + timeout_s
+        started = start_run_clock()
+        timeout_reason = None
+        last_snapshot = json.dumps(before, sort_keys=True, ensure_ascii=False)
         poll_s = _server_poll_interval(cfg)
         quiet_s = max(SERVER_QUIET_S, poll_s)
         while True:
@@ -1122,7 +1386,8 @@ def run_agent_server(cfg, session_id, prompt, live=None):
                 except Exception as e:
                     log(f"server abort: {e}")
                 break
-            if time.monotonic() >= deadline:
+            timeout_reason = run_expiry(cfg, started)
+            if timeout_reason:
                 timed_out = True
                 try:
                     _server_call(
@@ -1143,6 +1408,10 @@ def run_agent_server(cfg, session_id, prompt, live=None):
                 directory=directory,
                 base_url=base_url,
             ) or []
+            snapshot = json.dumps(messages, sort_keys=True, ensure_ascii=False)
+            if snapshot != last_snapshot:
+                last_snapshot = snapshot
+                mark_run_progress()
             trails, infos = server_messages(messages, baseline, acc, seen)
             if live is not None:
                 if trails:
@@ -1169,6 +1438,8 @@ def run_agent_server(cfg, session_id, prompt, live=None):
             )
             active = statuses.get(sid)
             busy = bool(active and active.get("type") != "idle")
+            if busy:
+                mark_run_progress()
             completed = bool(infos) and all(
                 (info.get("time") or {}).get("completed") or info.get("error")
                 for info in infos
@@ -1217,6 +1488,7 @@ def run_agent_server(cfg, session_id, prompt, live=None):
             RUN_STATE["server_sid"] = None
             RUN_STATE["server_directory"] = None
             RUN_STATE["server_url"] = None
+            RUN_STATE["server_api"] = None
             RUN_STATE["steer_pending"] = 0
             RUN_STATE["steer_errors"] = []
             cancelled = bool(RUN_STATE.pop("cancel", False)) or cancelled
@@ -1226,11 +1498,11 @@ def run_agent_server(cfg, session_id, prompt, live=None):
         if timed_out and answer:
             return (
                 sid,
-                answer + "\n\n⚠️ (partial — hit the %ss timeout)" % timeout_s,
+                answer + f"\n\n⚠️ (partial — hit the {timeout_reason} timeout)",
                 None,
             )
         if timed_out:
-            return sid, None, "agent timed out after %ss" % timeout_s
+            return sid, None, f"agent hit the {timeout_reason} timeout"
         if cancelled and answer:
             return sid, answer + "\n\n🛑 (cancelled — partial answer)", None
         if cancelled:
@@ -1260,15 +1532,641 @@ def run_agent_server(cfg, session_id, prompt, live=None):
                 RUN_STATE["server_sid"] = None
                 RUN_STATE["server_directory"] = None
                 RUN_STATE["server_url"] = None
+                RUN_STATE["server_api"] = None
                 RUN_STATE["steer_pending"] = 0
                 RUN_STATE["steer_errors"] = []
                 RUN_STATE.pop("cancel", None)
 
 
+def opencode_v2_supported(cfg):
+    """Detect the durable `/api/... delivery=steer` contract."""
+    try:
+        spec = _server_call("GET", "/doc", timeout=3, base_url=server_url(cfg)) or {}
+        route = (spec.get("paths") or {}).get("/api/session/{sessionID}/prompt")
+        return bool(route and route.get("post"))
+    except Exception:
+        return False
+
+
+def _opencode_model(cfg, v2=False):
+    model = str(cfg.get("model") or "").strip()
+    if "/" not in model:
+        return None
+    provider, _, model_id = model.partition("/")
+    if not provider or not model_id:
+        return None
+    return (
+        {"providerID": provider, "id": model_id}
+        if v2
+        else {"providerID": provider, "modelID": model_id}
+    )
+
+
+def server_messages_v2(response, baseline, acc, seen):
+    """Fold OpenCode v2 projected messages into the existing live accumulator."""
+    trails = []
+    infos = []
+    messages = (response or {}).get("data") if isinstance(response, dict) else response
+    ordered = sorted(
+        messages or [], key=lambda item: (item.get("time") or {}).get("created", 0)
+    )
+    for message in ordered:
+        mid = message.get("id")
+        if not mid or mid in baseline or message.get("type") != "assistant":
+            continue
+        infos.append(message)
+        error_ids = acc.setdefault("error_ids", set())
+        if message.get("error") and mid not in error_ids:
+            acc.setdefault("errors", []).append(message["error"])
+            error_ids.add(mid)
+        for part in message.get("content") or []:
+            pid = part.get("id")
+            kind = part.get("type")
+            if kind == "text" and pid and part.get("text") is not None:
+                acc["parts"][pid] = part["text"]
+                if pid not in seen:
+                    seen.add(pid)
+                    acc["order"].append(pid)
+            elif kind == "reasoning" and part.get("text"):
+                acc["thinking"] = part["text"]
+            elif kind == "tool" and pid not in seen:
+                seen.add(pid)
+                name = part.get("name") or "tool"
+                inp = (part.get("state") or {}).get("input") or {}
+                summary = max(
+                    (v for v in inp.values() if isinstance(v, str)),
+                    key=len,
+                    default="",
+                ).replace("\n", " ")[:60]
+                trails.append(f"🔧 {name}: {summary}" if summary else f"🔧 {name}")
+    return trails, infos
+
+
+def run_agent_server_v2(cfg, session_id, prompt, live=None):
+    """Run OpenCode v2 and admit follow-ups as native safe-boundary steers."""
+    sid = session_id
+    timed_out = False
+    cancelled = False
+    base_url = server_url(cfg)
+    acc = {"parts": {}, "order": [], "thinking": None, "errors": []}
+    seen = set()
+    try:
+        if sid:
+            try:
+                _server_call("GET", f"/api/session/{sid}", timeout=5, base_url=base_url)
+            except urllib.error.HTTPError as eably:
+                if eably.code != 404:
+                    raise
+                sid = None
+            else:
+                model_ref = _opencode_model(cfg, v2=True)
+                if model_ref:
+                    _server_call(
+                        "POST",
+                        f"/api/session/{sid}/model",
+                        {"model": model_ref},
+                        timeout=5,
+                        base_url=base_url,
+                    )
+        if not sid:
+            create_body = {"location": {"directory": cfg["workdir"]}}
+            model_ref = _opencode_model(cfg, v2=True)
+            if model_ref:
+                create_body["model"] = model_ref
+            created = _server_call(
+                "POST", "/api/session", create_body, timeout=10, base_url=base_url
+            )
+            sid = ((created or {}).get("data") or {}).get("id")
+            if not sid:
+                return session_id, None, "OpenCode v2: could not create session"
+        before = _server_call(
+            "GET",
+            f"/api/session/{sid}/message?order=desc&limit=100",
+            timeout=10,
+            base_url=base_url,
+        ) or {}
+        baseline = {
+            message.get("id") for message in before.get("data", []) if message.get("id")
+        }
+        _server_call(
+            "POST",
+            f"/api/session/{sid}/prompt",
+            {"prompt": {"text": prompt}, "delivery": "steer"},
+            timeout=10,
+            base_url=base_url,
+        )
+        with RUN_LOCK:
+            RUN_STATE["server_run_id"] = RUN_STATE.get("server_run_id", 0) + 1
+            RUN_STATE["server_sid"] = sid
+            RUN_STATE["server_directory"] = cfg["workdir"]
+            RUN_STATE["server_url"] = base_url
+            RUN_STATE["server_api"] = "v2"
+            RUN_STATE["steer_count"] = 0
+            RUN_STATE["steer_pending"] = 0
+            RUN_STATE["steer_errors"] = []
+            RUN_STATE["cancel"] = False
+            if RUN_STATE.get("current"):
+                RUN_STATE["current"]["session"] = sid
+        timeout_s = run_timeout(cfg)
+        started = start_run_clock()
+        timeout_reason = None
+        last_snapshot = json.dumps(before, sort_keys=True, ensure_ascii=False)
+        poll_s = _server_poll_interval(cfg)
+        quiet_s = max(SERVER_QUIET_S, poll_s)
+        while True:
+            with RUN_LOCK:
+                cancelled = bool(RUN_STATE.get("cancel"))
+            timeout_reason = run_expiry(cfg, started)
+            if cancelled or timeout_reason:
+                timed_out = bool(timeout_reason) and not cancelled
+                try:
+                    _server_call(
+                        "POST",
+                        f"/api/session/{sid}/interrupt",
+                        timeout=5,
+                        base_url=base_url,
+                    )
+                except Exception as eably:
+                    log(f"OpenCode v2 interrupt: {eably}")
+                break
+            messages = _server_call(
+                "GET",
+                f"/api/session/{sid}/message?order=desc&limit=100",
+                timeout=10,
+                base_url=base_url,
+            ) or {}
+            snapshot = json.dumps(messages, sort_keys=True, ensure_ascii=False)
+            if snapshot != last_snapshot:
+                last_snapshot = snapshot
+                mark_run_progress()
+            trails, infos = server_messages_v2(messages, baseline, acc, seen)
+            if live is not None:
+                if trails:
+                    live["trail"].extend(trails)
+                    edit_status(cfg, live)
+                if acc["thinking"]:
+                    live["thinking"] = acc["thinking"]
+                    edit_status(cfg, live)
+                if acc["order"]:
+                    latest = acc["parts"].get(acc["order"][-1])
+                    if latest:
+                        live["preview"] = latest
+                        edit_status(cfg, live)
+            active = _server_call(
+                "GET", "/api/session/active", timeout=5, base_url=base_url
+            ) or {}
+            busy = sid in (active.get("data") or {})
+            if busy:
+                mark_run_progress()
+            completed = bool(infos) and all(
+                (info.get("time") or {}).get("completed") or info.get("error")
+                for info in infos
+            )
+            with RUN_LOCK:
+                pending = RUN_STATE.get("steer_pending", 0)
+                generation = RUN_STATE.get("steer_count", 0)
+            if not busy and completed and pending == 0:
+                time.sleep(quiet_s)
+                with RUN_LOCK:
+                    stable = (
+                        RUN_STATE.get("steer_pending", 0) == 0
+                        and RUN_STATE.get("steer_count", 0) == generation
+                        and not RUN_STATE.get("cancel")
+                    )
+                if stable:
+                    final_messages = _server_call(
+                        "GET",
+                        f"/api/session/{sid}/message?order=desc&limit=100",
+                        timeout=10,
+                        base_url=base_url,
+                    ) or {}
+                    server_messages_v2(final_messages, baseline, acc, seen)
+                    break
+            time.sleep(poll_s)
+        with RUN_LOCK:
+            steer_errors = list(RUN_STATE.get("steer_errors") or [])
+            cancelled = bool(RUN_STATE.pop("cancel", False)) or cancelled
+        answer = "\n\n".join(
+            acc["parts"][pid] for pid in acc["order"] if acc["parts"].get(pid)
+        ).strip()
+        if timed_out:
+            return (
+                sid,
+                answer + f"\n\n⚠️ (partial — hit the {timeout_reason} timeout)"
+                if answer
+                else None,
+                None if answer else f"agent hit the {timeout_reason} timeout",
+            )
+        if cancelled:
+            return (
+                (sid, answer + "\n\n🛑 (cancelled — partial answer)", None)
+                if answer
+                else (sid, None, CANCEL_MSG)
+            )
+        if steer_errors:
+            return sid, answer or None, None if answer else "steering delivery failed"
+        if acc["errors"]:
+            detail = json.dumps(acc["errors"][-1], ensure_ascii=False)[-500:]
+            return sid, answer or None, None if answer else f"OpenCode v2 error: {detail}"
+        if not answer:
+            return sid, None, "agent returned no text"
+        return sid, answer, None
+    except Exception as eably:
+        return sid, None, f"OpenCode v2 server error: {eably}"
+    finally:
+        with RUN_LOCK:
+            if RUN_STATE.get("server_sid") == sid:
+                RUN_STATE["server_sid"] = None
+                RUN_STATE["server_directory"] = None
+                RUN_STATE["server_url"] = None
+                RUN_STATE["server_api"] = None
+                RUN_STATE["steer_pending"] = 0
+                RUN_STATE["steer_errors"] = []
+                RUN_STATE.pop("cancel", None)
+
+
+def run_agent_server(cfg, session_id, prompt, live=None):
+    if session_id and not str(session_id).startswith("ses"):
+        session_id = None
+    if opencode_v2_supported(cfg):
+        return run_agent_server_v2(cfg, session_id, prompt, live)
+    return run_agent_server_v1(cfg, session_id, prompt, live)
+
+
 SERVER_RUNNERS["opencode"] = {
     "run": run_agent_server,
     "healthy": server_ok,
-    "feature": "mid-run steering",
+    "feature": "native same-turn steer (v2)",
+}
+
+
+def codex_app_server_ok(_cfg=None):
+    """Installed Codex must expose the app-server transport used for steering."""
+    try:
+        result = subprocess.run(
+            [_bin("CODEX_BIN", "codex"), "app-server", "--help"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _codex_read_events(stream, events):
+    try:
+        for raw in stream:
+            try:
+                events.put(json.loads(raw))
+            except json.JSONDecodeError:
+                continue
+    finally:
+        events.put(None)
+
+
+def _codex_wait_response(events, request_id, timeout=20, keep=None):
+    """Wait for one setup RPC response; pre-turn notifications are disposable."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            event = events.get(timeout=min(0.5, deadline - time.monotonic()))
+        except queue.Empty:
+            continue
+        if event is None:
+            raise RuntimeError("Codex app-server exited during setup")
+        if event.get("id") == request_id:
+            if event.get("error"):
+                detail = json.dumps(event["error"], ensure_ascii=False)[-600:]
+                raise RuntimeError(detail)
+            return event.get("result") or {}
+        if keep is not None:
+            keep.append(event)
+    raise RuntimeError(f"Codex app-server RPC {request_id} timed out")
+
+
+def _codex_item_trail(item):
+    """Render a compact tool trail from a v2 app-server ThreadItem."""
+    kind = item.get("type")
+    if kind == "commandExecution":
+        return "🔧 bash: " + (item.get("command") or "")[:60]
+    if kind == "mcpToolCall":
+        label = "/".join(
+            str(v) for v in (item.get("server"), item.get("tool")) if v
+        )
+        return "🔧 " + (label or "MCP tool")[:70]
+    if kind == "dynamicToolCall":
+        return "🔧 " + str(item.get("tool") or "dynamic tool")[:70]
+    if kind == "collabAgentToolCall":
+        return "🔧 " + str(item.get("tool") or "agent")[:70]
+    if kind == "webSearch":
+        return "🔧 web: " + str(item.get("query") or "search")[:60]
+    if kind == "fileChange":
+        return "🔧 file change"
+    if kind == "imageView":
+        return "🔧 image: " + str(item.get("path") or "view")[-60:]
+    if kind == "imageGeneration":
+        return "🔧 image generation"
+    return None
+
+
+def _codex_handle_steer_response(cfg, event, run_id):
+    request_id = event.get("id")
+    if not isinstance(request_id, str) or not request_id.startswith("steer-"):
+        return False
+    with RUN_LOCK:
+        meta = RUN_STATE.setdefault("codex_steers", {}).pop(request_id, None)
+        if meta and RUN_STATE.get("codex_run_id") == run_id:
+            RUN_STATE["steer_pending"] = max(
+                0, RUN_STATE.get("steer_pending", 1) - 1
+            )
+            if not event.get("error"):
+                RUN_STATE["steer_count"] = RUN_STATE.get("steer_count", 0) + 1
+    if not meta:
+        return True
+    if event.get("error"):
+        detail = json.dumps(event["error"], ensure_ascii=False)[-500:]
+        audit(
+            "steer_error",
+            session=meta["sid"],
+            transport="codex_turn_steer",
+            err=detail,
+        )
+        _steer_fallback(cfg, meta, detail)
+    else:
+        audit(
+            "steer_delivered",
+            session=meta["sid"],
+            transport="codex_turn_steer",
+            chars=len(meta["text"]),
+        )
+    return True
+
+
+def run_codex_app_server(cfg, session_id, prompt, live=None):
+    """Run Codex through app-server so `turn/steer` reaches the active turn."""
+    sid = session_id
+    turn_id = None
+    timed_out = False
+    cancelled = False
+    proc = None
+    events = queue.Queue()
+    errbuf = []
+    answer_final = []
+    answer_unknown = []
+    seen_messages = set()
+    previews = {}
+    turn_error = None
+    run_id = None
+    outstanding = []
+    try:
+        proc = subprocess.Popen(
+            [
+                _bin("CODEX_BIN", "codex"),
+                "app-server",
+                "--listen",
+                "stdio://",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=cfg["workdir"],
+            start_new_session=True,
+            bufsize=1,
+        )
+        assert proc.stdout and proc.stderr
+        threading.Thread(
+            target=_codex_read_events, args=(proc.stdout, events), daemon=True
+        ).start()
+        stderr = proc.stderr
+        threading.Thread(
+            target=lambda: errbuf.append(stderr.read() or ""), daemon=True
+        ).start()
+        with RUN_LOCK:
+            RUN_STATE["proc"] = proc
+            RUN_STATE["codex_run_id"] = RUN_STATE.get("codex_run_id", 0) + 1
+            run_id = RUN_STATE["codex_run_id"]
+            RUN_STATE["codex_thread_id"] = None
+            RUN_STATE["codex_turn_id"] = None
+            RUN_STATE["codex_steers"] = {}
+            RUN_STATE["steer_count"] = 0
+            RUN_STATE["steer_pending"] = 0
+            RUN_STATE["steer_errors"] = []
+            RUN_STATE["cancel"] = False
+
+        _codex_rpc_write(
+            proc,
+            {
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {"name": "tgbridge", "version": "0.1"},
+                    "capabilities": {"experimentalApi": True},
+                },
+            },
+        )
+        _codex_wait_response(events, 1)
+        _codex_rpc_write(proc, {"method": "initialized"})
+
+        access = {
+            "cwd": cfg["workdir"],
+            "approvalPolicy": "never",
+            "sandbox": (
+                "danger-full-access" if cfg.get("codex_yolo", False) else "read-only"
+            ),
+        }
+        if cfg.get("model"):
+            access["model"] = cfg["model"]
+        setup_id = 2
+        if session_id:
+            params = {**access, "threadId": session_id}
+            _codex_rpc_write(
+                proc,
+                {"id": setup_id, "method": "thread/resume", "params": params},
+            )
+            try:
+                setup = _codex_wait_response(events, setup_id)
+            except RuntimeError:
+                setup_id += 1
+                _codex_rpc_write(
+                    proc,
+                    {
+                        "id": setup_id,
+                        "method": "thread/start",
+                        "params": {**access, "ephemeral": False},
+                    },
+                )
+                setup = _codex_wait_response(events, setup_id)
+        else:
+            _codex_rpc_write(
+                proc,
+                {
+                    "id": setup_id,
+                    "method": "thread/start",
+                    "params": {**access, "ephemeral": False},
+                },
+            )
+            setup = _codex_wait_response(events, setup_id)
+        sid = ((setup.get("thread") or {}).get("id")) or session_id
+        if not sid:
+            raise RuntimeError("Codex app-server returned no thread id")
+
+        turn_request_id = setup_id + 1
+        _codex_rpc_write(
+            proc,
+            {
+                "id": turn_request_id,
+                "method": "turn/start",
+                "params": {
+                    "threadId": sid,
+                    "input": [{"type": "text", "text": prompt}],
+                },
+            },
+        )
+        early_events = []
+        started_response = _codex_wait_response(
+            events, turn_request_id, keep=early_events
+        )
+        turn_id = ((started_response.get("turn") or {}).get("id"))
+        if not turn_id:
+            raise RuntimeError("Codex app-server returned no active turn id")
+        with RUN_LOCK:
+            if RUN_STATE.get("codex_run_id") == run_id:
+                RUN_STATE["codex_thread_id"] = sid
+                RUN_STATE["codex_turn_id"] = turn_id
+                if RUN_STATE.get("current"):
+                    RUN_STATE["current"]["session"] = sid
+
+        clock_started = start_run_clock()
+        timeout_reason = None
+        completed = False
+        while not completed:
+            with RUN_LOCK:
+                cancelled = bool(RUN_STATE.get("cancel"))
+            if cancelled:
+                signal_run_process(proc, signal.SIGTERM)
+                kill_after(proc, 3)
+                break
+            timeout_reason = run_expiry(cfg, clock_started)
+            if timeout_reason:
+                timed_out = True
+                signal_run_process(proc, signal.SIGTERM)
+                kill_after(proc, 3)
+                break
+            if early_events:
+                event = early_events.pop(0)
+            else:
+                try:
+                    event = events.get(timeout=0.25)
+                except queue.Empty:
+                    continue
+            if event is None:
+                break
+            mark_run_progress()
+            if _codex_handle_steer_response(cfg, event, run_id):
+                continue
+            method = event.get("method")
+            params = event.get("params") or {}
+            if params.get("turnId") not in (None, turn_id):
+                continue
+            item = params.get("item") or {}
+            if method == "item/started":
+                trail = _codex_item_trail(item)
+                if trail and live is not None:
+                    live["trail"].append(trail)
+                    edit_status(cfg, live)
+            elif method == "item/agentMessage/delta":
+                item_id = params.get("itemId") or "message"
+                previews[item_id] = previews.get(item_id, "") + (params.get("delta") or "")
+                if live is not None and previews[item_id]:
+                    live["preview"] = previews[item_id]
+                    edit_status(cfg, live)
+            elif method == "item/completed" and item.get("type") == "agentMessage":
+                item_id = item.get("id")
+                if item_id and item_id in seen_messages:
+                    continue
+                if item_id:
+                    seen_messages.add(item_id)
+                text = (item.get("text") or "").strip()
+                if text and item.get("phase") == "final_answer":
+                    answer_final.append(text)
+                elif text and item.get("phase") is None:
+                    answer_unknown.append(text)
+            elif method == "error":
+                if not params.get("willRetry"):
+                    turn_error = json.dumps(params.get("error") or params, ensure_ascii=False)[-600:]
+            elif method == "turn/completed":
+                turn = params.get("turn") or {}
+                if turn.get("id") == turn_id:
+                    if turn.get("error"):
+                        turn_error = json.dumps(turn["error"], ensure_ascii=False)[-600:]
+                    completed = True
+
+        # Responses normally precede turn/completed, but drain any already
+        # buffered steer acknowledgements before tearing down the transport.
+        while True:
+            try:
+                event = events.get_nowait()
+            except queue.Empty:
+                break
+            if event is not None:
+                _codex_handle_steer_response(cfg, event, run_id)
+
+        with RUN_LOCK:
+            outstanding = list(RUN_STATE.get("codex_steers", {}).values())
+            RUN_STATE["codex_steers"] = {}
+            RUN_STATE["steer_pending"] = 0
+            cancelled = bool(RUN_STATE.pop("cancel", False)) or cancelled
+        for meta in outstanding:
+            _steer_fallback(cfg, meta, "app-server closed before steer acknowledgement")
+
+        answer = "\n\n".join(answer_final or answer_unknown).strip()
+        if timed_out and answer:
+            return sid, answer + f"\n\n⚠️ (partial — hit the {timeout_reason} timeout)", None
+        if timed_out:
+            return sid, None, f"agent hit the {timeout_reason} timeout"
+        if cancelled and answer:
+            return sid, answer + "\n\n🛑 (cancelled — partial answer)", None
+        if cancelled:
+            return sid, None, CANCEL_MSG
+        if turn_error and answer:
+            return sid, answer + "\n\n⚠️ (agent turn ended with an error)", None
+        if turn_error:
+            return sid, None, f"Codex app-server error: {turn_error}"
+        if not answer:
+            tail = (errbuf[0] if errbuf else "").strip()[-500:]
+            return sid, None, "agent returned no text" + (f"\n{tail}" if tail else "")
+        return sid, answer, None
+    except Exception as e:
+        tail = (errbuf[0] if errbuf else "").strip()[-400:]
+        detail = f"Codex app-server error: {e}"
+        if tail:
+            detail += "\n" + tail
+        return sid, None, detail
+    finally:
+        with RUN_LOCK:
+            if RUN_STATE.get("codex_run_id") == run_id:
+                RUN_STATE["codex_thread_id"] = None
+                RUN_STATE["codex_turn_id"] = None
+                RUN_STATE["codex_steers"] = {}
+                RUN_STATE["steer_pending"] = 0
+                RUN_STATE["proc"] = None
+                RUN_STATE.pop("cancel", None)
+        if proc and proc.poll() is None:
+            try:
+                if proc.stdin:
+                    proc.stdin.close()
+                proc.wait(timeout=2)
+            except Exception:
+                signal_run_process(proc, signal.SIGTERM)
+                kill_after(proc, 2)
+
+
+SERVER_RUNNERS["codex"] = {
+    "run": run_codex_app_server,
+    "healthy": codex_app_server_ok,
+    "feature": "same-turn turn/steer",
 }
 
 
@@ -1342,14 +2240,147 @@ def unpack_entry(entry):
     """Queue items arrive as (chat_id, message_id, prompt) tuples (prompt path)
     or dicts (scheduled /at jobs). Accept both — never crash the worker."""
     if isinstance(entry, dict):
+        if entry.get("kind") == "prompt_batch":
+            with INGRESS_LOCK:
+                if PENDING_PROMPTS.get(entry["chat_id"]) is entry:
+                    PENDING_PROMPTS.pop(entry["chat_id"], None)
+                parts = list(entry.get("parts") or [])
+            return entry["chat_id"], entry["message_id"], "\n\n".join(parts)
         return entry["chat_id"], entry["message_id"], entry["prompt"]
     return entry
 
 
+def _flush_prompt_batch(cfg, chat_id, batch):
+    """Commit one settled Telegram burst to steering or the serial queue."""
+    with INGRESS_LOCK:
+        if PENDING_PROMPTS.get(chat_id) is not batch or batch.get("queued"):
+            return
+        text = "\n\n".join(batch.get("parts") or []).strip()
+        batch["timer"] = None
+        if not text:
+            PENDING_PROMPTS.pop(chat_id, None)
+            return
+        steer_target = _begin_steer(chat_id)
+        if steer_target:
+            PENDING_PROMPTS.pop(chat_id, None)
+        else:
+            batch["queued"] = True
+    if steer_target:
+        sid = steer_target["sid"]
+        audit(
+            "steer_received",
+            chat_id=chat_id,
+            session=sid,
+            transport=steer_target["transport"],
+            chars=len(text),
+            messages=len(batch.get("parts") or []),
+        )
+        if steer_target["transport"] == "opencode_v2_steer":
+            target = _steer_deliver_v2
+            args = (
+                cfg,
+                sid,
+                steer_target["run_id"],
+                steer_target["base_url"],
+                text,
+                chat_id,
+                batch["message_id"],
+            )
+        elif steer_target["transport"] == "codex_turn_steer":
+            target = _codex_steer_deliver
+            args = (
+                cfg,
+                sid,
+                steer_target["turn_id"],
+                steer_target["run_id"],
+                text,
+                chat_id,
+                batch["message_id"],
+            )
+        else:
+            raise RuntimeError(f"unknown steer transport {steer_target['transport']}")
+        send(
+            cfg["bot_token"],
+            chat_id,
+            "🧭 received — it will be injected into this agent after the current tool call",
+        )
+        threading.Thread(target=target, args=args, daemon=True).start()
+        return
+
+    PROMPT_Q.put(batch)
+    with RUN_LOCK:
+        busy = bool(RUN_STATE.get("busy"))
+    if busy:
+        send(
+            cfg["bot_token"],
+            chat_id,
+            f"⏳ queued as one batch (position {PROMPT_Q.qsize()}) — /status for details",
+        )
+
+
+def defer_prompt(cfg, chat_id, message_id, text):
+    """Merge adjacent messages, including Telegram's automatic text splits."""
+    with INGRESS_LOCK:
+        batch = PENDING_PROMPTS.get(chat_id)
+        if batch:
+            batch.setdefault("parts", []).append(text)
+            audit(
+                "input_merged",
+                chat_id=chat_id,
+                messages=len(batch["parts"]),
+                chars=len(text),
+            )
+            if batch.get("queued"):
+                return
+            old_timer = batch.get("timer")
+            if old_timer:
+                old_timer.cancel()
+        else:
+            batch = {
+                "kind": "prompt_batch",
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "parts": [text],
+                "queued": False,
+                "timer": None,
+            }
+            PENDING_PROMPTS[chat_id] = batch
+        timer = threading.Timer(
+            input_debounce(cfg), _flush_prompt_batch, args=(cfg, chat_id, batch)
+        )
+        timer.daemon = True
+        batch["timer"] = timer
+        timer.start()
+
+
+def merge_open_burst(cfg, chat_id, text):
+    """Attach an unaddressed split tail/media item to an addressed open burst."""
+    with INGRESS_LOCK:
+        batch = PENDING_PROMPTS.get(chat_id)
+        if not batch or batch.get("queued"):
+            return False
+        batch.setdefault("parts", []).append(text)
+        old_timer = batch.get("timer")
+        if old_timer:
+            old_timer.cancel()
+        timer = threading.Timer(
+            input_debounce(cfg), _flush_prompt_batch, args=(cfg, chat_id, batch)
+        )
+        timer.daemon = True
+        batch["timer"] = timer
+        timer.start()
+        audit(
+            "input_merged",
+            chat_id=chat_id,
+            messages=len(batch["parts"]),
+            chars=len(text),
+            unaddressed_tail=True,
+        )
+        return True
+
+
 def selftest():
     """Regression gate: cheap checks that catch the bugs we actually shipped."""
-    import json as _json
-
     fails = []
 
     # worker unpack: both queue shapes
@@ -1357,6 +2388,14 @@ def selftest():
         fails.append("unpack tuple")
     if unpack_entry({"chat_id": 1, "message_id": 2, "prompt": "p"}) != (1, 2, "p"):
         fails.append("unpack dict")
+    batch = {
+        "kind": "prompt_batch",
+        "chat_id": 1,
+        "message_id": 2,
+        "parts": ["part one", "part two"],
+    }
+    if unpack_entry(batch) != (1, 2, "part one\n\npart two"):
+        fails.append("unpack merged batch")
 
     # chunker
     if split_chunks("a" * 100, limit=10)[0] != "a" * 10:
@@ -1626,6 +2665,12 @@ def selftest():
     ):
         if run_timeout(cfg_case) != want:
             fails.append(f"run_timeout {cfg_case}")
+    if run_max({"run_timeout_s": 20, "run_max_s": 10}) != 20:
+        fails.append("run maximum must not undercut idle timeout")
+    if input_debounce({"input_debounce_s": 0}) != 0.2:
+        fails.append("input debounce minimum")
+    if input_debounce({"input_debounce_s": "bad"}) != INPUT_DEBOUNCE_S:
+        fails.append("input debounce fallback")
 
     # botcmd: command routing incl. new commands and @BotName suffix
     if (
@@ -1658,6 +2703,16 @@ def selftest():
     strict_cfg = {"allowed_chats": [-10022], "allowed_user_ids": [11]}
     if is_authorized(strict_cfg, -10022, "supergroup", 99):
         fails.append("auth strict group")
+
+    # Per-sender operator instructions apply only to the configured human ID.
+    sender_cfg = {"sender_instructions": {"11": "use the cheap lane"}}
+    tagged = apply_sender_instructions(sender_cfg, 11, "delegate this")
+    if "use the cheap lane" not in tagged or not tagged.endswith("delegate this"):
+        fails.append("sender instructions configured")
+    if apply_sender_instructions(sender_cfg, 12, "plain") != "plain":
+        fails.append("sender instructions isolation")
+    if apply_sender_instructions({"sender_instructions": []}, 11, "plain") != "plain":
+        fails.append("sender instructions invalid config")
 
     # server-mode event folding: tool trail dedupe, text snapshot replace
     acc = {"parts": {}, "order": [], "thinking": None}
@@ -1765,6 +2820,42 @@ def selftest():
         or poll_acc["parts"].get("text") != "new answer"
     ):
         fails.append("server message polling")
+    v2_acc = {"parts": {}, "order": [], "thinking": None, "errors": []}
+    v2_trails, v2_infos = server_messages_v2(
+        {
+            "data": [
+                {"id": "old", "type": "assistant", "content": []},
+                {
+                    "id": "new-v2",
+                    "type": "assistant",
+                    "time": {"completed": 123},
+                    "content": [
+                        {
+                            "id": "tool-v2",
+                            "type": "tool",
+                            "name": "bash",
+                            "state": {"input": {"command": "pwd"}},
+                        },
+                        {"id": "text-v2", "type": "text", "text": "v2 answer"},
+                    ],
+                },
+            ]
+        },
+        {"old"},
+        v2_acc,
+        set(),
+    )
+    if (
+        v2_trails != ["🔧 bash: pwd"]
+        or [i.get("id") for i in v2_infos] != ["new-v2"]
+        or v2_acc["parts"].get("text-v2") != "v2 answer"
+    ):
+        fails.append("v2 server message polling")
+    if _opencode_model({"model": "opencode/muse"}, v2=True) != {
+        "providerID": "opencode",
+        "id": "muse",
+    }:
+        fails.append("v2 model config")
     if _server_poll_interval({"server_poll_s": 0}) != 0.1:
         fails.append("server poll minimum")
     if _server_poll_interval({"server_poll_s": "bad"}) != SERVER_POLL_S:
@@ -1783,17 +2874,18 @@ def selftest():
         RUN_STATE["server_sid"] = "s9"
         RUN_STATE["server_directory"] = "/tmp/project"
         RUN_STATE["server_url"] = "http://127.0.0.1:4096"
+        RUN_STATE["server_api"] = "v2"
         RUN_STATE["server_run_id"] = 4
         RUN_STATE["steer_pending"] = 0
         RUN_STATE["current"] = {"chat": 7}
     if not should_steer(7) or should_steer(8) or should_steer(11):
         fails.append("steer route")
-    if _begin_steer(7) != (
-        "s9",
-        4,
-        "/tmp/project",
-        "http://127.0.0.1:4096",
-    ):
+    if _begin_steer(7) != {
+        "transport": "opencode_v2_steer",
+        "sid": "s9",
+        "run_id": 4,
+        "base_url": "http://127.0.0.1:4096",
+    }:
         fails.append("steer reservation")
     with RUN_LOCK:
         if RUN_STATE["steer_pending"] != 1:
@@ -1802,10 +2894,45 @@ def selftest():
         RUN_STATE["server_sid"] = None
         RUN_STATE["server_directory"] = None
         RUN_STATE["server_url"] = None
+        RUN_STATE["server_api"] = None
         RUN_STATE["steer_pending"] = 0
         RUN_STATE["current"] = None
     if should_steer(7):
         fails.append("steer route idle")
+    with RUN_LOCK:
+        RUN_STATE["busy"] = True
+        RUN_STATE["server_sid"] = "old-server"
+        RUN_STATE["server_api"] = "v1"
+        RUN_STATE["current"] = {"chat": 7}
+    if should_steer(7) or _begin_steer(7):
+        fails.append("legacy server must queue instead of unsafe steering")
+    with RUN_LOCK:
+        RUN_STATE["busy"] = False
+        RUN_STATE["server_sid"] = None
+        RUN_STATE["server_api"] = None
+        RUN_STATE["current"] = None
+    # Codex steering is bound to the exact active app-server turn.
+    with RUN_LOCK:
+        RUN_STATE["busy"] = True
+        RUN_STATE["codex_thread_id"] = "codex-thread"
+        RUN_STATE["codex_turn_id"] = "codex-turn"
+        RUN_STATE["codex_run_id"] = 8
+        RUN_STATE["steer_pending"] = 0
+        RUN_STATE["current"] = {"chat": 7, "runner": "codex"}
+    codex_target = _begin_steer(7)
+    if codex_target != {
+        "transport": "codex_turn_steer",
+        "sid": "codex-thread",
+        "turn_id": "codex-turn",
+        "run_id": 8,
+    }:
+        fails.append("codex turn/steer reservation")
+    with RUN_LOCK:
+        RUN_STATE["busy"] = False
+        RUN_STATE["codex_thread_id"] = None
+        RUN_STATE["codex_turn_id"] = None
+        RUN_STATE["steer_pending"] = 0
+        RUN_STATE["current"] = None
     # An allowed group member can prompt. Human group messages are captured by
     # default for ambient context, but the bot still speaks only when mentioned.
     auth_state = {
@@ -1885,17 +3012,19 @@ def worker(cfg, state):
         chat_id = message_id = prompt = None
         try:
             chat_id, message_id, prompt = unpack_entry(entry)
+            rname = cfg.get("runner", "opencode")
+            mode = runner_mode(cfg)
             with RUN_LOCK:
                 RUN_STATE["busy"] = True
                 RUN_STATE["current"] = {
                     "chat": chat_id,
                     "since": time.time(),
                     "prompt": prompt[:60],
+                    "runner": rname,
+                    "mode": mode,
                 }
             with STATE_LOCK:
                 session_id = state.get("sessions", {}).get(str(chat_id))
-            rname = cfg.get("runner", "opencode")
-            mode = runner_mode(cfg)
             outbox = outbox_dir(cfg)
             prompt = prompt + (
                 f"\n\n(To give files to the user, write them into {outbox}/ "
@@ -1948,11 +3077,14 @@ def worker(cfg, state):
                             "use runner_mode='cli'",
                         )
                     elif not adapter["healthy"](cfg):
+                        where = (
+                            f" at {server_url(cfg)}" if rname == "opencode" else ""
+                        )
                         new_sid, answer, err = (
                             session_id,
                             None,
-                            f"{rname} server unavailable at {server_url(cfg)}; "
-                            "start its local server or use runner_mode='cli'",
+                            f"{rname} server transport unavailable{where}; "
+                            "start/install it or use runner_mode='cli'",
                         )
                     else:
                         new_sid, answer, err = adapter["run"](
@@ -2048,28 +3180,48 @@ def rearm_at(cfg, state):
         t.start()
 
 
-def save_document(cfg, msg):
-    doc = msg.get("document") or {}
-    fid = doc.get("file_id")
+def save_attachment(cfg, msg):
+    """Download an inbound document or highest-resolution Telegram photo."""
+    kind = None
+    item = msg.get("document") or {}
+    if item.get("file_id"):
+        kind = "attachment"
+        name = os.path.basename(item.get("file_name") or "file") or "file"
+    else:
+        photos = msg.get("photo") or []
+        item = photos[-1] if photos else {}
+        if not item.get("file_id"):
+            return None, None
+        kind = "photo"
+        name = f"photo-{item.get('file_unique_id') or msg.get('message_id') or 'image'}.jpg"
+    fid = item.get("file_id")
     if not fid:
-        return None
-    name = os.path.basename(doc.get("file_name") or "file") or "file"
+        return None, None
     r = api(cfg["bot_token"], "getFile", file_id=fid)
     fp = (r or {}).get("result", {}).get("file_path")
     if not fp:
-        return None
+        return None, None
     inbox = os.path.join(CONFIG_DIR, "inbox")
     ensure_private_dir(inbox)
-    dest = os.path.join(inbox, time.strftime("%Y%m%d-%H%M%S") + "-" + name)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    chat_id = (msg.get("chat") or {}).get("id", "chat")
+    dest = os.path.join(
+        inbox, f"{stamp}-{chat_id}-{msg.get('message_id', 'x')}-{name}"
+    )
     url = f"https://api.telegram.org/file/bot{cfg['bot_token']}/{fp}"
     try:
         urllib.request.urlretrieve(url, dest)
         os.chmod(dest, 0o600)
     except Exception as e:
         log(f"download {name}: {e}")
-        return None
-    log(f"attachment saved: {dest}")
-    return dest
+        try:
+            os.unlink(dest)
+        except OSError:
+            pass
+        return None, None
+    log(f"{kind} saved: {dest}")
+    audit("inbound_file", kind=kind, path=dest, bytes=os.path.getsize(dest))
+    return kind, dest
 
 
 def send_document(token, chat_id, path):
@@ -2128,6 +3280,22 @@ def is_authorized(cfg, chat_id, chat_type, user_id):
     return user_id in (cfg.get("allowed_user_ids") or [])
 
 
+def apply_sender_instructions(cfg, user_id, prompt):
+    """Prepend trusted operator rules for one configured Telegram sender."""
+    instructions = cfg.get("sender_instructions") or {}
+    if not isinstance(instructions, dict) or user_id is None:
+        return prompt
+    rule = instructions.get(str(user_id))
+    if not isinstance(rule, str) or not rule.strip():
+        return prompt
+    return (
+        "[Operator-configured instructions for this Telegram sender]\n"
+        + rule.strip()
+        + "\n[/Operator-configured instructions]\n\n"
+        + prompt
+    )
+
+
 def handle_update(cfg, state, upd):
     msg = upd.get("message")
     if not msg:
@@ -2141,14 +3309,24 @@ def handle_update(cfg, state, upd):
     if not is_authorized(cfg, chat_id, chat_type, user_id):
         return
     bot_username = state.get("bot_username", "")
+    has_attachment = bool(msg.get("document") or msg.get("photo"))
+    attachment_kind = attachment_path = None
+    if has_attachment:
+        attachment_kind, attachment_path = save_attachment(cfg, msg)
+    attachment_note = (
+        f"[{attachment_kind} saved: {attachment_path}]" if attachment_path else ""
+    )
 
     if chat_type != "private":
         reply = msg.get("reply_to_message") or {}
         replied_to_bot = (reply.get("from") or {}).get("username") == bot_username
         if f"@{bot_username}" not in text and not replied_to_bot:
+            context_text = "\n".join(p for p in (text.strip(), attachment_note) if p)
+            if context_text and merge_open_burst(cfg, chat_id, context_text):
+                return
             if (
                 cfg.get("capture_group_context", True)
-                and text.strip()
+                and context_text
                 and not text.lstrip().startswith("/")
             ):
                 with STATE_LOCK:
@@ -2157,10 +3335,11 @@ def handle_update(cfg, state, upd):
                         {
                             "who": (msg.get("from") or {}).get("first_name") or "?",
                             "t": time.strftime("%H:%M"),
-                            "text": text.strip()[:200],
+                            "text": context_text[:500],
                         }
                     )
                     del buf[:-20]
+                    save_json(STATE_PATH, state)
                 now = time.time()
                 hints = state.get("hints", {})
                 if now - hints.get(str(chat_id), 0) > 1800:
@@ -2175,10 +3354,11 @@ def handle_update(cfg, state, upd):
             return
         text = text.replace(f"@{bot_username}", "").strip()
 
-    if msg.get("document"):
-        doc_path = save_document(cfg, msg)
-        if doc_path:
-            text = (text + f"\n[attachment saved: {doc_path}]").strip()
+    if attachment_note:
+        text = "\n".join(p for p in (text, attachment_note) if p).strip()
+    elif has_attachment and not text.strip():
+        send(cfg["bot_token"], chat_id, "⚠️ I could not download that file from Telegram")
+        return
 
     cmd, rest = botcmd(text)
     if cmd == "/help":
@@ -2202,6 +3382,7 @@ def handle_update(cfg, state, upd):
             server_sid = RUN_STATE.get("server_sid")
             server_directory = RUN_STATE.get("server_directory")
             active_server_url = RUN_STATE.get("server_url")
+            active_server_api = RUN_STATE.get("server_api")
         if server_sid:
             if not cur:
                 send(cfg["bot_token"], chat_id, "nothing running")
@@ -2218,9 +3399,13 @@ def handle_update(cfg, state, upd):
             try:
                 _server_call(
                     "POST",
-                    f"/session/{server_sid}/abort",
+                    (
+                        f"/api/session/{server_sid}/interrupt"
+                        if active_server_api == "v2"
+                        else f"/session/{server_sid}/abort"
+                    ),
                     timeout=5,
-                    directory=server_directory,
+                    directory=server_directory if active_server_api != "v2" else None,
                     base_url=active_server_url,
                 )
             except Exception as e:
@@ -2238,10 +3423,7 @@ def handle_update(cfg, state, upd):
                 f"run belongs to chat {cur['chat']} — cancel from there",
             )
             return
-        try:
-            proc.terminate()
-        except Exception:
-            pass
+        signal_run_process(proc, signal.SIGTERM)
         kill_after(proc, 5)
         with RUN_LOCK:
             RUN_STATE["cancel"] = True
@@ -2254,6 +3436,9 @@ def handle_update(cfg, state, upd):
             pending = sum(
                 1 for e in state.get("at", {}).values() if e.get("chat_id") == chat_id
             )
+        with INGRESS_LOCK:
+            incoming = PENDING_PROMPTS.get(chat_id)
+            incoming_count = len((incoming or {}).get("parts") or [])
         with RUN_LOCK:
             c = RUN_STATE.get("current")
         cur = ""
@@ -2264,14 +3449,19 @@ def handle_update(cfg, state, upd):
         capability = (SERVER_RUNNERS.get(runner_name) or {}).get("feature")
         mode_label = f"{mode}: {capability}" if mode == "server" and capability else mode
         if runner_name == "codex":
-            policy = "yolo" if cfg.get("codex_yolo") else "default permissions"
+            policy = (
+                "yolo"
+                if cfg.get("codex_yolo")
+                else ("read-only" if mode == "server" else "default permissions")
+            )
             mode_label += f", {policy}"
         send(
             cfg["bot_token"],
             chat_id,
             f"chat {chat_id}\nrunner: {runner_name} ({mode_label})\n"
             f"session: {info}\ncwd: {cfg['workdir']}\n"
-            f"queued: {PROMPT_Q.qsize()}\nscheduled: {pending}{cur}",
+            f"incoming parts: {incoming_count}\nqueued batches: {PROMPT_Q.qsize()}\n"
+            f"scheduled: {pending}{cur}",
         )
         return
     if cmd == "/at":
@@ -2284,7 +3474,7 @@ def handle_update(cfg, state, upd):
             send(cfg["bot_token"], chat_id, "/at max is 7d")
             return
         due = int(time.time()) + delay
-        prompt = m.group(3).strip()
+        prompt = apply_sender_instructions(cfg, user_id, m.group(3).strip())
         with STATE_LOCK:
             state.setdefault("at", {})[str(due)] = {
                 "chat_id": chat_id,
@@ -2325,21 +3515,6 @@ def handle_update(cfg, state, upd):
 
     audit("enqueue", chat_id=chat_id, user_id=user_id, chars=len(text.strip()))
     prompt_text = text.strip()
-    steer_target = _begin_steer(chat_id)
-    if steer_target:
-        sid, run_id, directory, base_url = steer_target
-        audit("steer_received", chat_id=chat_id, session=sid, chars=len(prompt_text))
-        threading.Thread(
-            target=_steer_deliver,
-            args=(sid, run_id, directory, base_url, prompt_text),
-            daemon=True,
-        ).start()
-        send(
-            cfg["bot_token"],
-            chat_id,
-            "🧭 steering queued — the agent absorbs it at its next turn",
-        )
-        return
     if chat_type != "private" and cfg.get("capture_group_context", True):
         with STATE_LOCK:
             buf = (state.get("context") or {}).pop(str(chat_id), None) or []
@@ -2349,13 +3524,8 @@ def handle_update(cfg, state, upd):
                 "[group messages since your last turn — passive context, "
                 "nobody asked you anything yet:\n" + digest + "\n]\n\n" + prompt_text
             )
-    PROMPT_Q.put((chat_id, message_id, prompt_text))
-    if RUN_STATE["busy"]:
-        send(
-            cfg["bot_token"],
-            chat_id,
-            f"⏳ queued (position {PROMPT_Q.qsize()}) — /status for details",
-        )
+    prompt_text = apply_sender_instructions(cfg, user_id, prompt_text)
+    defer_prompt(cfg, chat_id, message_id, prompt_text)
 
 
 def cli_send(args):
@@ -2390,9 +3560,32 @@ def run(cfg):
     if not cfg.get("capture_group_context", True):
         state.pop("context", None)
         state.pop("hints", None)
-    me = api(cfg["bot_token"], "getMe")
+    me = None
+    for attempt in range(1, 6):
+        me = api(cfg["bot_token"], "getMe")
+        if me and me.get("ok"):
+            break
+        # api() returns None for both a dead token and a transient network
+        # fault — a single attempt must not misreport a blip as "bad token".
+        # Probe the raw HTTP status: only 401 means the token is wrong.
+        try:
+            probe = urllib.request.Request(
+                f"https://api.telegram.org/bot{cfg['bot_token']}/getMe",
+                data=b"",
+            )
+            with urllib.request.urlopen(probe, timeout=15) as r:
+                json.load(r)
+            log(f"getMe attempt {attempt}/5: no ok payload, retrying")
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                sys.exit("getMe failed: bad token (401 Unauthorized)")
+            log(f"getMe attempt {attempt}/5 transient http {e.code}, retrying")
+        except Exception as e:
+            log(f"getMe attempt {attempt}/5 transient {type(e).__name__}: {e}")
+        me = None
+        time.sleep(3)
     if not me or not me.get("ok"):
-        sys.exit("getMe failed: bad token?")
+        sys.exit("getMe failed after 5 retries: Telegram unreachable (token not verified)")
     state["bot_username"] = me["result"]["username"]
     save_json(STATE_PATH, state)
     api(
@@ -2440,9 +3633,12 @@ def run(cfg):
                 "use runner_mode='cli'"
             )
         elif not adapter["healthy"](cfg):
+            where = (
+                f" at {server_url(cfg)}" if rname == "opencode" else ""
+            )
             warn = (
-                f"⚠️ {rname} server unavailable at {server_url(cfg)} — "
-                "start it before prompting or use runner_mode='cli'"
+                f"⚠️ {rname} server transport unavailable{where} — "
+                "start/install it before prompting or use runner_mode='cli'"
             )
     if warn and hc:
         send(cfg["bot_token"], hc, warn)
@@ -2504,18 +3700,21 @@ def main():
             server_sid = RUN_STATE.get("server_sid")
             server_directory = RUN_STATE.get("server_directory")
             active_server_url = RUN_STATE.get("server_url")
+            active_server_api = RUN_STATE.get("server_api")
         if p is not None and p.poll() is None:
-            try:
-                p.terminate()  # don't orphan a burning agent run
-            except Exception:
-                pass
+            signal_run_process(p, signal.SIGTERM)  # don't orphan a burning agent run
+            kill_after(p, 2)
         if server_sid:
             try:
                 _server_call(
                     "POST",
-                    f"/session/{server_sid}/abort",
+                    (
+                        f"/api/session/{server_sid}/interrupt"
+                        if active_server_api == "v2"
+                        else f"/session/{server_sid}/abort"
+                    ),
                     timeout=5,
-                    directory=server_directory,
+                    directory=server_directory if active_server_api != "v2" else None,
                     base_url=active_server_url,
                 )
             except Exception:
