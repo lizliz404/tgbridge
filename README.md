@@ -122,6 +122,7 @@ To post to Telegram yourself: python3 /path/to/tgbridge/tgbridge.py --send <chat
 |---|---|
 | `bot_token` | Bot token from BotFather |
 | `allowed_user_ids` | Users allowed in DMs and in the default strict group policy |
+| `sender_instructions` | Optional map of Telegram user ID strings to trusted operator-authored instructions prepended only to that sender's prompts |
 | `allowed_chats` | Chat IDs the bridge listens in (DM + groups); also gates `--send` |
 | `allow_all_users_in_allowed_groups` | If `true`, trust members of allowlisted groups without listing every user ID; DMs remain user-allowlisted (default `false`) |
 | `capture_group_context` | Buffer the last 20 eligible human group messages for the next prompt (default `true`) |

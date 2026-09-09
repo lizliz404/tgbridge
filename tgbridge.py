@@ -169,7 +169,7 @@ def api(token, method, **params):
             log(f"api {method} http {e.code}: {body[:150]}")
             return None
         except Exception as e:
-            log(f"api {method} error: {e}")
+            log(f"api {method} error: {type(e).__name__}: {e}")
             return None
     return None
 
@@ -2704,6 +2704,16 @@ def selftest():
     if is_authorized(strict_cfg, -10022, "supergroup", 99):
         fails.append("auth strict group")
 
+    # Per-sender operator instructions apply only to the configured human ID.
+    sender_cfg = {"sender_instructions": {"11": "use the cheap lane"}}
+    tagged = apply_sender_instructions(sender_cfg, 11, "delegate this")
+    if "use the cheap lane" not in tagged or not tagged.endswith("delegate this"):
+        fails.append("sender instructions configured")
+    if apply_sender_instructions(sender_cfg, 12, "plain") != "plain":
+        fails.append("sender instructions isolation")
+    if apply_sender_instructions({"sender_instructions": []}, 11, "plain") != "plain":
+        fails.append("sender instructions invalid config")
+
     # server-mode event folding: tool trail dedupe, text snapshot replace
     acc = {"parts": {}, "order": [], "thinking": None}
     seen = set()
@@ -3270,6 +3280,22 @@ def is_authorized(cfg, chat_id, chat_type, user_id):
     return user_id in (cfg.get("allowed_user_ids") or [])
 
 
+def apply_sender_instructions(cfg, user_id, prompt):
+    """Prepend trusted operator rules for one configured Telegram sender."""
+    instructions = cfg.get("sender_instructions") or {}
+    if not isinstance(instructions, dict) or user_id is None:
+        return prompt
+    rule = instructions.get(str(user_id))
+    if not isinstance(rule, str) or not rule.strip():
+        return prompt
+    return (
+        "[Operator-configured instructions for this Telegram sender]\n"
+        + rule.strip()
+        + "\n[/Operator-configured instructions]\n\n"
+        + prompt
+    )
+
+
 def handle_update(cfg, state, upd):
     msg = upd.get("message")
     if not msg:
@@ -3448,7 +3474,7 @@ def handle_update(cfg, state, upd):
             send(cfg["bot_token"], chat_id, "/at max is 7d")
             return
         due = int(time.time()) + delay
-        prompt = m.group(3).strip()
+        prompt = apply_sender_instructions(cfg, user_id, m.group(3).strip())
         with STATE_LOCK:
             state.setdefault("at", {})[str(due)] = {
                 "chat_id": chat_id,
@@ -3498,6 +3524,7 @@ def handle_update(cfg, state, upd):
                 "[group messages since your last turn — passive context, "
                 "nobody asked you anything yet:\n" + digest + "\n]\n\n" + prompt_text
             )
+    prompt_text = apply_sender_instructions(cfg, user_id, prompt_text)
     defer_prompt(cfg, chat_id, message_id, prompt_text)
 
 
@@ -3533,9 +3560,32 @@ def run(cfg):
     if not cfg.get("capture_group_context", True):
         state.pop("context", None)
         state.pop("hints", None)
-    me = api(cfg["bot_token"], "getMe")
+    me = None
+    for attempt in range(1, 6):
+        me = api(cfg["bot_token"], "getMe")
+        if me and me.get("ok"):
+            break
+        # api() returns None for both a dead token and a transient network
+        # fault — a single attempt must not misreport a blip as "bad token".
+        # Probe the raw HTTP status: only 401 means the token is wrong.
+        try:
+            probe = urllib.request.Request(
+                f"https://api.telegram.org/bot{cfg['bot_token']}/getMe",
+                data=b"",
+            )
+            with urllib.request.urlopen(probe, timeout=15) as r:
+                json.load(r)
+            log(f"getMe attempt {attempt}/5: no ok payload, retrying")
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                sys.exit("getMe failed: bad token (401 Unauthorized)")
+            log(f"getMe attempt {attempt}/5 transient http {e.code}, retrying")
+        except Exception as e:
+            log(f"getMe attempt {attempt}/5 transient {type(e).__name__}: {e}")
+        me = None
+        time.sleep(3)
     if not me or not me.get("ok"):
-        sys.exit("getMe failed: bad token?")
+        sys.exit("getMe failed after 5 retries: Telegram unreachable (token not verified)")
     state["bot_username"] = me["result"]["username"]
     save_json(STATE_PATH, state)
     api(

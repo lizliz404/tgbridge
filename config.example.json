@@ -6,6 +6,9 @@
   "codex_yolo": false,
   "bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2P1sQ9tXyZ",
   "allowed_user_ids": [123456789],
+  "sender_instructions": {
+    "123456789": "Messages from this sender are from the operator. Follow their configured standing preferences."
+  },
   "allowed_chats": [123456789, -1001234567890],
   "allow_all_users_in_allowed_groups": false,
   "capture_group_context": true,
