@@ -2944,7 +2944,14 @@ def selftest():
     def auth_api(token, method, **params):
         return {"ok": True, "result": {"message_id": 1}}
 
+    auth_writes = []
+
+    def auth_save(path, data):
+        auth_writes.append(path)
+
+    orig_save_json = save_json
     globals()["api"] = auth_api
+    globals()["save_json"] = auth_save
     try:
         handle_update(
             auth_cfg,
@@ -2957,6 +2964,7 @@ def selftest():
                     "text": "background conversation",
                 }
             },
+            state_path=None,
         )
         if len((auth_state.get("context") or {}).get("-10022", [])) != 1:
             fails.append("group context default")
@@ -2972,11 +2980,15 @@ def selftest():
                     "text": "explicitly ignored context",
                 }
             },
+            state_path=None,
         )
         if private_state.get("context"):
             fails.append("group context opt-out")
+        if auth_writes:
+            fails.append("selftest state isolation")
     finally:
         globals()["api"] = orig_api
+        globals()["save_json"] = orig_save_json
 
     # Runtime metadata may contain prompts/session IDs, so modes are repaired
     # even when a permissive umask or an older version created the files.
@@ -3296,7 +3308,12 @@ def apply_sender_instructions(cfg, user_id, prompt):
     )
 
 
-def handle_update(cfg, state, upd):
+def handle_update(cfg, state, upd, *, state_path=STATE_PATH):
+    """Handle one Telegram update.
+
+    ``state_path=None`` keeps pure/self-test calls from persisting fixture state
+    into the live bridge store. Runtime callers use the real path by default.
+    """
     msg = upd.get("message")
     if not msg:
         return
@@ -3339,13 +3356,15 @@ def handle_update(cfg, state, upd):
                         }
                     )
                     del buf[:-20]
-                    save_json(STATE_PATH, state)
+                    if state_path is not None:
+                        save_json(state_path, state)
                 now = time.time()
                 hints = state.get("hints", {})
                 if now - hints.get(str(chat_id), 0) > 1800:
                     with STATE_LOCK:
                         state.setdefault("hints", {})[str(chat_id)] = now
-                        save_json(STATE_PATH, state)
+                        if state_path is not None:
+                            save_json(state_path, state)
                     send(
                         cfg["bot_token"],
                         chat_id,
@@ -3372,7 +3391,8 @@ def handle_update(cfg, state, upd):
     if cmd == "/new":
         with STATE_LOCK:
             state.setdefault("sessions", {}).pop(str(chat_id), None)
-            save_json(STATE_PATH, state)
+            if state_path is not None:
+                save_json(state_path, state)
         send(cfg["bot_token"], chat_id, "session cleared. next message starts fresh.")
         return
     if cmd == "/cancel":
@@ -3481,7 +3501,8 @@ def handle_update(cfg, state, upd):
                 "message_id": message_id,
                 "prompt": prompt,
             }
-            save_json(STATE_PATH, state)
+            if state_path is not None:
+                save_json(state_path, state)
         t = threading.Timer(delay, fire_at, args=(cfg, state, due))
         t.daemon = True
         t.start()
