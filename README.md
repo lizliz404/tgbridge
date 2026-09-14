@@ -2,8 +2,9 @@
 
 A minimal Telegram bridge for a local OpenCode, Claude, or Codex agent.
 
-A single Python file with **zero dependencies** (stdlib only). No webhooks,
-public ports, or databases: Bot API long-poll in, local CLI agent out.
+A small **zero-dependency** Python package (stdlib only) with `tgbridge.py` kept
+as the stable CLI entry point. No webhooks, public ports, or databases: Bot API
+long-poll in, local CLI agent out.
 
 ## Features
 
@@ -22,7 +23,7 @@ public ports, or databases: Bot API long-poll in, local CLI agent out.
 - **Slash-command menu** — `/new`, `/status`, `/at`, `/cancel`, `/help` registered via `setMyCommands`
 - **Chat + sender policy** — double allowlist by default; optionally trust all members of specifically allowlisted groups while keeping DMs user-allowlisted
 - **Private runtime state** — config, session index, audit log, attachments, and undelivered replies are kept under `~/.config/tgbridge` with private permissions
-- **Selftest gate** — `python3 tgbridge.py --selftest` runs at every startup; a bridge that fails its own checks does not go live
+- **Regression + startup gates** — `python3 tgbridge.py --selftest` runs the exhaustive suite on demand/CI; every service start runs only a fast, side-effect-free smoke gate
 - **Emoji lifecycle** — 👀 received → ✅ done / 🔴 error, via `setMessageReaction`
 - **Typing indicator** — `sendChatAction` keep-alive for the whole run (re-fired every 4s)
 - **Paragraph-aware chunking** — replies split at `\n\n` > `\n` > space (UTF-16 aware, never mid-emoji or mid-code-span), first chunk reply-threaded to your message. Markdown renders as Telegram HTML — code fences with syntax highlighting, tables as bullet groups, merged blockquotes (incl. expandable), bold/italic/strike/spoiler/links — with an automatic clean-plain-text fallback if Telegram ever refuses the HTML
@@ -191,6 +192,28 @@ actual transcript in its native storage. A group has one shared session, while
 each DM or other group gets a different one. `/new` only forgets the mapping so
 the next prompt creates a fresh session; it deliberately does not delete the
 runner's historical transcript.
+
+### Code layout
+
+`tgbridge.py` remains the compatible executable and owns runtime orchestration.
+Stable, independently testable boundaries live under `tgbridge_core/`:
+
+- `rendering.py` — Markdown-to-Telegram HTML and UTF-16-aware chunking
+- `health.py` — redacted proxy inspection and network failure classification
+- `storage.py` — private directories and atomic JSON persistence
+- `runners.py` — capability registries and native Codex/OpenCode/Claude CLI adapters
+- `selftest.py` — the exhaustive legacy regression gate, kept out of startup
+
+Focused tests live in `tests/` and run with:
+
+```sh
+python3 -m unittest discover -s tests -v
+python3 tgbridge.py --selftest
+```
+
+Future runner/transport extractions should follow the same rule: declare
+capabilities and preserve the public config/session contracts instead of making
+Codex, OpenCode, or Claude the global internal format.
 
 ## Runners
 
