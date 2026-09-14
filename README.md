@@ -27,6 +27,7 @@ public ports, or databases: Bot API long-poll in, local CLI agent out.
 - **Typing indicator** — `sendChatAction` keep-alive for the whole run (re-fired every 4s)
 - **Paragraph-aware chunking** — replies split at `\n\n` > `\n` > space (UTF-16 aware, never mid-emoji or mid-code-span), first chunk reply-threaded to your message. Markdown renders as Telegram HTML — code fences with syntax highlighting, tables as bullet groups, merged blockquotes (incl. expandable), bold/italic/strike/spoiler/links — with an automatic clean-plain-text fallback if Telegram ever refuses the HTML
 - **Rate-limit friendly** — honors Telegram 429 `retry_after`; poll failures back off exponentially (3s → 30s)
+- **Inspectable health** — `--doctor`, `/status`, and private `health.json` distinguish a live process from a healthy Telegram long poll; repeated failures can hand control back to launchd/systemd
 
 ## Setup
 
@@ -80,6 +81,16 @@ tail -f ~/.config/tgbridge/tgbridge.log
 ```
 
 or just run it inside `tmux`: `OPENCODE_BIN=$(which opencode) python3 tgbridge.py`
+
+Check the complete service environment before relying on it:
+
+```sh
+python3 tgbridge.py --doctor
+```
+
+The command exits nonzero when config/state, the selected runner, or Telegram
+is unavailable. Its JSON output redacts proxy credentials and reports dead
+localhost proxy endpoints.
 
 **4. Talk to it.** DM the bot, or add it to a group and @mention it.
 For groups you may want BotFather → `/setprivacy` → Disable, or make the bot
@@ -138,6 +149,7 @@ To post to Telegram yourself: python3 /path/to/tgbridge/tgbridge.py --send <chat
 | `chunk` | Outgoing reply chunk size (default `3900`, Telegram caps at 4096) |
 | `outbox_dir` | Where agents drop files for auto-delivery (default `workdir/.tgbridge-outbox`) |
 | `reactions` | `false` disables 👀/👍/👎 emoji lifecycle (default `true`) |
+| `poll_failure_exit_threshold` | Exit nonzero after this many consecutive failed long polls so launchd/systemd can restart and surface the failure (default `20`; `0` disables) |
 | `model` | Optional `provider/model` override passed to CLI and server transports; empty = runner default |
 | `transcribe_base_url` | OpenAI-compatible base URL for transcription (default `https://api.openai.com/v1`) |
 | `transcribe_key` | API key; absent = voice notes disabled |
@@ -150,7 +162,26 @@ still accepted as `runner_mode: "server"` for backward compatibility.
 
 Runtime files (never committed) live under `~/.config/tgbridge/` with private
 permissions: `state.json` (session index, Telegram offset, scheduled prompts),
-`audit.jsonl`, downloaded attachments, and undelivered replies.
+`health.json` (poll status and last success/error), `audit.jsonl`, downloaded
+attachments, and undelivered replies.
+
+### Telegram is silent but the service says running
+
+A supervisor only proves that the Python process exists. Check the bridge log
+and run `python3 tgbridge.py --doctor` as the same service user. A common
+cross-platform failure is a stale `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY`
+pointing to a localhost port whose proxy process stopped or moved.
+
+- macOS: inspect `launchctl print gui/$(id -u)/com.liz.tgbridge`,
+  `scutil --proxy`, and `lsof -nP -iTCP:<port> -sTCP:LISTEN`.
+- Linux: inspect `systemctl --user show tgbridge -p Environment -p MainPID`,
+  `journalctl --user -u tgbridge`, and `ss -ltnp`.
+- If direct Telegram access is intended, add both uppercase and lowercase
+  `NO_PROXY` entries for `api.telegram.org,127.0.0.1,localhost` to the service
+  environment. If the network requires a proxy, repair its endpoint instead.
+
+After restarting, verify at least one complete 50-second long-poll interval.
+Do not treat `running` or a one-off `getMe` response as end-to-end health.
 
 ### Session storage model
 
