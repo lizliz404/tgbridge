@@ -25,6 +25,7 @@ import queue
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -37,6 +38,7 @@ CONFIG_DIR = os.path.expanduser("~/.config/tgbridge")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 STATE_PATH = os.path.join(CONFIG_DIR, "state.json")
 AUDIT_PATH = os.path.join(CONFIG_DIR, "audit.jsonl")
+HEALTH_PATH = os.path.join(CONFIG_DIR, "health.json")
 OPENCODE = os.environ.get(
     "OPENCODE_BIN", os.path.expanduser("~/.local/share/mise/shims/opencode")
 )
@@ -96,6 +98,7 @@ def ensure_private_storage():
         CONFIG_PATH,
         STATE_PATH,
         AUDIT_PATH,
+        HEALTH_PATH,
         os.path.join(CONFIG_DIR, "tgbridge.log"),
     ):
         if os.path.isfile(path):
@@ -141,7 +144,98 @@ def save_json(path, data):
         raise
 
 
-def api(token, method, **params):
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def redact_proxy_url(value):
+    """Return useful proxy coordinates without leaking embedded credentials."""
+    if not value or not isinstance(value, str):
+        return value
+    candidate = value if "://" in value else "http://" + value
+    try:
+        parsed = urllib.parse.urlsplit(candidate)
+    except ValueError:
+        return "<invalid>"
+    host = parsed.hostname
+    if not host:
+        return "<invalid>"
+    host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    try:
+        port = f":{parsed.port}" if parsed.port else ""
+    except ValueError:
+        return "<invalid>"
+    scheme = parsed.scheme or "http"
+    return f"{scheme}://{host}{port}"
+
+
+def proxy_diagnostics():
+    """Describe proxy routing and whether localhost proxy endpoints are alive."""
+    proxies = {
+        str(kind): redact_proxy_url(str(value))
+        for kind, value in urllib.request.getproxies().items()
+    }
+    local = []
+    seen = set()
+    for kind, value in proxies.items():
+        if kind == "no" or not value or value == "<invalid>":
+            continue
+        try:
+            parsed = urllib.parse.urlsplit(value)
+            host, port = parsed.hostname, parsed.port
+        except ValueError:
+            continue
+        if host not in ("localhost", "127.0.0.1", "::1") or not port:
+            continue
+        endpoint = (host, port)
+        if endpoint in seen:
+            continue
+        seen.add(endpoint)
+        listening = False
+        try:
+            with socket.create_connection(endpoint, timeout=0.4):
+                listening = True
+        except OSError:
+            pass
+        local.append(
+            {"host": host, "port": port, "listening": listening, "source": kind}
+        )
+    return {
+        "proxies": proxies,
+        "telegram_bypassed": urllib.request.proxy_bypass("api.telegram.org"),
+        "local_endpoints": local,
+    }
+
+
+def classify_network_error(exc, proxy_info=None):
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    refused = isinstance(reason, ConnectionRefusedError) or getattr(
+        reason, "errno", None
+    ) in (61, 111)
+    info = proxy_info if proxy_info is not None else proxy_diagnostics()
+    dead_local_proxy = any(
+        not endpoint.get("listening") for endpoint in info.get("local_endpoints", [])
+    )
+    if refused and dead_local_proxy and not info.get("telegram_bypassed"):
+        return "proxy_refused"
+    if refused:
+        return "connection_refused"
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"http_{exc.code}"
+    if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError):
+        return "timeout"
+    return type(reason).__name__.lower()
+
+
+def update_health(**fields):
+    health = load_json(HEALTH_PATH, {})
+    health.update(fields)
+    health["updated_at"] = now_iso()
+    save_json(HEALTH_PATH, health)
+    return health
+
+
+def api(token, method, _error=None, **params):
     data = urllib.parse.urlencode(params).encode()
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{token}/{method}", data=data
@@ -152,6 +246,8 @@ def api(token, method, **params):
                 return json.load(r)
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")
+            if _error is not None:
+                _error.update(kind=classify_network_error(e), message=f"HTTP {e.code}")
             if e.code == 409:
                 log(
                     "409 CONFLICT: another poller holds this bot token — is an old bridge still running?"
@@ -169,6 +265,8 @@ def api(token, method, **params):
             log(f"api {method} http {e.code}: {body[:150]}")
             return None
         except Exception as e:
+            if _error is not None:
+                _error.update(kind=classify_network_error(e), message=str(e)[:200])
             log(f"api {method} error: {type(e).__name__}: {e}")
             return None
     return None
@@ -2403,6 +2501,17 @@ def selftest():
     parts = split_chunks("x\n\n" + "y" * 100, limit=20)
     if parts[0] != "x" or len(parts) < 2:
         fails.append("chunk boundary")
+    if redact_proxy_url("http://user:secret@127.0.0.1:7897/path") != (
+        "http://127.0.0.1:7897"
+    ):
+        fails.append("proxy credential redaction")
+    refused = urllib.error.URLError(ConnectionRefusedError(61, "refused"))
+    dead_proxy = {
+        "telegram_bypassed": False,
+        "local_endpoints": [{"listening": False}],
+    }
+    if classify_network_error(refused, dead_proxy) != "proxy_refused":
+        fails.append("dead proxy classification")
 
     # markdown -> telegram HTML
     h, pre, _lang = md_to_html("code `<b>&</b>` and **bold** [t](http://x/y)")
@@ -3461,6 +3570,9 @@ def handle_update(cfg, state, upd, *, state_path=STATE_PATH):
             incoming_count = len((incoming or {}).get("parts") or [])
         with RUN_LOCK:
             c = RUN_STATE.get("current")
+        health = load_json(HEALTH_PATH, {})
+        poll_health = health.get("status", "unknown")
+        failures = health.get("consecutive_poll_failures", 0)
         cur = ""
         if c:
             cur = f"\nrunning: {c['prompt']}… ({int(time.time() - c['since'])}s)"
@@ -3481,7 +3593,8 @@ def handle_update(cfg, state, upd, *, state_path=STATE_PATH):
             f"chat {chat_id}\nrunner: {runner_name} ({mode_label})\n"
             f"session: {info}\ncwd: {cfg['workdir']}\n"
             f"incoming parts: {incoming_count}\nqueued batches: {PROMPT_Q.qsize()}\n"
-            f"scheduled: {pending}{cur}",
+            f"scheduled: {pending}\ntelegram poll: {poll_health} "
+            f"(failures: {failures}){cur}",
         )
         return
     if cmd == "/at":
@@ -3568,6 +3681,69 @@ def cli_send(args):
     log(f"--send -> {chat_id} ({len(args[1])} chars)")
 
 
+def doctor_report():
+    """Return a redacted, cross-platform runtime readiness report."""
+    ensure_private_storage()
+    cfg = load_json(CONFIG_PATH, None)
+    report = {
+        "ok": False,
+        "checked_at": now_iso(),
+        "config_path": CONFIG_PATH,
+        "state_path": STATE_PATH,
+        "health_path": HEALTH_PATH,
+        "proxy": proxy_diagnostics(),
+        "health": load_json(HEALTH_PATH, {}),
+    }
+    if not cfg:
+        report["config"] = {"ok": False, "error": "missing or invalid config"}
+        return report
+    report["config"] = {"ok": True}
+    state_parent = os.path.dirname(STATE_PATH)
+    state_writable = os.access(state_parent, os.W_OK) and (
+        not os.path.exists(STATE_PATH) or os.access(STATE_PATH, os.W_OK)
+    )
+    report["state"] = {"writable": state_writable}
+
+    rname = cfg.get("runner", "opencode")
+    mode = runner_mode(cfg)
+    runner_check = {"name": rname, "mode": mode, "ok": False}
+    try:
+        if rname not in RUNNERS:
+            raise RunnerError(f"unknown runner {rname!r}")
+        RUNNERS[rname](None, "doctor", cfg.get("model") or None)
+        if mode == "server":
+            adapter = SERVER_RUNNERS.get(rname)
+            if not adapter:
+                raise RunnerError(f"runner {rname!r} has no server transport")
+            if not adapter["healthy"](cfg):
+                raise RunnerError("server transport unavailable")
+        elif mode != "cli":
+            raise RunnerError(f"unknown runner_mode {mode!r}")
+        runner_check["ok"] = True
+    except Exception as e:
+        runner_check["error"] = str(e)[:200]
+    report["runner"] = runner_check
+
+    telegram_error = {}
+    me = api(cfg["bot_token"], "getMe", _error=telegram_error)
+    telegram_ok = bool(me and me.get("ok"))
+    report["telegram"] = {
+        "ok": telegram_ok,
+        "bot_username": (me.get("result") or {}).get("username")
+        if telegram_ok
+        else None,
+        "error": telegram_error or None,
+    }
+    report["ok"] = bool(state_writable and runner_check["ok"] and telegram_ok)
+    return report
+
+
+def cli_doctor():
+    report = doctor_report()
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report.get("ok") else 1
+
+
 class BridgeStop(Exception):
     """Raised by the SIGTERM/SIGINT handler — a graceful stop, not a crash."""
 
@@ -3577,6 +3753,12 @@ def on_stop(signum, frame):
 
 
 def run(cfg):
+    update_health(
+        status="starting",
+        pid=os.getpid(),
+        started_at=now_iso(),
+        consecutive_poll_failures=0,
+    )
     state = load_json(STATE_PATH, {})
     if not cfg.get("capture_group_context", True):
         state.pop("context", None)
@@ -3623,6 +3805,7 @@ def run(cfg):
         ),
     )
     log(f"tgbridge up as @{state['bot_username']}, chats={cfg['allowed_chats']}")
+    update_health(status="polling", bot_username=state["bot_username"])
     if cfg.get("runner") == "codex" and cfg.get("codex_yolo"):
         log("WARNING codex_yolo=true: Telegram prompts have unsandboxed OS access")
 
@@ -3670,6 +3853,13 @@ def run(cfg):
 
     offset = state.get("offset")
     backoff = 3
+    poll_failures = 0
+    try:
+        failure_exit_threshold = max(
+            0, int(cfg.get("poll_failure_exit_threshold", 20))
+        )
+    except (TypeError, ValueError):
+        failure_exit_threshold = 20
     while True:
         if not worker_t.is_alive():
             log("worker thread died — respawning")
@@ -3680,12 +3870,31 @@ def run(cfg):
         params = {"timeout": 50, "allowed_updates": json.dumps(["message"])}
         if offset:
             params["offset"] = offset
-        res = api(cfg["bot_token"], "getUpdates", **params)
+        poll_error = {}
+        res = api(cfg["bot_token"], "getUpdates", _error=poll_error, **params)
         if not res or not res.get("ok"):
+            poll_failures += 1
+            update_health(
+                status="unhealthy",
+                consecutive_poll_failures=poll_failures,
+                last_poll_error=poll_error
+                or {"kind": "invalid_response", "message": "Telegram returned no ok payload"},
+            )
+            if failure_exit_threshold and poll_failures >= failure_exit_threshold:
+                raise RuntimeError(
+                    f"Telegram polling unhealthy for {poll_failures} consecutive attempts"
+                )
             time.sleep(backoff)
             backoff = min(backoff * 2, 30)
             continue
+        poll_failures = 0
         backoff = 3
+        update_health(
+            status="healthy",
+            last_poll_ok_at=now_iso(),
+            consecutive_poll_failures=0,
+            last_poll_error=None,
+        )
         for upd in res.get("result", []):
             offset = upd["update_id"] + 1
             try:
@@ -3702,6 +3911,8 @@ def run(cfg):
 
 
 def main():
+    if "--doctor" in sys.argv:
+        sys.exit(cli_doctor())
     if "--selftest" in sys.argv:
         selftest()
         return
@@ -3716,6 +3927,7 @@ def main():
     try:
         run(cfg)
     except BridgeStop:
+        update_health(status="stopped", stopped_at=now_iso())
         with RUN_LOCK:
             p = RUN_STATE.get("proc")
             server_sid = RUN_STATE.get("server_sid")
@@ -3745,9 +3957,11 @@ def main():
         log("bridge stopped by signal")
         sys.exit(0)
     except SystemExit as e:
+        update_health(status="failed", exit_error=str(e.code or ""))
         announce_all(cfg, f"💀 bridge exited: {e.code or ''}".rstrip())
         raise
     except BaseException as e:
+        update_health(status="crashed", crash_error=str(e)[:300])
         audit("crash", err=str(e)[:300])
         announce_all(cfg, f"💀 bridge crashed: {e} — restarting")
         sys.exit(1)
