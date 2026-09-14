@@ -23,9 +23,7 @@ import json
 import os
 import queue
 import re
-import shutil
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -34,14 +32,32 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from tgbridge_core.rendering import (
+    _balanced,
+    _strip_html_markup,
+    _wrap_markdown_tables,
+    md_to_html,
+    split_chunks,
+)
+from tgbridge_core.health import (
+    classify_network_error,
+    now_iso,
+    proxy_diagnostics,
+)
+from tgbridge_core.storage import ensure_private_dir, load_json, save_json
+from tgbridge_core.runners import (
+    RUNNERS,
+    SERVER_RUNNERS,
+    RunnerError,
+    _bin,
+    apply_runner_policy,
+)
+
 CONFIG_DIR = os.path.expanduser("~/.config/tgbridge")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 STATE_PATH = os.path.join(CONFIG_DIR, "state.json")
 AUDIT_PATH = os.path.join(CONFIG_DIR, "audit.jsonl")
 HEALTH_PATH = os.path.join(CONFIG_DIR, "health.json")
-OPENCODE = os.environ.get(
-    "OPENCODE_BIN", os.path.expanduser("~/.local/share/mise/shims/opencode")
-)
 OPENCODE_SERVER = os.environ.get("OPENCODE_SERVER", "http://localhost:4096")
 RUN_TIMEOUT_S = 900
 RUN_MAX_S = 43200
@@ -50,7 +66,6 @@ SERVER_QUIET_S = 0.75
 INPUT_DEBOUNCE_S = 1.5
 CHUNK = 3900
 CANCEL_MSG = "🛑 cancelled by user"
-CODEX_YOLO_FLAG = "--dangerously-bypass-approvals-and-sandbox"
 
 PROMPT_Q = queue.Queue()
 STATE_LOCK = threading.Lock()
@@ -86,10 +101,6 @@ def log(msg):
     print(time.strftime("%H:%M:%S"), msg, flush=True)
 
 
-def ensure_private_dir(path):
-    """Create private runtime storage and repair permissive existing modes."""
-    os.makedirs(path, mode=0o700, exist_ok=True)
-    os.chmod(path, 0o700)
 
 
 def ensure_private_storage():
@@ -119,112 +130,8 @@ def audit(event, **fields):
         pass
 
 
-def load_json(path, default):
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return default
 
 
-def save_json(path, data):
-    ensure_private_dir(os.path.dirname(path) or ".")
-    tmp = path + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, ensure_ascii=False, indent=1)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
-def now_iso():
-    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
-
-
-def redact_proxy_url(value):
-    """Return useful proxy coordinates without leaking embedded credentials."""
-    if not value or not isinstance(value, str):
-        return value
-    candidate = value if "://" in value else "http://" + value
-    try:
-        parsed = urllib.parse.urlsplit(candidate)
-    except ValueError:
-        return "<invalid>"
-    host = parsed.hostname
-    if not host:
-        return "<invalid>"
-    host = f"[{host}]" if ":" in host and not host.startswith("[") else host
-    try:
-        port = f":{parsed.port}" if parsed.port else ""
-    except ValueError:
-        return "<invalid>"
-    scheme = parsed.scheme or "http"
-    return f"{scheme}://{host}{port}"
-
-
-def proxy_diagnostics():
-    """Describe proxy routing and whether localhost proxy endpoints are alive."""
-    proxies = {
-        str(kind): redact_proxy_url(str(value))
-        for kind, value in urllib.request.getproxies().items()
-    }
-    local = []
-    seen = set()
-    for kind, value in proxies.items():
-        if kind == "no" or not value or value == "<invalid>":
-            continue
-        try:
-            parsed = urllib.parse.urlsplit(value)
-            host, port = parsed.hostname, parsed.port
-        except ValueError:
-            continue
-        if host not in ("localhost", "127.0.0.1", "::1") or not port:
-            continue
-        endpoint = (host, port)
-        if endpoint in seen:
-            continue
-        seen.add(endpoint)
-        listening = False
-        try:
-            with socket.create_connection(endpoint, timeout=0.4):
-                listening = True
-        except OSError:
-            pass
-        local.append(
-            {"host": host, "port": port, "listening": listening, "source": kind}
-        )
-    return {
-        "proxies": proxies,
-        "telegram_bypassed": urllib.request.proxy_bypass("api.telegram.org"),
-        "local_endpoints": local,
-    }
-
-
-def classify_network_error(exc, proxy_info=None):
-    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
-    refused = isinstance(reason, ConnectionRefusedError) or getattr(
-        reason, "errno", None
-    ) in (61, 111)
-    info = proxy_info if proxy_info is not None else proxy_diagnostics()
-    dead_local_proxy = any(
-        not endpoint.get("listening") for endpoint in info.get("local_endpoints", [])
-    )
-    if refused and dead_local_proxy and not info.get("telegram_bypassed"):
-        return "proxy_refused"
-    if refused:
-        return "connection_refused"
-    if isinstance(exc, urllib.error.HTTPError):
-        return f"http_{exc.code}"
-    if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError):
-        return "timeout"
-    return type(reason).__name__.lower()
 
 
 def update_health(**fields):
@@ -284,282 +191,6 @@ def react(cfg, chat_id, message_id, emoji):
     )
 
 
-def utf16_len(s):
-    """Telegram's 4096 cap counts UTF-16 code units, not Python codepoints
-    (astral emoji cost 2). Ported from hermes-agent gateway/platforms/base.py."""
-    return len(s.encode("utf-16-le")) // 2
-
-
-def _prefix_within_utf16_limit(s, limit):
-    """Longest prefix whose UTF-16 length <= limit; the codepoint-slice never
-    lands mid-character (hermes-agent gateway/platforms/base.py)."""
-    if utf16_len(s) <= limit:
-        return s
-    lo, hi = 0, len(s)
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if utf16_len(s[:mid]) <= limit:
-            lo = mid
-        else:
-            hi = mid - 1
-    return s[:lo]
-
-
-def _wrap_markdown_tables(text):
-    """Rewrite GFM pipe tables into bold-heading + bullet groups.
-
-    Telegram HTML has no table entity, so raw pipe rows render as escape
-    noise. Ported from hermes-agent gateway/platforms/helpers.py
-    convert_table_to_bullets: tables inside fenced code blocks are left alone.
-    """
-    if "|" not in text or "-" not in text:
-        return text
-
-    def _split_row(line):
-        s = line.strip()
-        if s.startswith("|"):
-            s = s[1:]
-        if s.endswith("|"):
-            s = s[:-1]
-        return [c.strip() for c in s.split("|")]
-
-    def _render_block(block):
-        headers = _split_row(block[0])
-        if len(headers) < 2:
-            return "\n".join(block)
-        groups = []
-        for index, row in enumerate(block[2:], start=1):
-            cells = _split_row(row)
-            while len(cells) < len(headers):
-                cells.append("")
-            cells = cells[: len(headers)]
-            raw_heading = next((c for c in cells if c), f"Row {index}")
-            bullets = [
-                f"• {h}: {v}" for h, v in zip(headers, cells) if v != raw_heading
-            ]
-            # headings flatten inner bold (hermes _convert_header): a bold
-            # cell would render <b><b>…</b></b>, same-type nesting Telegram
-            # refuses — which would demote the whole chunk to plain text
-            heading = re.sub(r"\*\*(.+?)\*\*", r"\1", raw_heading)
-            groups.append("\n".join([f"**{heading}**", *bullets]))
-        return "\n\n".join(groups)
-
-    sep = re.compile(r"^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?\s*$")
-    out, in_fence, lines, i = [], False, text.split("\n"), 0
-    while i < len(lines):
-        line = lines[i]
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
-            out.append(line)
-            i += 1
-            continue
-        if (
-            not in_fence
-            and "|" in line
-            and i + 1 < len(lines)
-            and sep.match(lines[i + 1])
-        ):
-            block = [line, lines[i + 1]]
-            j = i + 2
-            while j < len(lines) and lines[j].strip() and "|" in lines[j]:
-                block.append(lines[j])
-                j += 1
-            out.append(_render_block(block))
-            i = j
-            continue
-        out.append(line)
-        i += 1
-    return "\n".join(out)
-
-
-def esc(s):
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-MD_LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
-
-
-def inline_html(line):
-    """One markdown line -> Telegram HTML. Line-local by design: no entity
-    ever spans lines, so per-chunk conversion stays balanced even when a
-    chunk boundary lands mid-paragraph. Converted code spans and links are
-    stashed hermes-style (format_message placeholders) so later substitutions
-    never touch their contents."""
-    s = esc(line)
-    stash = []
-
-    def _keep(m):
-        key = f"\x00tg{len(stash)}\x00"
-        stash.append((key, m.group(0)))
-        return key
-
-    s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
-    s = re.sub(r"<code>[^<]*</code>", _keep, s)
-    s = MD_LINK.sub(r'<a href="\2">\1</a>', s)
-    s = re.sub(r"<a href=[^>]*>[^<]*</a>", _keep, s)
-    # headers flatten inner bold (hermes _convert_header strips redundant
-    # bold markers — <b><b>…</b></b> is same-type nesting Telegram refuses,
-    # which would demote the whole chunk to plain text)
-    s = re.sub(
-        r"^#{1,6}\s+(.*)",
-        lambda m: "<b>" + re.sub(r"\*\*(.+?)\*\*", r"\1", m.group(1)) + "</b>",
-        s,
-    )
-    # markdown list markers -> Telegram's native bullet glyph (hermes tables
-    # and lists render bullets as "• ", not literal -/*/+)
-    s = re.sub(r"^(\s*)[-*+]\s+", r"\1• ", s)
-    # ***x*** must run before ** or it is eaten as bold + stray asterisks
-    s = re.sub(r"\*\*\*(.+?)\*\*\*", r"<b><i>\1</i></b>", s)
-    s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
-    # emphasis delimiters never flank whitespace and never hug word chars
-    # (hermes format_message guards bullets via [^*\n]+; the space-flank rule
-    # also kills "a * b * c" arithmetic and "* item *" false positives)
-    s = re.sub(r"(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", s)
-    s = re.sub(r"(?<![\w_])_(?!\s)([^_\n]+?)(?<!\s)_(?![\w_])", r"<i>\1</i>", s)
-    s = re.sub(r"~~(.+?)~~", r"<s>\1</s>", s)
-    s = re.sub(r"\|\|(.+?)\|\|", r"<tg-spoiler>\1</tg-spoiler>", s)
-    for key, val in stash:
-        s = s.replace(key, val)
-    return s
-
-
-def _quote_body(line):
-    """Classify one blockquote line -> (is_quote, expandable, content).
-
-    hermes _convert_blockquote: '> text' is a plain quote, '**> text' opens
-    an expandable quote closed by a trailing '||'."""
-    ls = line.lstrip()
-    if ls.startswith("**> "):
-        return True, True, ls[4:].rstrip()
-    if ls.startswith(">") and (len(ls) == 1 or ls[1] in " >"):
-        return True, False, ls.lstrip("> ").rstrip()
-    return False, False, ""
-
-
-def md_to_html(md, in_pre=False, pre_lang=""):
-    """Markdown -> Telegram HTML. Returns (html, in_pre_after, pre_lang_after)
-    so a fenced block split across chunks stays a valid <pre> in every chunk,
-    carrying the original language tag (hermes truncate_message carry_lang)."""
-    out = []
-    if in_pre:
-        # continuation chunk reopens the carried fence with its language tag
-        out.append(
-            f'<pre><code class="language-{esc(pre_lang)}">' if pre_lang else "<pre>"
-        )
-    lines = md.split("\n")
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if line.lstrip().startswith("```"):
-            tag = line.lstrip()[3:].strip()
-            lang = tag.split()[0] if tag else ""
-            if in_pre:
-                out.append("</code></pre>" if pre_lang else "</pre>")
-            else:
-                # language tag -> Telegram's <code class="language-x">,
-                # rendered with syntax highlighting in official clients
-                out.append(
-                    f'<pre><code class="language-{esc(lang)}">' if lang else "<pre>"
-                )
-            in_pre = not in_pre
-            pre_lang = lang
-            i += 1
-            continue
-        if in_pre:
-            out.append(esc(line))
-            i += 1
-            continue
-        is_quote, expandable, _ = _quote_body(line)
-        if is_quote:
-            # merge consecutive quote lines into ONE blockquote (hermes
-            # treats quote blocks as blocks, not per-line entities — N
-            # stacked boxes is visual noise); **> makes it expandable
-            j, parts = i, []
-            while j < len(lines):
-                q_is, q_exp, q_body = _quote_body(lines[j])
-                if not q_is:
-                    break
-                expandable = expandable or q_exp
-                parts.append(q_body)
-                j += 1
-            if expandable and parts and parts[-1].endswith("||"):
-                # hermes: trailing || is the expandable-quote end marker
-                parts[-1] = parts[-1][:-2].rstrip()
-            inner = "\n".join(inline_html(p) for p in parts)
-            open_tag = "<blockquote expandable>" if expandable else "<blockquote>"
-            out.append(open_tag + inner + "</blockquote>")
-            i = j
-            continue
-        out.append(inline_html(line))
-        i += 1
-    if in_pre:
-        out.append("</code></pre>" if pre_lang else "</pre>")
-    return "\n".join(out), in_pre, pre_lang
-
-
-def _strip_html_markup(md):
-    """Markdown -> clean plain text for the fallback send (hermes-agent's
-    _strip_mdv2 contract: the resend must never show raw **/```/[]()
-    syntax that the failed formatted attempt would have consumed)."""
-    s = re.sub(r"```[^\n]*\n?", "", md)
-    s = re.sub(r"``([^`]+)``", r"\1", s)
-    s = re.sub(r"`([^`]+)`", r"\1", s)
-    s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)
-    s = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"\1", s)
-    s = re.sub(r"~~(.+?)~~", r"\1", s)
-    s = re.sub(r"\|\|(.+?)\|\|", r"\1", s)
-    s = MD_LINK.sub(r"\1 (\2)", s)
-    s = re.sub(r"^#{1,6}\s+", "", s, flags=re.MULTILINE)
-    s = re.sub(r"^> ?", "", s, flags=re.MULTILINE)
-    return s.rstrip()
-
-
-def _balanced(html):
-    """True when every <tag> in the chunk is closed and nesting matches —
-    an unbalanced chunk must never be offered to Telegram as HTML."""
-    stack = []
-    for m in re.finditer(r"<(/?)([a-z][a-z0-9-]*)(?:\s[^>]*)?>", html):
-        if m.group(1):
-            if not stack or stack[-1] != m.group(2):
-                return False
-            stack.pop()
-        else:
-            stack.append(m.group(2))
-    return not stack
-
-
-def split_chunks(text, limit=CHUNK):
-    if utf16_len(text) <= limit:
-        return [text]
-    chunks, rest = [], text
-    while rest:
-        if utf16_len(rest) <= limit:
-            chunks.append(rest)
-            break
-        region = _prefix_within_utf16_limit(rest, limit)
-        cut = region.rfind("\n\n")
-        if cut < 1:
-            cut = region.rfind("\n")
-        if cut < 1:
-            cut = region.rfind(" ")
-        if cut < 1:
-            cut = len(region)
-        # Never cut inside an inline code span: an odd number of unescaped
-        # backticks means the split lands in an open span (hermes-agent
-        # truncate_message); pull the cut back before the unpaired backtick.
-        candidate = rest[:cut]
-        if (candidate.count("`") - candidate.count("\\`")) % 2 == 1:
-            last = candidate.rfind("`")
-            while last > 0 and candidate[last - 1] == "\\":
-                last = candidate.rfind("`", 0, last)
-            safe = max(candidate.rfind("\n", 0, last), candidate.rfind(" ", 0, last))
-            if safe >= 1 and safe >= cut // 4:
-                cut = safe
-        if cut < 1:
-            cut = 1  # degenerate budget: always consume one codepoint
-        chunks.append(rest[:cut].rstrip())
-        rest = rest[cut:].lstrip()
-    return [c for c in chunks if c] or [""]
 
 
 def send(token, chat_id, text, reply_to=None, chunk_limit=CHUNK):
@@ -744,16 +375,6 @@ def typing_loop(token, chat_id, stop_event):
         api(token, "sendChatAction", chat_id=chat_id, action="typing")
 
 
-def trail_line(part):
-    tool = part.get("tool", "?")
-    st = part.get("state") or {}
-    inp = st.get("input") or {}
-    summary = ""
-    for v in inp.values():
-        if isinstance(v, str) and len(v) > len(summary):
-            summary = v
-    summary = summary.replace("\n", " ")[:60]
-    return f"🔧 {tool}: {summary}" if summary else f"🔧 {tool}"
 
 
 def edit_status(cfg, live, final=None):
@@ -786,140 +407,6 @@ def edit_status(cfg, live, final=None):
         )
 
 
-def _bin(env_key, name):
-    p = os.environ.get(env_key) or shutil.which(name)
-    if not p:
-        raise RunnerError(
-            f"runner {name!r} not found on PATH; install it or set {env_key}"
-        )
-    return p
-
-
-RUNNERS = {}
-SERVER_RUNNERS = {}
-
-
-def runner(name):
-    def deco(fn):
-        RUNNERS[name] = fn
-        return fn
-
-    return deco
-
-
-class RunnerError(Exception):
-    pass
-
-
-@runner("opencode")
-def _opencode(session_id, prompt, model=None):
-    """opencode run --format json. Events: sessionID / tool_use / text / reasoning."""
-    p = OPENCODE if os.path.exists(OPENCODE) else shutil.which("opencode")
-    if not p:
-        raise RunnerError(
-            "runner 'opencode' not found; install opencode or set OPENCODE_BIN"
-        )
-    cmd = [p, "run", "--format", "json"]
-    if session_id:
-        cmd += ["--session", session_id]
-    else:
-        cmd += ["--title", time.strftime("tg %Y%m%d-%H%M")]
-    if model:
-        cmd += ["--model", model]  # flag verified live against opencode CLI
-    cmd.append(prompt)
-
-    def parse(ev, acc):
-        part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
-        if ev.get("sessionID"):
-            acc["sid"] = ev["sessionID"]
-        t = ev.get("type")
-        if t == "tool_use":
-            return trail_line(part)
-        if t == "text" and part.get("text"):
-            acc["texts"].append(part["text"])
-            acc["thinking"] = None
-        elif t == "reasoning" and part.get("text"):
-            acc["thinking"] = part["text"]
-        elif t == "step_finish":
-            acc["cost"] = acc.get("cost", 0.0) + (part.get("cost") or 0.0)
-            acc["tokens"] = (part.get("tokens") or {}).get("total")
-        return None
-
-    return cmd, parse
-
-
-@runner("claude")
-def _claude(session_id, prompt, model=None):
-    """claude -p --output-format stream-json (resume via --resume)."""
-    cmd = [
-        _bin("CLAUDE_BIN", "claude"),
-        "-p",
-        prompt,
-        "--output-format",
-        "stream-json",
-        "--verbose",
-    ]
-    if session_id:
-        cmd += ["--resume", session_id]
-    if model:
-        cmd += ["--model", model]
-
-    def parse(ev, acc):
-        t = ev.get("type")
-        if t == "system" and ev.get("session_id"):
-            acc["sid"] = ev["session_id"]
-        if t == "assistant":
-            trail = None
-            for blk in (ev.get("message") or {}).get("content") or []:
-                bt = blk.get("type")
-                if bt == "tool_use":
-                    inp = blk.get("input") or {}
-                    s = next((v for v in inp.values() if isinstance(v, str)), "")
-                    trail = f"🔧 {blk.get('tool', '?')}: " + s.replace("\n", " ")[:60]
-                elif bt == "text" and blk.get("text"):
-                    acc["texts"].append(blk["text"])
-                    acc["thinking"] = None
-                elif bt == "thinking" and blk.get("thinking"):
-                    acc["thinking"] = blk["thinking"]
-            return trail
-        return None
-
-    return cmd, parse
-
-
-@runner("codex")
-def _codex(session_id, prompt, model=None):
-    """codex exec --json (resume via `codex exec resume <id>`). Best-effort."""
-    cmd = [_bin("CODEX_BIN", "codex"), "exec", "--json"]
-    if session_id:
-        cmd += ["resume", session_id]
-    if model:
-        cmd += ["--model", model]
-    cmd.append(prompt)
-
-    def parse(ev, acc):
-        t = ev.get("type")
-        if t == "thread.started" and ev.get("thread_id"):
-            acc["sid"] = ev["thread_id"]
-        item = ev.get("item") or {}
-        it = item.get("type")
-        if t in ("item.started", "item.completed") and it == "command_execution":
-            return "🔧 bash: " + (item.get("command") or "")[:60]
-        if it == "reasoning":
-            acc["thinking"] = (item.get("text") or "")[:200] or acc.get("thinking")
-        if it == "agent_message" and item.get("text"):
-            acc["texts"].append(item["text"])
-            acc["thinking"] = None
-        return None
-
-    return cmd, parse
-
-
-def apply_runner_policy(runner_name, cmd, cfg):
-    """Apply explicit bridge-owned runner policy after command construction."""
-    if runner_name == "codex" and cfg.get("codex_yolo", False):
-        return cmd[:2] + [CODEX_YOLO_FLAG] + cmd[2:]
-    return cmd
 
 
 def run_agent(cfg, session_id, prompt, live=None):
@@ -957,7 +444,6 @@ def run_agent(cfg, session_id, prompt, live=None):
         RUN_STATE["steer_pending"] = 0
         RUN_STATE["steer_errors"] = []
     assert proc.stdout and proc.stderr  # guaranteed: both opened with PIPE
-    timeout_s = run_timeout(cfg)
     started = start_run_clock()
     timed_out = []
     stop_timeout = threading.Event()
@@ -1463,7 +949,6 @@ def run_agent_server_v1(cfg, session_id, prompt, live=None):
             RUN_STATE["cancel"] = False
             if RUN_STATE.get("current"):
                 RUN_STATE["current"]["session"] = sid
-        timeout_s = run_timeout(cfg)
         started = start_run_clock()
         timeout_reason = None
         last_snapshot = json.dumps(before, sort_keys=True, ensure_ascii=False)
@@ -1765,7 +1250,6 @@ def run_agent_server_v2(cfg, session_id, prompt, live=None):
             RUN_STATE["cancel"] = False
             if RUN_STATE.get("current"):
                 RUN_STATE["current"]["session"] = sid
-        timeout_s = run_timeout(cfg)
         started = start_run_clock()
         timeout_reason = None
         last_snapshot = json.dumps(before, sort_keys=True, ensure_ascii=False)
@@ -2477,651 +1961,21 @@ def merge_open_burst(cfg, chat_id, text):
         return True
 
 
+def startup_smoke():
+    """Side-effect-free checks safe to run before every service start."""
+    if md_to_html("**ok**")[0] != "<b>ok</b>":
+        raise RuntimeError("render smoke failed")
+    if split_chunks("a" * 25, limit=10) != ["a" * 10, "a" * 10, "a" * 5]:
+        raise RuntimeError("chunk smoke failed")
+    if runner_mode({}) != "cli" or not {"opencode", "claude", "codex"} <= set(RUNNERS):
+        raise RuntimeError("runner registry smoke failed")
+
+
 def selftest():
-    """Regression gate: cheap checks that catch the bugs we actually shipped."""
-    fails = []
+    """Run the exhaustive suite on demand and in the normal test runner."""
+    from tgbridge_core.selftest import run_selftest
 
-    # worker unpack: both queue shapes
-    if unpack_entry((1, 2, "p")) != (1, 2, "p"):
-        fails.append("unpack tuple")
-    if unpack_entry({"chat_id": 1, "message_id": 2, "prompt": "p"}) != (1, 2, "p"):
-        fails.append("unpack dict")
-    batch = {
-        "kind": "prompt_batch",
-        "chat_id": 1,
-        "message_id": 2,
-        "parts": ["part one", "part two"],
-    }
-    if unpack_entry(batch) != (1, 2, "part one\n\npart two"):
-        fails.append("unpack merged batch")
-
-    # chunker
-    if split_chunks("a" * 100, limit=10)[0] != "a" * 10:
-        fails.append("chunk hard cut")
-    parts = split_chunks("x\n\n" + "y" * 100, limit=20)
-    if parts[0] != "x" or len(parts) < 2:
-        fails.append("chunk boundary")
-    if redact_proxy_url("http://user:secret@127.0.0.1:7897/path") != (
-        "http://127.0.0.1:7897"
-    ):
-        fails.append("proxy credential redaction")
-    refused = urllib.error.URLError(ConnectionRefusedError(61, "refused"))
-    dead_proxy = {
-        "telegram_bypassed": False,
-        "local_endpoints": [{"listening": False}],
-    }
-    if classify_network_error(refused, dead_proxy) != "proxy_refused":
-        fails.append("dead proxy classification")
-
-    # markdown -> telegram HTML
-    h, pre, _lang = md_to_html("code `<b>&</b>` and **bold** [t](http://x/y)")
-    if (
-        h
-        != (
-            "code <code>&lt;b&gt;&amp;&lt;/b&gt;</code> and <b>bold</b> "
-            '<a href="http://x/y">t</a>'
-        )
-        or pre
-    ):
-        fails.append("md inline")
-    # new inline entities: italic / strikethrough / spoiler; bold wins over
-    # inner single asterisks (hermes format_message parity)
-    h, pre, _lang = md_to_html("*it* ~~gone~~ ||shh|| **b*bold*i**")
-    if h != "<i>it</i> <s>gone</s> <tg-spoiler>shh</tg-spoiler> <b>b*bold*i</b>" or pre:
-        fails.append("md inline rich")
-    # ***bold italic*** renders as nested tags, not broken crossing ones
-    h, pre, _lang = md_to_html("***both***")
-    if h != "<b><i>both</i></b>" or pre:
-        fails.append("md bold italic")
-    # _x_ italics, but snake_case and bare arithmetic stay literal
-    h, pre, _lang = md_to_html("my_var and a * b and *real*")
-    if h != "my_var and a * b and <i>real</i>" or pre:
-        fails.append("md italic guards")
-    # list markers -> native bullet glyph
-    h, pre, _lang = md_to_html("- one\n* two\n+ three\nplain - dash")
-    if h != "• one\n• two\n• three\nplain - dash" or pre:
-        fails.append("md bullets")
-    # header flattens inner bold (no <b><b> nesting Telegram refuses)
-    h, pre, _lang = md_to_html("## **Title** here")
-    if h != "<b>Title here</b>" or pre:
-        fails.append("md header flat")
-    # blockquote line
-    h, pre, _lang = md_to_html("text\n> quoted line\nafter")
-    if h != "text\n<blockquote>quoted line</blockquote>\nafter" or pre:
-        fails.append("md blockquote")
-    # consecutive quote lines merge into ONE blockquote
-    h, pre, _lang = md_to_html("> line1\n> line2\nafter")
-    if h != "<blockquote>line1\nline2</blockquote>\nafter" or pre:
-        fails.append("md blockquote merge")
-    # expandable quote: **> opener + trailing || closer (hermes)
-    h, pre, _lang = md_to_html("**> details\n> more||\nafter")
-    if h != "<blockquote expandable>details\nmore</blockquote>\nafter" or pre:
-        fails.append("md blockquote expandable")
-    # blockquote chars in prose text are NOT blockquotes
-    h, pre, _lang = md_to_html("a > b implies")
-    if "<blockquote>" in h:
-        fails.append("md blockquote false positive")
-    # tables convert to bullets exactly like hermes convert_table_to_bullets:
-    # heading = first non-empty cell, bullet duplicating the heading is dropped
-    h = _wrap_markdown_tables("| a | b |\n|---|---|\n| 1 | 2 |")
-    if "**1**" not in h or "• b: 2" not in h or "|" in h:
-        fails.append("md table")
-    # bold cells are plain markdown for the renderer — the HTML must never
-    # contain redundant <b><b> (heading cells are flattened pre-wrap)
-    html, _pre, _lang = md_to_html(
-        _wrap_markdown_tables("| **a** | b |\n|---|---|\n| 1 | **2** |")
-    )
-    if "<b><b>" in html or "<b>1</b>" not in html or "• b: <b>2</b>" not in html:
-        fails.append("md table bold")
-    h = _wrap_markdown_tables("```\n| a | b |\n|---|---|\n| 1 | 2 |\n```")
-    if "| 1 | 2 |" not in h:
-        fails.append("md table in fence")
-    # fenced block with language -> <pre><code class="language-x">
-    h, pre, lang = md_to_html("a\n```py\nx < y\n```\nb")
-    if (
-        pre
-        or lang
-        or h != 'a\n<pre><code class="language-py">\nx &lt; y\n</code></pre>\nb'
-    ):
-        fails.append("md fence")
-    # fence split across chunks stays balanced per chunk, carrying the
-    # language tag (hermes truncate_message carry_lang)
-    h1, pre1, lang1 = md_to_html("intro\n```py\nprint(1)")
-    h2, pre2, lang2 = md_to_html("print(2)\n```", in_pre=pre1, pre_lang=lang1)
-    if (
-        pre1 is not True
-        or pre2 is not False
-        or lang1 != "py"
-        or lang2
-        or "</code></pre>" not in h1
-        or h2.count("<pre>") != 1
-        or "language-py" not in h2
-    ):
-        fails.append("md fence continuation")
-    # _balanced: valid vs broken chunks
-    if not _balanced("<b>a<code>b</code></b> &amp; <i>c</i>"):
-        fails.append("balanced ok")
-    if _balanced("<b>a<code>b</b>") or _balanced("</b>") or _balanced("ok <b>"):
-        fails.append("balanced broken")
-    # nested <b><i> is balanced; the renderer must never emit redundant
-    # same-type nesting like <b><b> (headers/tables flatten it away)
-    if not _balanced("<b><i>x</i></b>") or _balanced("<b>a<code>b</code></i>"):
-        fails.append("balanced nesting")
-    if "<b><b>" in md_to_html("## **T** x")[0] + md_to_html("***x***")[0]:
-        fails.append("no same-type nesting")
-    # _strip_html_markup: fallback text has no raw markup syntax left
-    plain = _strip_html_markup(
-        "# Head\n\n**hi** `x <y>` [t](http://e/x)\n> q\n```py\ncode\n```"
-    )
-    if (
-        "**" in plain
-        or "`" in plain
-        or "```" in plain
-        or "](" in plain
-        or plain != "Head\n\nhi x <y> t (http://e/x)\nq\ncode"
-    ):
-        fails.append("strip markup")
-    # utf16 chunking: astral chars counted as 2 units, never split mid-char
-    tc = "😀" * 10
-    if utf16_len(tc) != 20:
-        fails.append("utf16 len")
-    if (
-        len(split_chunks(tc + "x", limit=15)) != 2
-        or "".join(split_chunks(tc + "x", limit=15)) != tc + "x"
-    ):
-        fails.append("utf16 chunk content")
-    # inline-code split avoidance: cut lands outside the backtick span
-    parts = split_chunks("word " + "z" * 40 + " `code span` tail", limit=20)
-    joined = "\n".join(parts)
-    if joined.count("`") % 2 != 0:
-        fails.append("chunk inline code")
-    # chunk content is preserved across all chunks
-    if split_chunks("a" * 45, limit=20) != ["a" * 20, "a" * 20, "a" * 5]:
-        fails.append("chunk preserve")
-    # table conversion integrates with send path (via fake_api below)
-
-    # send(): HTML refused -> plain-text fallback, never lost
-    sent = []
-
-    def fake_api(token, method, **params):
-        sent.append(params)
-        if params.get("parse_mode") == "HTML" and "<b>" in params["text"]:
-            return None  # simulate Telegram rejecting the entity
-        return {"ok": True}
-
-    orig_api = api
-    globals()["api"] = fake_api
-    try:
-        if not send("t", 1, "hi **there**"):
-            fails.append("send fallback ok")
-    finally:
-        globals()["api"] = orig_api
-    # fallback resend is clean plain text, never the raw markdown
-    if len(sent) != 2 or "parse_mode" in sent[1] or sent[1]["text"] != "hi there":
-        fails.append("send fallback shape")
-
-    # table markdown flows through send() as converted bullet HTML
-    sent.clear()
-
-    def fake_api2(token, method, **params):
-        sent.append(params)
-        return {"ok": True}
-
-    globals()["api"] = fake_api2
-    try:
-        if not send("t", 1, "| a | b |\n|---|---|\n| 1 | 2 |"):
-            fails.append("send table ok")
-    finally:
-        globals()["api"] = orig_api
-    if (
-        len(sent) != 1
-        or sent[0].get("parse_mode") != "HTML"
-        or "<b>1</b>" not in sent[0]["text"]
-        or "• b: 2" not in sent[0]["text"]
-        or "|" in sent[0]["text"]
-    ):
-        fails.append("send table shape")
-
-    # every runner builds a cmd and parses a synthetic event
-    for name, fn in RUNNERS.items():
-        try:
-            cmd, parse = fn(None, "hi", None)
-            assert cmd and callable(parse), f"{name}: bad cmd/parse"
-            cmd2, _ = fn(None, "hi", "test-model")
-            i = cmd2.index("--model")
-            if cmd2[i + 1] != "test-model":
-                fails.append(f"{name} model flag")
-        except RunnerError:
-            pass  # binary not installed — acceptable, runtime reports it
-        except Exception as e:
-            fails.append(f"{name} cmd: {e}")
-
-    codex_cmd, _ = RUNNERS["codex"](None, "hi", None)
-    yolo_cmd = apply_runner_policy("codex", codex_cmd, {"codex_yolo": True})
-    if CODEX_YOLO_FLAG not in yolo_cmd or yolo_cmd.index(CODEX_YOLO_FLAG) != 2:
-        fails.append("codex yolo flag")
-    if apply_runner_policy("codex", codex_cmd, {}) != codex_cmd:
-        fails.append("codex yolo default off")
-    if apply_runner_policy("claude", ["claude", "-p"], {"codex_yolo": True}) != [
-        "claude",
-        "-p",
-    ]:
-        fails.append("codex yolo isolation")
-
-    ev = {
-        "sessionID": "s1",
-        "type": "tool_use",
-        "part": {"tool": "bash", "state": {"input": {"command": "ls"}}},
-    }
-    cmd, parse = RUNNERS["opencode"](None, "hi", None)
-    acc = {"sid": None, "texts": [], "thinking": None, "cost": 0.0, "tokens": None}
-    if parse(ev, acc) is None or acc["sid"] != "s1":
-        fails.append("opencode parse")
-
-    cmd, parse = RUNNERS["claude"](None, "hi", None)
-    acc = {"sid": None, "texts": [], "thinking": None, "cost": 0.0, "tokens": None}
-    parse({"type": "system", "session_id": "s2"}, acc)
-    parse(
-        {
-            "type": "assistant",
-            "message": {
-                "content": [
-                    {"type": "tool_use", "tool": "Bash", "input": {"command": "ls"}},
-                    {"type": "text", "text": "ok"},
-                ]
-            },
-        },
-        acc,
-    )
-    if acc["sid"] != "s2" or acc["texts"] != ["ok"]:
-        fails.append("claude parse")
-
-    # death announcement: one call per chat, one bad chat must not raise
-    calls = []
-
-    def fake_post(url, data, timeout):
-        calls.append((url, timeout))
-        if "-100999" in url:
-            raise OSError("boom")
-
-    announce_all(
-        {"bot_token": "t", "allowed_chats": [1, -100999, 2]}, "bye", post=fake_post
-    )
-    if len(calls) != 3:
-        fails.append("announce per-chat")
-    if any(t > 5 for _, t in calls):
-        fails.append("announce timeout>5s")
-
-    # /cancel kill paths against a real Popen
-    for name, kill in (
-        ("terminate path", lambda p: p.terminate()),
-        ("kill_after escalation", lambda p: kill_after(p, 0.2)),
-    ):
-        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
-        kill(p)
-        time.sleep(0.6)
-        if p.poll() is None:
-            fails.append(name)
-            p.kill()
-        p.wait()
-
-    # run_timeout config plumbing
-    for cfg_case, want in (
-        ({}, RUN_TIMEOUT_S),
-        ({"run_timeout_s": "5"}, 5),
-        ({"run_timeout_s": "abc"}, RUN_TIMEOUT_S),
-        ({"run_timeout_s": None}, RUN_TIMEOUT_S),
-    ):
-        if run_timeout(cfg_case) != want:
-            fails.append(f"run_timeout {cfg_case}")
-    if run_max({"run_timeout_s": 20, "run_max_s": 10}) != 20:
-        fails.append("run maximum must not undercut idle timeout")
-    if input_debounce({"input_debounce_s": 0}) != 0.2:
-        fails.append("input debounce minimum")
-    if input_debounce({"input_debounce_s": "bad"}) != INPUT_DEBOUNCE_S:
-        fails.append("input debounce fallback")
-
-    # botcmd: command routing incl. new commands and @BotName suffix
-    if (
-        botcmd("/cancel@Bot") != ("/cancel", "")
-        or botcmd("/at@B 5m hi") != ("/at", "5m hi")
-        or botcmd("plain words") != (None, "")
-    ):
-        fails.append("botcmd")
-
-    # authorization: chats are always explicit; DMs always require a user ID.
-    # Group-wide trust is opt-in and applies only inside an allowed group.
-    auth_cfg = {
-        "bot_token": "t",
-        "allowed_chats": [11, -10022],
-        "allowed_user_ids": [11],
-        "allow_all_users_in_allowed_groups": True,
-    }
-    if not is_authorized(auth_cfg, 11, "private", 11):
-        fails.append("auth allowed dm")
-    if is_authorized(auth_cfg, 12, "private", 12):
-        fails.append("auth unknown dm")
-    if not is_authorized(auth_cfg, -10022, "supergroup", 99):
-        fails.append("auth allowed group member")
-    if is_authorized(auth_cfg, -10023, "supergroup", 99):
-        fails.append("auth unknown group")
-    if is_authorized(auth_cfg, -10022, "supergroup", None):
-        fails.append("auth anonymous group sender")
-    if is_authorized(auth_cfg, -10022, "channel", 99):
-        fails.append("auth channel")
-    strict_cfg = {"allowed_chats": [-10022], "allowed_user_ids": [11]}
-    if is_authorized(strict_cfg, -10022, "supergroup", 99):
-        fails.append("auth strict group")
-
-    # Per-sender operator instructions apply only to the configured human ID.
-    sender_cfg = {"sender_instructions": {"11": "use the cheap lane"}}
-    tagged = apply_sender_instructions(sender_cfg, 11, "delegate this")
-    if "use the cheap lane" not in tagged or not tagged.endswith("delegate this"):
-        fails.append("sender instructions configured")
-    if apply_sender_instructions(sender_cfg, 12, "plain") != "plain":
-        fails.append("sender instructions isolation")
-    if apply_sender_instructions({"sender_instructions": []}, 11, "plain") != "plain":
-        fails.append("sender instructions invalid config")
-
-    # server-mode event folding: tool trail dedupe, text snapshot replace
-    acc = {"parts": {}, "order": [], "thinking": None}
-    seen = set()
-    t1 = server_event(
-        {
-            "type": "message.part.updated",
-            "data": {
-                "part": {
-                    "id": "p1",
-                    "type": "tool",
-                    "tool": "bash",
-                    "state": {"input": {"command": "ls /x"}},
-                }
-            },
-        },
-        acc,
-        seen,
-    )
-    if t1 != "🔧 bash: ls /x" or seen != {"p1"}:
-        fails.append("server tool trail")
-    t2 = server_event(
-        {
-            "type": "message.part.updated",
-            "data": {
-                "part": {
-                    "id": "p1",
-                    "type": "tool",
-                    "tool": "bash",
-                    "state": {"input": {"command": "ls /y"}},
-                }
-            },
-        },
-        acc,
-        seen,
-    )
-    if t2 is not None:
-        fails.append("server tool dedupe")
-    server_event(
-        {
-            "type": "message.part.updated",
-            "data": {"part": {"id": "p2", "type": "text", "text": "par"}},
-        },
-        acc,
-        seen,
-    )
-    server_event(
-        {
-            "type": "message.part.updated",
-            "data": {"part": {"id": "p2", "type": "text", "text": "partial answer"}},
-        },
-        acc,
-        seen,
-    )
-    if acc["parts"].get("p2") != "partial answer" or acc["order"] != ["p2"]:
-        fails.append("server text snapshot")
-    server_event(
-        {
-            "type": "message.part.updated",
-            "data": {"part": {"id": "p3", "type": "reasoning", "text": "hmm"}},
-        },
-        acc,
-        seen,
-    )
-    if acc["thinking"] != "hmm":
-        fails.append("server reasoning")
-    if server_event({"type": "session.updated", "data": {}}, acc, seen) is not None:
-        fails.append("server ignore other events")
-
-    # Poll snapshots exclude prior turns, preserve new message/part order, and
-    # surface assistant completion metadata for the quiescence check.
-    poll_acc = {"parts": {}, "order": [], "thinking": None, "errors": []}
-    poll_seen = set()
-    trails, infos = server_messages(
-        [
-            {
-                "info": {"id": "old", "role": "assistant", "time": {}},
-                "parts": [{"id": "oldp", "type": "text", "text": "ignore"}],
-            },
-            {
-                "info": {
-                    "id": "new",
-                    "role": "assistant",
-                    "time": {"completed": 123},
-                },
-                "parts": [
-                    {
-                        "id": "tool",
-                        "type": "tool",
-                        "tool": "bash",
-                        "state": {"input": {"command": "pwd"}},
-                    },
-                    {"id": "text", "type": "text", "text": "new answer"},
-                ],
-            },
-        ],
-        {"old"},
-        poll_acc,
-        poll_seen,
-    )
-    if (
-        trails != ["🔧 bash: pwd"]
-        or [i.get("id") for i in infos] != ["new"]
-        or poll_acc["order"] != ["text"]
-        or poll_acc["parts"].get("text") != "new answer"
-    ):
-        fails.append("server message polling")
-    v2_acc = {"parts": {}, "order": [], "thinking": None, "errors": []}
-    v2_trails, v2_infos = server_messages_v2(
-        {
-            "data": [
-                {"id": "old", "type": "assistant", "content": []},
-                {
-                    "id": "new-v2",
-                    "type": "assistant",
-                    "time": {"completed": 123},
-                    "content": [
-                        {
-                            "id": "tool-v2",
-                            "type": "tool",
-                            "name": "bash",
-                            "state": {"input": {"command": "pwd"}},
-                        },
-                        {"id": "text-v2", "type": "text", "text": "v2 answer"},
-                    ],
-                },
-            ]
-        },
-        {"old"},
-        v2_acc,
-        set(),
-    )
-    if (
-        v2_trails != ["🔧 bash: pwd"]
-        or [i.get("id") for i in v2_infos] != ["new-v2"]
-        or v2_acc["parts"].get("text-v2") != "v2 answer"
-    ):
-        fails.append("v2 server message polling")
-    if _opencode_model({"model": "opencode/muse"}, v2=True) != {
-        "providerID": "opencode",
-        "id": "muse",
-    }:
-        fails.append("v2 model config")
-    if _server_poll_interval({"server_poll_s": 0}) != 0.1:
-        fails.append("server poll minimum")
-    if _server_poll_interval({"server_poll_s": "bad"}) != SERVER_POLL_S:
-        fails.append("server poll fallback")
-    if (
-        runner_mode({}) != "cli"
-        or runner_mode({"server_runner": True}) != "server"
-        or runner_mode({"server_runner": True, "runner_mode": "cli"}) != "cli"
-        or "opencode" not in SERVER_RUNNERS
-    ):
-        fails.append("runner transport config")
-
-    # steering route: only a same-chat message during a server-mode run steers
-    with RUN_LOCK:
-        RUN_STATE["busy"] = True
-        RUN_STATE["server_sid"] = "s9"
-        RUN_STATE["server_directory"] = "/tmp/project"
-        RUN_STATE["server_url"] = "http://127.0.0.1:4096"
-        RUN_STATE["server_api"] = "v2"
-        RUN_STATE["server_run_id"] = 4
-        RUN_STATE["steer_pending"] = 0
-        RUN_STATE["current"] = {"chat": 7}
-    if not should_steer(7) or should_steer(8) or should_steer(11):
-        fails.append("steer route")
-    if _begin_steer(7) != {
-        "transport": "opencode_v2_steer",
-        "sid": "s9",
-        "run_id": 4,
-        "base_url": "http://127.0.0.1:4096",
-    }:
-        fails.append("steer reservation")
-    with RUN_LOCK:
-        if RUN_STATE["steer_pending"] != 1:
-            fails.append("steer pending")
-        RUN_STATE["busy"] = False
-        RUN_STATE["server_sid"] = None
-        RUN_STATE["server_directory"] = None
-        RUN_STATE["server_url"] = None
-        RUN_STATE["server_api"] = None
-        RUN_STATE["steer_pending"] = 0
-        RUN_STATE["current"] = None
-    if should_steer(7):
-        fails.append("steer route idle")
-    with RUN_LOCK:
-        RUN_STATE["busy"] = True
-        RUN_STATE["server_sid"] = "old-server"
-        RUN_STATE["server_api"] = "v1"
-        RUN_STATE["current"] = {"chat": 7}
-    if should_steer(7) or _begin_steer(7):
-        fails.append("legacy server must queue instead of unsafe steering")
-    with RUN_LOCK:
-        RUN_STATE["busy"] = False
-        RUN_STATE["server_sid"] = None
-        RUN_STATE["server_api"] = None
-        RUN_STATE["current"] = None
-    # Codex steering is bound to the exact active app-server turn.
-    with RUN_LOCK:
-        RUN_STATE["busy"] = True
-        RUN_STATE["codex_thread_id"] = "codex-thread"
-        RUN_STATE["codex_turn_id"] = "codex-turn"
-        RUN_STATE["codex_run_id"] = 8
-        RUN_STATE["steer_pending"] = 0
-        RUN_STATE["current"] = {"chat": 7, "runner": "codex"}
-    codex_target = _begin_steer(7)
-    if codex_target != {
-        "transport": "codex_turn_steer",
-        "sid": "codex-thread",
-        "turn_id": "codex-turn",
-        "run_id": 8,
-    }:
-        fails.append("codex turn/steer reservation")
-    with RUN_LOCK:
-        RUN_STATE["busy"] = False
-        RUN_STATE["codex_thread_id"] = None
-        RUN_STATE["codex_turn_id"] = None
-        RUN_STATE["steer_pending"] = 0
-        RUN_STATE["current"] = None
-    # An allowed group member can prompt. Human group messages are captured by
-    # default for ambient context, but the bot still speaks only when mentioned.
-    auth_state = {
-        "bot_username": "Bot",
-        "sessions": {"-10022": "keep-me"},
-        "hints": {"-10022": time.time()},
-    }
-
-    def auth_api(token, method, **params):
-        return {"ok": True, "result": {"message_id": 1}}
-
-    auth_writes = []
-
-    def auth_save(path, data):
-        auth_writes.append(path)
-
-    orig_save_json = save_json
-    globals()["api"] = auth_api
-    globals()["save_json"] = auth_save
-    try:
-        handle_update(
-            auth_cfg,
-            auth_state,
-            {
-                "message": {
-                    "chat": {"id": -10022, "type": "supergroup"},
-                    "from": {"id": 99, "first_name": "member"},
-                    "message_id": 1,
-                    "text": "background conversation",
-                }
-            },
-            state_path=None,
-        )
-        if len((auth_state.get("context") or {}).get("-10022", [])) != 1:
-            fails.append("group context default")
-        private_state = {"bot_username": "Bot"}
-        handle_update(
-            {**auth_cfg, "capture_group_context": False},
-            private_state,
-            {
-                "message": {
-                    "chat": {"id": -10022, "type": "supergroup"},
-                    "from": {"id": 99, "first_name": "member"},
-                    "message_id": 2,
-                    "text": "explicitly ignored context",
-                }
-            },
-            state_path=None,
-        )
-        if private_state.get("context"):
-            fails.append("group context opt-out")
-        if auth_writes:
-            fails.append("selftest state isolation")
-    finally:
-        globals()["api"] = orig_api
-        globals()["save_json"] = orig_save_json
-
-    # Runtime metadata may contain prompts/session IDs, so modes are repaired
-    # even when a permissive umask or an older version created the files.
-    import stat as _stat
-    import tempfile as _tempfile
-
-    with _tempfile.TemporaryDirectory() as private_dir:
-        os.chmod(private_dir, 0o755)
-        private_state = os.path.join(private_dir, "state.json")
-        save_json(private_state, {"sessions": {}})
-        if _stat.S_IMODE(os.stat(private_dir).st_mode) != 0o700:
-            fails.append("private dir mode")
-        if _stat.S_IMODE(os.stat(private_state).st_mode) != 0o600:
-            fails.append("private state mode")
-
-    if fails:
-        for f in fails:
-            print(f"SELFTEST FAIL: {f}")
-        sys.exit(1)
-    print(
-        "selftest OK:",
-        ", ".join(sorted(RUNNERS)),
-        "runners + unpack + render + chunker + announce + kill + timeout + botcmd + auth + steer",
-    )
+    run_selftest(sys.modules[__name__])
 
 
 def worker(cfg, state):
@@ -3916,7 +2770,7 @@ def main():
     if "--selftest" in sys.argv:
         selftest()
         return
-    selftest()  # regression gate — a bridge that fails checks must not go live
+    startup_smoke()  # fast and side-effect-free; full suite is `--selftest`
 
     ensure_private_storage()
     cfg = load_json(CONFIG_PATH, None)
