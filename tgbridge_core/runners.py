@@ -3,12 +3,17 @@
 import os
 import re
 import shutil
+import subprocess
+import threading
 import time
 
 OPENCODE = os.environ.get(
     "OPENCODE_BIN", os.path.expanduser("~/.local/share/mise/shims/opencode")
 )
 CODEX_YOLO_FLAG = "--dangerously-bypass-approvals-and-sandbox"
+AUTO_OPENCODE_GO_MODEL = "auto:opencode-go"
+_MODEL_DISCOVERY_CACHE = {}
+_MODEL_DISCOVERY_LOCK = threading.Lock()
 
 
 def trail_line(part):
@@ -260,18 +265,119 @@ def classify_run_error(text, extra_markers=None):
     return "other"
 
 
-def resolve_model(cfg, runner_name, explicit=None):
-    """Pick the model for a runner step.
+def _version_tuple(value):
+    """Natural numeric version ordering: 1.10 is newer than 1.9."""
+    return tuple(int(part) for part in re.split(r"[._-]", value) if part.isdigit())
 
-    Precedence: explicit step model > runner_models[runner] > cfg model.
-    Empty string means "runner default" (unchanged historical behavior).
+
+def select_opencode_go_models(models):
+    """Return newest Go Muse Contributor, then newest Go GLM fallback.
+
+    Model names are discovered, never enumerated here. This keeps a future
+    Muse Spark 1.4 (or GLM 5.4) eligible without a bridge release. At the
+    same GLM version, prefer the full model over its ``-flash`` variant;
+    flash is still selected when it is the only newest variant.
     """
+    go_models = []
+    for raw in models or []:
+        name = str(raw).strip()
+        if name.lower().startswith("opencode-go/"):
+            go_models.append((name, name.lower()))
+
+    muse = []
+    for name, lower in go_models:
+        match = re.search(r"/muse[-_.]?spark[-_.]?v?(\d+(?:[._-]\d+)*)", lower)
+        if match and "contributor" in lower:
+            muse.append((_version_tuple(match.group(1)), name))
+
+    glm = []
+    for name, lower in go_models:
+        match = re.search(r"/glm[-_.]?v?(\d+(?:[._-]\d+)*)", lower)
+        if match:
+            glm.append(
+                (
+                    _version_tuple(match.group(1)),
+                    not lower.endswith("-flash"),
+                    name,
+                )
+            )
+
+    selected = []
+    if muse:
+        selected.append(max(muse, key=lambda item: (item[0], item[1]))[1])
+    if glm:
+        selected.append(max(glm, key=lambda item: (item[0], item[1], item[2]))[2])
+    return selected
+
+
+def discover_opencode_go_models(cfg=None):
+    """Ask the installed OpenCode CLI for current Go models, with a short TTL."""
+    cfg = cfg or {}
+    try:
+        cache_s = max(0, int(cfg.get("model_discovery_cache_s", 300)))
+        timeout_s = max(1, int(cfg.get("model_discovery_timeout_s", 15)))
+    except (TypeError, ValueError):
+        cache_s, timeout_s = 300, 15
+    now = time.monotonic()
+    with _MODEL_DISCOVERY_LOCK:
+        cached = _MODEL_DISCOVERY_CACHE.get("opencode-go")
+        if cached and now - cached[0] < cache_s:
+            return list(cached[1])
+
+    path = OPENCODE if os.path.exists(OPENCODE) else shutil.which("opencode")
+    if not path:
+        raise RunnerError(
+            "cannot discover OpenCode Go models: opencode is not installed"
+        )
+    try:
+        result = subprocess.run(
+            [path, "models", "opencode-go"],
+            text=True,
+            capture_output=True,
+            timeout=timeout_s,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RunnerError(f"OpenCode Go model discovery failed: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown error").strip()[-300:]
+        raise RunnerError(f"OpenCode Go model discovery failed: {detail}")
+    selected = select_opencode_go_models(result.stdout.splitlines())
+    if not selected:
+        raise RunnerError("OpenCode Go has no Muse Spark Contributor or GLM model")
+    with _MODEL_DISCOVERY_LOCK:
+        _MODEL_DISCOVERY_CACHE["opencode-go"] = (now, tuple(selected))
+    return selected
+
+
+def _model_spec(cfg, runner_name, explicit=None):
     if explicit:
         return explicit
     per_runner = cfg.get("runner_models") or {}
     if isinstance(per_runner, dict) and per_runner.get(runner_name):
         return per_runner[runner_name]
     return cfg.get("model") or ""
+
+
+def model_candidates(cfg, model_spec):
+    """Expand an auto selector into ordered concrete model names."""
+    if model_spec != AUTO_OPENCODE_GO_MODEL:
+        return [model_spec]
+    try:
+        return discover_opencode_go_models(cfg)
+    except RunnerError:
+        # Keep a loud placeholder in the chain. run_one resolves it strictly
+        # and reports the discovery error instead of silently using Zen/default.
+        return [AUTO_OPENCODE_GO_MODEL]
+
+
+def resolve_model(cfg, runner_name, explicit=None):
+    """Pick the model for a runner step.
+
+    Precedence: explicit step model > runner_models[runner] > cfg model.
+    Empty string means "runner default" (unchanged historical behavior).
+    """
+    spec = _model_spec(cfg, runner_name, explicit)
+    return model_candidates(cfg, spec)[0]
 
 
 def fallback_chain(cfg):
@@ -295,9 +401,11 @@ def fallback_chain(cfg):
         if not isinstance(entry, dict) or not entry.get("runner"):
             continue
         rname = entry["runner"]
-        step = (rname, resolve_model(cfg, rname, entry.get("model") or None))
-        if step in seen:
-            continue
-        seen.add(step)
-        chain.append(step)
+        spec = _model_spec(cfg, rname, entry.get("model") or None)
+        for model in model_candidates(cfg, spec):
+            step = (rname, model)
+            if step in seen:
+                continue
+            seen.add(step)
+            chain.append(step)
     return chain

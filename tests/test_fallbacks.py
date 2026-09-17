@@ -1,12 +1,16 @@
 """Fallback chain: quota classification, model resolution, failover order."""
 
 import unittest
+from unittest import mock
 
 from tgbridge_core.runners import (
+    AUTO_OPENCODE_GO_MODEL,
     classify_run_error,
     fallback_chain,
     is_quota_error,
+    model_candidates,
     resolve_model,
+    select_opencode_go_models,
 )
 
 
@@ -83,6 +87,49 @@ class ModelResolutionTest(unittest.TestCase):
         cfg = {"model": "a/b", "runner_models": {"opencode": "c/d"}}
         self.assertEqual(resolve_model(cfg, "opencode", "e/f"), "e/f")
 
+    def test_go_selector_tracks_future_versions_and_provider(self):
+        models = [
+            "opencode/muse-spark-99-contributor",
+            "opencode-go/muse-spark-9.0",
+            "opencode-go/muse-spark-1.3-contributor",
+            "opencode-go/muse-spark-1.10-contributor",
+            "opencode-go/glm-5.3",
+            "opencode-go/glm-5.3-flash",
+            "opencode-go/glm-5.4-flash",
+        ]
+        self.assertEqual(
+            select_opencode_go_models(models),
+            [
+                "opencode-go/muse-spark-1.10-contributor",
+                "opencode-go/glm-5.4-flash",
+            ],
+        )
+
+    def test_go_selector_falls_back_to_latest_full_glm(self):
+        models = [
+            "opencode-go/glm-5.2",
+            "opencode-go/glm-5.3-flash",
+            "opencode-go/glm-5.3",
+        ]
+        self.assertEqual(select_opencode_go_models(models), ["opencode-go/glm-5.3"])
+
+    def test_auto_model_resolves_to_first_discovered_candidate(self):
+        with mock.patch(
+            "tgbridge_core.runners.discover_opencode_go_models",
+            return_value=["opencode-go/muse-spark-2-contributor", "opencode-go/glm-6"],
+        ):
+            self.assertEqual(
+                model_candidates({}, AUTO_OPENCODE_GO_MODEL),
+                ["opencode-go/muse-spark-2-contributor", "opencode-go/glm-6"],
+            )
+            self.assertEqual(
+                resolve_model(
+                    {"runner_models": {"opencode": AUTO_OPENCODE_GO_MODEL}},
+                    "opencode",
+                ),
+                "opencode-go/muse-spark-2-contributor",
+            )
+
 
 class FallbackChainTest(unittest.TestCase):
     def test_no_fallbacks_by_default(self):
@@ -118,6 +165,28 @@ class FallbackChainTest(unittest.TestCase):
         self.assertEqual(
             fallback_chain({"runner": "codex", "runner_fallbacks": "opencode"}), []
         )
+
+    def test_auto_selector_expands_muse_then_glm(self):
+        cfg = {
+            "runner": "codex",
+            "runner_fallbacks": [
+                {"runner": "opencode", "model": AUTO_OPENCODE_GO_MODEL}
+            ],
+        }
+        with mock.patch(
+            "tgbridge_core.runners.discover_opencode_go_models",
+            return_value=[
+                "opencode-go/muse-spark-2-contributor",
+                "opencode-go/glm-6",
+            ],
+        ):
+            self.assertEqual(
+                fallback_chain(cfg),
+                [
+                    ("opencode", "opencode-go/muse-spark-2-contributor"),
+                    ("opencode", "opencode-go/glm-6"),
+                ],
+            )
 
 
 if __name__ == "__main__":

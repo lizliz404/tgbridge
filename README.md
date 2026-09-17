@@ -10,7 +10,7 @@ long-poll in, local CLI agent out.
 
 - **DM + group chats** — groups are mention-triggered (@bot or reply-to-bot), DMs always answer
 - **Per-chat sessions** — each chat maps to one native runner session (`/new` forgets the mapping, `/status` inspects it)
-- **Agent failover + switching** — any failed CLI or server-mode run (quota, dead binary, broken network, timeout, empty answer) automatically walks `runner_fallbacks` with a fresh runner-native session and a one-line 🔀 header; only user cancel stops the chain. The same runner may appear repeatedly with different models, so a dead model/provider rotates without mixing Codex/OpenCode/Claude session IDs. `/runners` shows the on-device availability probe, `/runner <name> [model]` switches the global primary without restarting (`/runner default` restores file config)
+- **Agent failover + switching** — any failed CLI or server-mode run (quota, dead binary, broken network, timeout, empty answer) automatically walks `runner_fallbacks` with a fresh runner-native session and a one-line 🔀 header; only user cancel stops the chain. The same runner may appear repeatedly with different models, so a dead model/provider rotates without mixing Codex/OpenCode/Claude session IDs. `auto:opencode-go` discovers the current Go catalog and expands to the newest Muse Spark Contributor followed by the newest GLM, so model-version bumps do not require config edits. `/runners` shows the resolved chain and on-device availability probe; `/runner <name> [model]` switches the global primary without restarting (`/runner default` restores file config)
 - **Same-turn steering where supported** — Codex app-server uses `turn/steer`; OpenCode server mode uses `prompt_async`; the bridge acknowledges the nuance immediately, then injects it without cancelling the active tool
 - **Burst coalescing** — adjacent Telegram messages are held briefly and merged, so automatic 4096-character splits do not become many separate agent runs
 - **Inbound photos + documents** — downloaded privately and passed as local paths; an unaddressed group upload is retained for the next @mention/reply, so the file itself needs no tag
@@ -154,8 +154,10 @@ To post to Telegram yourself: python3 /path/to/tgbridge/tgbridge.py --send <chat
 | `reactions` | `false` disables 👀/👍/👎 emoji lifecycle (default `true`) |
 | `poll_failure_exit_threshold` | Exit nonzero after this many consecutive failed long polls so launchd/systemd can restart and surface the failure (default `20`; `0` disables) |
 | `model` | Optional `provider/model` override passed to CLI and server transports; empty = runner default |
-| `runner_models` | Per-runner default model, e.g. `{"opencode": "opencode-go/muse-spark-1.3-contributor"}`; wins over `model` for that runner |
-| `runner_fallbacks` | Ordered failover chain; repeat a runner with different models/providers for model rotation. Walked on any run failure except user cancel — the bridge tags the failure (quota/unavailable/other) but never refuses to switch on cause |
+| `runner_models` | Per-runner default model. Use `{"opencode": "auto:opencode-go"}` to dynamically select the newest `opencode-go` Muse Spark Contributor, or the newest GLM when no Contributor model is listed |
+| `runner_fallbacks` | Ordered failover chain; repeat a runner with different models/providers for model rotation. An `auto:opencode-go` entry expands to resolved Muse and GLM attempts. Walked on any run failure except user cancel — the bridge tags the failure (quota/unavailable/other) but never refuses to switch on cause |
+| `model_discovery_cache_s` | Seconds to cache the resolved OpenCode Go catalog (default `300`); expiry picks up newly added model versions without a restart |
+| `model_discovery_timeout_s` | Timeout for `opencode models opencode-go` discovery (default `15`) |
 | `fallback_run_timeout_s` | Optional shorter idle timeout for fallback attempts; prevents one dead model from blocking the rest of a long chain while leaving the primary runner timeout unchanged |
 | `quota_markers` | Extra case-insensitive regexes feeding the failure tag only (audit + 🔀 note); switching does not depend on them |
 | `transcribe_base_url` | OpenAI-compatible base URL for transcription (default `https://api.openai.com/v1`) |
