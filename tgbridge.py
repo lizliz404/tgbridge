@@ -46,12 +46,14 @@ from tgbridge_core.health import (
 )
 from tgbridge_core.storage import ensure_private_dir, load_json, save_json
 from tgbridge_core.runners import (
+    AUTO_OPENCODE_GO_MODEL,
     RUNNERS,
     SERVER_RUNNERS,
     RunnerError,
     _bin,
     apply_runner_policy,
     classify_run_error,
+    discover_opencode_go_models,
     fallback_chain,
     probe_runners,
     resolve_model,
@@ -583,6 +585,11 @@ def clear_runner_sessions(state, chat_id):
 def run_one(cfg, session_id, prompt, live=None):
     """Run one configured runner through its declared CLI/server transport."""
     rname = cfg.get("runner", "opencode")
+    if cfg.get("model") == AUTO_OPENCODE_GO_MODEL:
+        try:
+            cfg = dict(cfg, model=discover_opencode_go_models(cfg)[0])
+        except RunnerError as exc:
+            return session_id, None, str(exc)
     mode = resolve_runner_mode(cfg, rname)
     if mode == "cli":
         return run_agent(cfg, session_id, prompt, live)

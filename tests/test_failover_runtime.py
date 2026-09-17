@@ -37,9 +37,7 @@ class ServerFailoverTests(unittest.TestCase):
             "runner_mode": "server",
             "run_timeout_s": 1800,
             "fallback_run_timeout_s": 45,
-            "runner_fallbacks": [
-                {"runner": "opencode", "model": "opencode-go/muse"}
-            ],
+            "runner_fallbacks": [{"runner": "opencode", "model": "opencode-go/muse"}],
         }
         result_meta = {}
         with mock.patch.object(tgbridge, "SERVER_RUNNERS", adapters):
@@ -59,14 +57,50 @@ class ServerFailoverTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(result_meta["runner"], "opencode")
 
+    def test_dynamic_muse_failure_continues_to_discovered_glm(self):
+        calls = []
+
+        def run_one(cfg, session_id, prompt, live=None):
+            model = cfg.get("model")
+            calls.append((cfg["runner"], model))
+            if model == "opencode-go/glm-5.4-flash":
+                return "glm-session", "glm answer", None
+            return session_id, None, "model unavailable"
+
+        cfg = {
+            "runner": "codex",
+            "runner_fallbacks": [{"runner": "opencode", "model": "auto:opencode-go"}],
+        }
+        with (
+            mock.patch.object(tgbridge, "run_one", side_effect=run_one),
+            mock.patch(
+                "tgbridge_core.runners.discover_opencode_go_models",
+                return_value=[
+                    "opencode-go/muse-spark-1.4-contributor",
+                    "opencode-go/glm-5.4-flash",
+                ],
+            ),
+        ):
+            sid, answer, error = tgbridge.run_with_fallbacks(cfg, None, "prompt")
+
+        self.assertEqual(
+            calls,
+            [
+                ("codex", ""),
+                ("opencode", "opencode-go/muse-spark-1.4-contributor"),
+                ("opencode", "opencode-go/glm-5.4-flash"),
+            ],
+        )
+        self.assertEqual(sid, "glm-session")
+        self.assertIn("glm answer", answer)
+        self.assertIsNone(error)
+
 
 class RunnerSessionTests(unittest.TestCase):
     def test_legacy_session_is_owned_by_file_primary(self):
         state = {"sessions": {"7": "codex-session"}}
         self.assertIsNone(
-            tgbridge.runner_session(
-                state, 7, "opencode", legacy_runner="codex"
-            )
+            tgbridge.runner_session(state, 7, "opencode", legacy_runner="codex")
         )
         self.assertEqual(
             tgbridge.runner_session(state, 7, "codex", legacy_runner="codex"),
@@ -78,9 +112,7 @@ class RunnerSessionTests(unittest.TestCase):
         tgbridge.store_runner_session(state, 7, "codex", "codex-session")
         tgbridge.store_runner_session(state, 7, "opencode", "open-session")
         self.assertEqual(tgbridge.runner_session(state, 7, "codex"), "codex-session")
-        self.assertEqual(
-            tgbridge.runner_session(state, 7, "opencode"), "open-session"
-        )
+        self.assertEqual(tgbridge.runner_session(state, 7, "opencode"), "open-session")
         tgbridge.clear_runner_sessions(state, 7)
         self.assertIsNone(tgbridge.runner_session(state, 7, "codex"))
         self.assertIsNone(tgbridge.runner_session(state, 7, "opencode"))
