@@ -5,7 +5,7 @@
 # ruff: noqa: F821
 
 from .health import redact_proxy_url
-from .runners import CODEX_YOLO_FLAG
+from .runners import CODEX_YOLO_FLAG, fallback_chain, is_quota_error, resolve_model
 
 
 def _set_app_global(app, name, value):
@@ -378,6 +378,108 @@ def run_selftest(app):
         "id": "muse",
     }:
         fails.append("v2 model config")
+    # Failover gate: quota classification, per-runner default model, chain.
+    if not is_quota_error("weekly limit reached, resets Monday"):
+        fails.append("quota classification")
+    if is_quota_error("opencode failed rc=1\nconnection refused"):
+        fails.append("non-quota must stay loud")
+    if (
+        resolve_model(
+            {"model": "a/b", "runner_models": {"opencode": "c/d"}}, "opencode"
+        )
+        != "c/d"
+    ):
+        fails.append("per-runner default model")
+    if fallback_chain(
+        {
+            "runner": "codex",
+            "runner_models": {"opencode": "c/d"},
+            "runner_fallbacks": [{"runner": "codex"}, {"runner": "opencode"}],
+        }
+    ) != [("opencode", "c/d")]:
+        fails.append("fallback chain dedupe")
+    # Failover orchestration: quota on primary -> fresh fallback session + header.
+    fb_calls = []
+    fb_audits = []
+    orig_run_agent = run_agent
+    orig_audit = audit
+
+    def fake_run_agent(cfg, session_id, prompt, live=None):
+        fb_calls.append((cfg.get("runner"), cfg.get("model"), session_id))
+        if len(fb_calls) == 1:
+            return session_id, None, "codex failed rc=1\nweekly limit reached"
+        return "new-sid", "fallback answer", None
+
+    _set_app_global(app, "run_agent", fake_run_agent)
+    _set_app_global(app, "audit", lambda event, **kw: fb_audits.append(event))
+    try:
+        fb_sid, fb_answer, fb_err = run_with_fallbacks(
+            {
+                "runner": "codex",
+                "workdir": "/tmp",
+                "runner_models": {"opencode": "opencode-go/muse-spark-1.3-contributor"},
+                "runner_fallbacks": [{"runner": "opencode"}],
+            },
+            "old-sid",
+            "hi",
+            None,
+        )
+    finally:
+        _set_app_global(app, "run_agent", orig_run_agent)
+        _set_app_global(app, "audit", orig_audit)
+    if (
+        fb_err is not None
+        or fb_sid != "new-sid"
+        or "answered via opencode" not in (fb_answer or "")
+    ):
+        fails.append("quota failover")
+    if fb_calls != [
+        ("codex", "", "old-sid"),
+        ("opencode", "opencode-go/muse-spark-1.3-contributor", None),
+    ]:
+        fails.append("failover fresh session + model")
+    if "run_fallback" not in fb_audits:
+        fails.append("failover audit")
+    # Any failure (not just quota) fails over; only cancel stops the chain.
+    fb_calls.clear()
+
+    def dead_run_agent(cfg, session_id, prompt, live=None):
+        fb_calls.append((cfg.get("runner"), cfg.get("model"), session_id))
+        return session_id, None, "opencode failed rc=1\nconnection refused"
+
+    _set_app_global(app, "run_agent", dead_run_agent)
+    try:
+        _, _, dead_err = run_with_fallbacks(
+            {
+                "runner": "codex",
+                "runner_fallbacks": [{"runner": "opencode", "model": "c/d"}],
+            },
+            "s",
+            "hi",
+            None,
+        )
+    finally:
+        _set_app_global(app, "run_agent", orig_run_agent)
+    if "all runners exhausted (codex -> opencode)" not in (dead_err or ""):
+        fails.append("any-failure fails over")
+    if [c[:2] for c in fb_calls] != [("codex", ""), ("opencode", "c/d")]:
+        fails.append("failover walks the whole chain")
+    _set_app_global(
+        app,
+        "run_agent",
+        lambda cfg, session_id, prompt, live=None: (session_id, None, CANCEL_MSG),
+    )
+    try:
+        _, _, cancel_err = run_with_fallbacks(
+            {"runner": "codex", "runner_fallbacks": [{"runner": "opencode"}]},
+            "s",
+            "hi",
+            None,
+        )
+    finally:
+        _set_app_global(app, "run_agent", orig_run_agent)
+    if cancel_err != CANCEL_MSG:
+        fails.append("cancel never fails over")
     if _server_poll_interval({"server_poll_s": 0}) != 0.1:
         fails.append("server poll minimum")
     if _server_poll_interval({"server_poll_s": "bad"}) != SERVER_POLL_S:

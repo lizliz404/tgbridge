@@ -10,6 +10,7 @@ long-poll in, local CLI agent out.
 
 - **DM + group chats** — groups are mention-triggered (@bot or reply-to-bot), DMs always answer
 - **Per-chat sessions** — each chat maps to one native runner session (`/new` forgets the mapping, `/status` inspects it)
+- **Agent failover + switching** — any failed run (quota, dead binary, broken network, empty answer) automatically walks `runner_fallbacks` with a fresh session and a one-line 🔀 header; only user cancel stops the chain. `/runners` shows the on-device availability probe, `/runner <name> [model]` switches the global primary without restarting (`/runner default` restores file config)
 - **Same-turn steering where supported** — Codex app-server uses `turn/steer`; OpenCode server mode uses `prompt_async`; the bridge acknowledges the nuance immediately, then injects it without cancelling the active tool
 - **Burst coalescing** — adjacent Telegram messages are held briefly and merged, so automatic 4096-character splits do not become many separate agent runs
 - **Inbound photos + documents** — downloaded privately and passed as local paths; an unaddressed group upload is retained for the next @mention/reply, so the file itself needs no tag
@@ -20,7 +21,7 @@ long-poll in, local CLI agent out.
 - **Audit log** — every enqueue/run/send/schedule event appended to `~/.config/tgbridge/audit.jsonl`
 - **Never dies silently** — any fatal crash or SIGTERM announces `💀 …` to every allowed chat (best-effort, 3s each) before systemd restarts it; a dead worker thread is detected and respawned; a failed answer delivery retries once, then is audited and saved to `~/.config/tgbridge/undelivered/` instead of vanishing; a missing runner binary warns at startup instead of crashing
 - **Ambient group context** — hears recent human conversation but only runs when explicitly @mentioned or replied to
-- **Slash-command menu** — `/new`, `/status`, `/at`, `/cancel`, `/help` registered via `setMyCommands`
+- **Slash-command menu** — `/new`, `/status`, `/runners`, `/runner`, `/at`, `/cancel`, `/help` registered via `setMyCommands`
 - **Chat + sender policy** — double allowlist by default; optionally trust all members of specifically allowlisted groups while keeping DMs user-allowlisted
 - **Private runtime state** — config, session index, audit log, attachments, and undelivered replies are kept under `~/.config/tgbridge` with private permissions
 - **Regression + startup gates** — `python3 tgbridge.py --selftest` runs the exhaustive suite on demand/CI; every service start runs only a fast, side-effect-free smoke gate
@@ -152,6 +153,9 @@ To post to Telegram yourself: python3 /path/to/tgbridge/tgbridge.py --send <chat
 | `reactions` | `false` disables 👀/👍/👎 emoji lifecycle (default `true`) |
 | `poll_failure_exit_threshold` | Exit nonzero after this many consecutive failed long polls so launchd/systemd can restart and surface the failure (default `20`; `0` disables) |
 | `model` | Optional `provider/model` override passed to CLI and server transports; empty = runner default |
+| `runner_models` | Per-runner default model, e.g. `{"opencode": "opencode-go/muse-spark-1.3-contributor"}`; wins over `model` for that runner |
+| `runner_fallbacks` | Ordered failover chain, e.g. `[{"runner": "opencode", "model": "opencode-go/muse-spark-1.3-contributor"}]`; walked on any run failure except user cancel — the bridge tags the failure (quota/unavailable/other) but never refuses to switch on cause |
+| `quota_markers` | Extra case-insensitive regexes feeding the failure tag only (audit + 🔀 note); switching does not depend on them |
 | `transcribe_base_url` | OpenAI-compatible base URL for transcription (default `https://api.openai.com/v1`) |
 | `transcribe_key` | API key; absent = voice notes disabled |
 | `transcribe_model` | Whisper model name (default `whisper-1`; Groq: `whisper-large-v3-turbo`) |

@@ -20,6 +20,13 @@
   "chunk": 3900,
   "reactions": true,
   "model": "",
+  "runner_models": {
+    "opencode": "opencode-go/muse-spark-1.3-contributor"
+  },
+  "runner_fallbacks": [
+    {"runner": "opencode", "model": "opencode-go/muse-spark-1.3-contributor"}
+  ],
+  "quota_markers": [],
   "transcribe_base_url": "https://api.openai.com/v1",
   "transcribe_key": "sk-REPLACE-OR-REMOVE",
   "transcribe_model": "whisper-1"

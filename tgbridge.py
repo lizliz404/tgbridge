@@ -51,6 +51,10 @@ from tgbridge_core.runners import (
     RunnerError,
     _bin,
     apply_runner_policy,
+    classify_run_error,
+    fallback_chain,
+    probe_runners,
+    resolve_model,
 )
 
 CONFIG_DIR = os.path.expanduser("~/.config/tgbridge")
@@ -101,8 +105,6 @@ def log(msg):
     print(time.strftime("%H:%M:%S"), msg, flush=True)
 
 
-
-
 def ensure_private_storage():
     ensure_private_dir(CONFIG_DIR)
     for path in (
@@ -128,10 +130,6 @@ def audit(event, **fields):
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except OSError:
         pass
-
-
-
-
 
 
 def update_health(**fields):
@@ -189,8 +187,6 @@ def react(cfg, chat_id, message_id, emoji):
         message_id=message_id,
         reaction=json.dumps([{"type": "emoji", "emoji": emoji}]),
     )
-
-
 
 
 def send(token, chat_id, text, reply_to=None, chunk_limit=CHUNK):
@@ -375,8 +371,6 @@ def typing_loop(token, chat_id, stop_event):
         api(token, "sendChatAction", chat_id=chat_id, action="typing")
 
 
-
-
 def edit_status(cfg, live, final=None):
     now = time.time()
     if not final and now - live.get("last_edit", 0) < 8:
@@ -405,8 +399,6 @@ def edit_status(cfg, live, final=None):
             message_id=live["status_id"],
             text=text,
         )
-
-
 
 
 def run_agent(cfg, session_id, prompt, live=None):
@@ -508,8 +500,7 @@ def run_agent(cfg, session_id, prompt, live=None):
             return (
                 sid,
                 partial
-                + "\n\n⚠️ (partial answer — hit the %s timeout and was killed)"
-                % reason,
+                + "\n\n⚠️ (partial answer — hit the %s timeout and was killed)" % reason,
                 None,
             )
         return sid, None, "agent hit the %s timeout and was killed" % reason
@@ -530,9 +521,85 @@ def run_agent(cfg, session_id, prompt, live=None):
     return sid, "\n".join(acc["texts"]).strip(), None
 
 
-def _server_call(
-    method, path, body=None, timeout=15, directory=None, base_url=None
-):
+def effective_run_config(cfg, state):
+    """Copy of cfg honoring a Telegram-set global runner override.
+
+    state["runner_override"] = {"runner": ..., "model": ...} (model may be
+    ""), written by /runner and cleared by `/runner default`. Absent/invalid
+    override → cfg unchanged, so file config stays the source of truth.
+    """
+    override = {}
+    try:
+        override = (state or {}).get("runner_override") or {}
+    except AttributeError:
+        override = {}
+    rname = override.get("runner")
+    if rname not in RUNNERS:
+        return dict(cfg)
+    out = dict(cfg, runner=rname)
+    if override.get("model") is not None:
+        out["model"] = override["model"]
+    return out
+
+
+def run_with_fallbacks(cfg, session_id, prompt, live=None):
+    """Run the primary runner, failing over across runners on ANY failure.
+
+    The bridge does not care how or why a runner broke — quota, dead
+    binary, broken network path, empty answer: if it is unusable, tag it
+    (audit kind=quota|unavailable|other) and try the next entry of
+    `runner_fallbacks`. Only a user cancel stops the chain; everything else
+    walks it. Fallback steps always start a fresh session — session/thread
+    IDs are runner-native and cannot resume across runners — and the
+    delivered answer carries a one-line 🔀 header naming the runner that
+    actually answered.
+    """
+    rname = cfg.get("runner", "opencode")
+    model = resolve_model(cfg, rname)
+    new_sid, answer, err = run_agent(
+        dict(cfg, runner=rname, model=model), session_id, prompt, live
+    )
+    if answer is not None or (err or "") == CANCEL_MSG:
+        return new_sid, answer, err
+    kind = classify_run_error(err, cfg.get("quota_markers"))
+    reason = "hit a limit" if kind == "quota" else "is unusable"
+    tried = [(rname, model)]
+    with RUN_LOCK:
+        if RUN_STATE.get("current"):
+            RUN_STATE["current"]["runner"] = rname
+    for step_runner, step_model in fallback_chain(cfg):
+        note = f"🔀 {rname} {reason} — failing over to {step_runner}"
+        log(
+            f"run failover ({kind}): {rname} -> {step_runner} ({step_model or 'runner default'})"
+        )
+        audit(
+            "run_fallback",
+            kind=kind,
+            from_runner=rname,
+            to_runner=step_runner,
+            to_model=step_model,
+            err=(err or "")[:200],
+        )
+        if live is not None:
+            live["trail"].append(note)
+            edit_status(cfg, live)
+        with RUN_LOCK:
+            if RUN_STATE.get("current"):
+                RUN_STATE["current"]["runner"] = step_runner
+        step_cfg = dict(cfg, runner=step_runner, model=step_model)
+        new_sid, answer, err = run_agent(step_cfg, None, prompt, live)
+        rname = step_runner
+        tried.append((step_runner, step_model))
+        if answer is not None:
+            header = f"🔀 {tried[0][0]} {reason} — answered via {step_runner}"
+            if step_model:
+                header += f" ({step_model})"
+            return new_sid, header + "\n\n" + answer, None
+    chain = " -> ".join(r for r, _ in tried)
+    return session_id, None, f"all runners exhausted ({chain}): {err}"
+
+
+def _server_call(method, path, body=None, timeout=15, directory=None, base_url=None):
     """JSON call to the local OpenCode server; returns parsed body or None."""
     if directory:
         separator = "&" if "?" in path else "?"
@@ -676,14 +743,8 @@ def should_steer(chat_id):
             and cur
             and cur.get("chat") == chat_id
             and (
-                (
-                    RUN_STATE.get("server_sid")
-                    and RUN_STATE.get("server_api") == "v2"
-                )
-                or (
-                    RUN_STATE.get("codex_thread_id")
-                    and RUN_STATE.get("codex_turn_id")
-                )
+                (RUN_STATE.get("server_sid") and RUN_STATE.get("server_api") == "v2")
+                or (RUN_STATE.get("codex_thread_id") and RUN_STATE.get("codex_turn_id"))
             )
         )
 
@@ -925,7 +986,7 @@ def run_agent_server_v1(cfg, session_id, prompt, live=None):
             if (message.get("info") or {}).get("id")
         }
         body: dict = {"parts": [{"type": "text", "text": prompt}]}
-        model = cfg.get("model")
+        model = resolve_model(cfg, cfg.get("runner", "opencode"))
         if model and "/" in model:
             prov, _, mid = model.partition("/")
             body["model"] = {"providerID": prov, "modelID": mid}
@@ -984,13 +1045,16 @@ def run_agent_server_v1(cfg, session_id, prompt, live=None):
                     log(f"server timeout abort: {e}")
                 break
 
-            messages = _server_call(
-                "GET",
-                f"/session/{sid}/message",
-                timeout=5,
-                directory=directory,
-                base_url=base_url,
-            ) or []
+            messages = (
+                _server_call(
+                    "GET",
+                    f"/session/{sid}/message",
+                    timeout=5,
+                    directory=directory,
+                    base_url=base_url,
+                )
+                or []
+            )
             snapshot = json.dumps(messages, sort_keys=True, ensure_ascii=False)
             if snapshot != last_snapshot:
                 last_snapshot = snapshot
@@ -1040,13 +1104,16 @@ def run_agent_server_v1(cfg, session_id, prompt, live=None):
                     )
                 if stable:
                     # One final read captures the last text snapshot after idle.
-                    messages = _server_call(
-                        "GET",
-                        f"/session/{sid}/message",
-                        timeout=5,
-                        directory=directory,
-                        base_url=base_url,
-                    ) or []
+                    messages = (
+                        _server_call(
+                            "GET",
+                            f"/session/{sid}/message",
+                            timeout=5,
+                            directory=directory,
+                            base_url=base_url,
+                        )
+                        or []
+                    )
                     trails, _ = server_messages(messages, baseline, acc, seen)
                     if live is not None and trails:
                         live["trail"].extend(trails)
@@ -1055,13 +1122,16 @@ def run_agent_server_v1(cfg, session_id, prompt, live=None):
 
         # Abort can race the last model write; retain whatever was persisted.
         try:
-            messages = _server_call(
-                "GET",
-                f"/session/{sid}/message",
-                timeout=5,
-                directory=directory,
-                base_url=base_url,
-            ) or []
+            messages = (
+                _server_call(
+                    "GET",
+                    f"/session/{sid}/message",
+                    timeout=5,
+                    directory=directory,
+                    base_url=base_url,
+                )
+                or []
+            )
             server_messages(messages, baseline, acc, seen)
         except Exception as e:
             log(f"server final transcript: {e}")
@@ -1132,7 +1202,7 @@ def opencode_v2_supported(cfg):
 
 
 def _opencode_model(cfg, v2=False):
-    model = str(cfg.get("model") or "").strip()
+    model = str(resolve_model(cfg, cfg.get("runner", "opencode")) or "").strip()
     if "/" not in model:
         return None
     provider, _, model_id = model.partition("/")
@@ -1222,12 +1292,15 @@ def run_agent_server_v2(cfg, session_id, prompt, live=None):
             sid = ((created or {}).get("data") or {}).get("id")
             if not sid:
                 return session_id, None, "OpenCode v2: could not create session"
-        before = _server_call(
-            "GET",
-            f"/api/session/{sid}/message?order=desc&limit=100",
-            timeout=10,
-            base_url=base_url,
-        ) or {}
+        before = (
+            _server_call(
+                "GET",
+                f"/api/session/{sid}/message?order=desc&limit=100",
+                timeout=10,
+                base_url=base_url,
+            )
+            or {}
+        )
         baseline = {
             message.get("id") for message in before.get("data", []) if message.get("id")
         }
@@ -1271,12 +1344,15 @@ def run_agent_server_v2(cfg, session_id, prompt, live=None):
                 except Exception as eably:
                     log(f"OpenCode v2 interrupt: {eably}")
                 break
-            messages = _server_call(
-                "GET",
-                f"/api/session/{sid}/message?order=desc&limit=100",
-                timeout=10,
-                base_url=base_url,
-            ) or {}
+            messages = (
+                _server_call(
+                    "GET",
+                    f"/api/session/{sid}/message?order=desc&limit=100",
+                    timeout=10,
+                    base_url=base_url,
+                )
+                or {}
+            )
             snapshot = json.dumps(messages, sort_keys=True, ensure_ascii=False)
             if snapshot != last_snapshot:
                 last_snapshot = snapshot
@@ -1294,9 +1370,10 @@ def run_agent_server_v2(cfg, session_id, prompt, live=None):
                     if latest:
                         live["preview"] = latest
                         edit_status(cfg, live)
-            active = _server_call(
-                "GET", "/api/session/active", timeout=5, base_url=base_url
-            ) or {}
+            active = (
+                _server_call("GET", "/api/session/active", timeout=5, base_url=base_url)
+                or {}
+            )
             busy = sid in (active.get("data") or {})
             if busy:
                 mark_run_progress()
@@ -1316,12 +1393,15 @@ def run_agent_server_v2(cfg, session_id, prompt, live=None):
                         and not RUN_STATE.get("cancel")
                     )
                 if stable:
-                    final_messages = _server_call(
-                        "GET",
-                        f"/api/session/{sid}/message?order=desc&limit=100",
-                        timeout=10,
-                        base_url=base_url,
-                    ) or {}
+                    final_messages = (
+                        _server_call(
+                            "GET",
+                            f"/api/session/{sid}/message?order=desc&limit=100",
+                            timeout=10,
+                            base_url=base_url,
+                        )
+                        or {}
+                    )
                     server_messages_v2(final_messages, baseline, acc, seen)
                     break
             time.sleep(poll_s)
@@ -1349,7 +1429,11 @@ def run_agent_server_v2(cfg, session_id, prompt, live=None):
             return sid, answer or None, None if answer else "steering delivery failed"
         if acc["errors"]:
             detail = json.dumps(acc["errors"][-1], ensure_ascii=False)[-500:]
-            return sid, answer or None, None if answer else f"OpenCode v2 error: {detail}"
+            return (
+                sid,
+                answer or None,
+                None if answer else f"OpenCode v2 error: {detail}",
+            )
         if not answer:
             return sid, None, "agent returned no text"
         return sid, answer, None
@@ -1433,9 +1517,7 @@ def _codex_item_trail(item):
     if kind == "commandExecution":
         return "🔧 bash: " + (item.get("command") or "")[:60]
     if kind == "mcpToolCall":
-        label = "/".join(
-            str(v) for v in (item.get("server"), item.get("tool")) if v
-        )
+        label = "/".join(str(v) for v in (item.get("server"), item.get("tool")) if v)
         return "🔧 " + (label or "MCP tool")[:70]
     if kind == "dynamicToolCall":
         return "🔧 " + str(item.get("tool") or "dynamic tool")[:70]
@@ -1459,9 +1541,7 @@ def _codex_handle_steer_response(cfg, event, run_id):
     with RUN_LOCK:
         meta = RUN_STATE.setdefault("codex_steers", {}).pop(request_id, None)
         if meta and RUN_STATE.get("codex_run_id") == run_id:
-            RUN_STATE["steer_pending"] = max(
-                0, RUN_STATE.get("steer_pending", 1) - 1
-            )
+            RUN_STATE["steer_pending"] = max(0, RUN_STATE.get("steer_pending", 1) - 1)
             if not event.get("error"):
                 RUN_STATE["steer_count"] = RUN_STATE.get("steer_count", 0) + 1
     if not meta:
@@ -1558,8 +1638,8 @@ def run_codex_app_server(cfg, session_id, prompt, live=None):
                 "danger-full-access" if cfg.get("codex_yolo", False) else "read-only"
             ),
         }
-        if cfg.get("model"):
-            access["model"] = cfg["model"]
+        if resolve_model(cfg, "codex"):
+            access["model"] = resolve_model(cfg, "codex")
         setup_id = 2
         if session_id:
             params = {**access, "threadId": session_id}
@@ -1610,7 +1690,7 @@ def run_codex_app_server(cfg, session_id, prompt, live=None):
         started_response = _codex_wait_response(
             events, turn_request_id, keep=early_events
         )
-        turn_id = ((started_response.get("turn") or {}).get("id"))
+        turn_id = (started_response.get("turn") or {}).get("id")
         if not turn_id:
             raise RuntimeError("Codex app-server returned no active turn id")
         with RUN_LOCK:
@@ -1660,7 +1740,9 @@ def run_codex_app_server(cfg, session_id, prompt, live=None):
                     edit_status(cfg, live)
             elif method == "item/agentMessage/delta":
                 item_id = params.get("itemId") or "message"
-                previews[item_id] = previews.get(item_id, "") + (params.get("delta") or "")
+                previews[item_id] = previews.get(item_id, "") + (
+                    params.get("delta") or ""
+                )
                 if live is not None and previews[item_id]:
                     live["preview"] = previews[item_id]
                     edit_status(cfg, live)
@@ -1677,12 +1759,16 @@ def run_codex_app_server(cfg, session_id, prompt, live=None):
                     answer_unknown.append(text)
             elif method == "error":
                 if not params.get("willRetry"):
-                    turn_error = json.dumps(params.get("error") or params, ensure_ascii=False)[-600:]
+                    turn_error = json.dumps(
+                        params.get("error") or params, ensure_ascii=False
+                    )[-600:]
             elif method == "turn/completed":
                 turn = params.get("turn") or {}
                 if turn.get("id") == turn_id:
                     if turn.get("error"):
-                        turn_error = json.dumps(turn["error"], ensure_ascii=False)[-600:]
+                        turn_error = json.dumps(turn["error"], ensure_ascii=False)[
+                            -600:
+                        ]
                     completed = True
 
         # Responses normally precede turn/completed, but drain any already
@@ -1705,7 +1791,11 @@ def run_codex_app_server(cfg, session_id, prompt, live=None):
 
         answer = "\n\n".join(answer_final or answer_unknown).strip()
         if timed_out and answer:
-            return sid, answer + f"\n\n⚠️ (partial — hit the {timeout_reason} timeout)", None
+            return (
+                sid,
+                answer + f"\n\n⚠️ (partial — hit the {timeout_reason} timeout)",
+                None,
+            )
         if timed_out:
             return sid, None, f"agent hit the {timeout_reason} timeout"
         if cancelled and answer:
@@ -1987,8 +2077,10 @@ def worker(cfg, state):
         chat_id = message_id = prompt = None
         try:
             chat_id, message_id, prompt = unpack_entry(entry)
-            rname = cfg.get("runner", "opencode")
-            mode = runner_mode(cfg)
+            with STATE_LOCK:
+                run_cfg = effective_run_config(cfg, state)
+            rname = run_cfg.get("runner", "opencode")
+            mode = runner_mode(run_cfg)
             with RUN_LOCK:
                 RUN_STATE["busy"] = True
                 RUN_STATE["current"] = {
@@ -2052,9 +2144,7 @@ def worker(cfg, state):
                             "use runner_mode='cli'",
                         )
                     elif not adapter["healthy"](cfg):
-                        where = (
-                            f" at {server_url(cfg)}" if rname == "opencode" else ""
-                        )
+                        where = f" at {server_url(cfg)}" if rname == "opencode" else ""
                         new_sid, answer, err = (
                             session_id,
                             None,
@@ -2063,10 +2153,12 @@ def worker(cfg, state):
                         )
                     else:
                         new_sid, answer, err = adapter["run"](
-                            cfg, session_id, prompt, live
+                            run_cfg, session_id, prompt, live
                         )
                 elif mode == "cli":
-                    new_sid, answer, err = run_agent(cfg, session_id, prompt, live)
+                    new_sid, answer, err = run_with_fallbacks(
+                        run_cfg, session_id, prompt, live
+                    )
                 else:
                     new_sid, answer, err = (
                         session_id,
@@ -2083,7 +2175,7 @@ def worker(cfg, state):
                     RUN_STATE["current"] = None
             if err and session_id and "failed rc=" in err and err != CANCEL_MSG:
                 live["trail"].append("♻️ stale session — retrying fresh")
-                new_sid, answer, err = run_agent(cfg, None, prompt, live)
+                new_sid, answer, err = run_with_fallbacks(run_cfg, None, prompt, live)
             if live["status_id"]:
                 edit_status(cfg, live, final="✅ done" if not err else "🔴 failed")
             with STATE_LOCK:
@@ -2180,9 +2272,7 @@ def save_attachment(cfg, msg):
     ensure_private_dir(inbox)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     chat_id = (msg.get("chat") or {}).get("id", "chat")
-    dest = os.path.join(
-        inbox, f"{stamp}-{chat_id}-{msg.get('message_id', 'x')}-{name}"
-    )
+    dest = os.path.join(inbox, f"{stamp}-{chat_id}-{msg.get('message_id', 'x')}-{name}")
     url = f"https://api.telegram.org/file/bot{cfg['bot_token']}/{fp}"
     try:
         urllib.request.urlretrieve(url, dest)
@@ -2339,7 +2429,9 @@ def handle_update(cfg, state, upd, *, state_path=STATE_PATH):
     if attachment_note:
         text = "\n".join(p for p in (text, attachment_note) if p).strip()
     elif has_attachment and not text.strip():
-        send(cfg["bot_token"], chat_id, "⚠️ I could not download that file from Telegram")
+        send(
+            cfg["bot_token"], chat_id, "⚠️ I could not download that file from Telegram"
+        )
         return
 
     cmd, rest = botcmd(text)
@@ -2347,7 +2439,8 @@ def handle_update(cfg, state, upd, *, state_path=STATE_PATH):
         send(
             cfg["bot_token"],
             chat_id,
-            "commands: /new reset session · /status state · /at 30m <prompt> "
+            "commands: /new reset session · /status state · /runners list agents · "
+            "/runner <name> [model] switch agent · /at 30m <prompt> "
             "schedule · /cancel abort current run · anything else goes to the agent",
         )
         return
@@ -2430,10 +2523,13 @@ def handle_update(cfg, state, upd, *, state_path=STATE_PATH):
         cur = ""
         if c:
             cur = f"\nrunning: {c['prompt']}… ({int(time.time() - c['since'])}s)"
-        runner_name = cfg.get("runner", "opencode")
-        mode = runner_mode(cfg)
+        status_cfg = effective_run_config(cfg, state)
+        runner_name = status_cfg.get("runner", "opencode")
+        mode = runner_mode(status_cfg)
         capability = (SERVER_RUNNERS.get(runner_name) or {}).get("feature")
-        mode_label = f"{mode}: {capability}" if mode == "server" and capability else mode
+        mode_label = (
+            f"{mode}: {capability}" if mode == "server" and capability else mode
+        )
         if runner_name == "codex":
             policy = (
                 "yolo"
@@ -2441,14 +2537,96 @@ def handle_update(cfg, state, upd, *, state_path=STATE_PATH):
                 else ("read-only" if mode == "server" else "default permissions")
             )
             mode_label += f", {policy}"
+        model_label = resolve_model(status_cfg, runner_name) or "runner default"
+        chain = fallback_chain(status_cfg)
+        chain_label = (
+            "none"
+            if not chain
+            else " -> ".join(f"{r}/{m or 'runner default'}" for r, m in chain)
+        )
+        override_note = ""
+        if (state.get("runner_override") or {}).get("runner"):
+            override_note = f" (override, file says {cfg.get('runner', 'opencode')})"
         send(
             cfg["bot_token"],
             chat_id,
-            f"chat {chat_id}\nrunner: {runner_name} ({mode_label})\n"
+            f"chat {chat_id}\nrunner: {runner_name} ({mode_label}){override_note}\n"
+            f"model: {model_label}\nfallbacks: {chain_label}\n"
             f"session: {info}\ncwd: {cfg['workdir']}\n"
             f"incoming parts: {incoming_count}\nqueued batches: {PROMPT_Q.qsize()}\n"
             f"scheduled: {pending}\ntelegram poll: {poll_health} "
             f"(failures: {failures}){cur}",
+        )
+        return
+    if cmd == "/runners":
+        probe = probe_runners()
+        eff = effective_run_config(cfg, state)
+        lines = [
+            f"{'●' if p['available'] else '○'} {name}"
+            + ("" if p["available"] else f" — {p['detail']}")
+            for name, p in probe.items()
+        ]
+        chain = fallback_chain(eff)
+        lines.append(
+            "fallbacks: "
+            + (
+                "none"
+                if not chain
+                else " -> ".join(f"{r}/{m or 'runner default'}" for r, m in chain)
+            )
+        )
+        ov = (state.get("runner_override") or {}).get("runner")
+        lines.append(
+            f"primary: {eff.get('runner', 'opencode')}"
+            + (
+                f" (via /runner, file says {cfg.get('runner', 'opencode')})"
+                if ov
+                else ""
+            )
+        )
+        send(cfg["bot_token"], chat_id, "runners:\n" + "\n".join(lines))
+        return
+    if cmd == "/runner":
+        args = (rest or "").split()
+        if not args:
+            eff = effective_run_config(cfg, state)
+            send(
+                cfg["bot_token"],
+                chat_id,
+                f"primary: {eff.get('runner', 'opencode')} "
+                f"({resolve_model(eff, eff.get('runner', 'opencode')) or 'runner default'})\n"
+                "usage: /runner <name> [model] · /runner default",
+            )
+            return
+        if args[0] == "default":
+            with STATE_LOCK:
+                state.pop("runner_override", None)
+                if state_path is not None:
+                    save_json(state_path, state)
+            audit("runner_override_cleared", chat_id=chat_id)
+            send(
+                cfg["bot_token"],
+                chat_id,
+                f"primary back to file config: {cfg.get('runner', 'opencode')}",
+            )
+            return
+        name, model = args[0], (args[1] if len(args) > 1 else "")
+        if name not in RUNNERS:
+            send(
+                cfg["bot_token"],
+                chat_id,
+                f"unknown runner {name!r} (available: {', '.join(sorted(RUNNERS))})",
+            )
+            return
+        with STATE_LOCK:
+            state["runner_override"] = {"runner": name, "model": model}
+            if state_path is not None:
+                save_json(state_path, state)
+        audit("runner_override_set", chat_id=chat_id, runner=name, model=model)
+        send(
+            cfg["bot_token"],
+            chat_id,
+            f"primary now {name} ({model or 'runner default'}) — applies to the next run",
         )
         return
     if cmd == "/at":
@@ -2564,7 +2742,7 @@ def doctor_report():
     try:
         if rname not in RUNNERS:
             raise RunnerError(f"unknown runner {rname!r}")
-        RUNNERS[rname](None, "doctor", cfg.get("model") or None)
+        RUNNERS[rname](None, "doctor", resolve_model(cfg, rname) or None)
         if mode == "server":
             adapter = SERVER_RUNNERS.get(rname)
             if not adapter:
@@ -2577,6 +2755,22 @@ def doctor_report():
     except Exception as e:
         runner_check["error"] = str(e)[:200]
     report["runner"] = runner_check
+    fallback_checks = []
+    for step_runner, step_model in fallback_chain(cfg):
+        check = {
+            "runner": step_runner,
+            "model": step_model or "runner default",
+            "ok": False,
+        }
+        try:
+            if step_runner not in RUNNERS:
+                raise RunnerError(f"unknown runner {step_runner!r}")
+            RUNNERS[step_runner](None, "doctor", step_model or None)
+            check["ok"] = True
+        except Exception as e:
+            check["error"] = str(e)[:200]
+        fallback_checks.append(check)
+    report["fallbacks"] = fallback_checks
 
     telegram_error = {}
     me = api(cfg["bot_token"], "getMe", _error=telegram_error)
@@ -2642,7 +2836,9 @@ def run(cfg):
         me = None
         time.sleep(3)
     if not me or not me.get("ok"):
-        sys.exit("getMe failed after 5 retries: Telegram unreachable (token not verified)")
+        sys.exit(
+            "getMe failed after 5 retries: Telegram unreachable (token not verified)"
+        )
     state["bot_username"] = me["result"]["username"]
     save_json(STATE_PATH, state)
     api(
@@ -2652,6 +2848,11 @@ def run(cfg):
             [
                 {"command": "new", "description": "Reset session for this chat"},
                 {"command": "status", "description": "Show session info"},
+                {"command": "runners", "description": "List available agents"},
+                {
+                    "command": "runner",
+                    "description": "Switch agent: /runner <name> [model]",
+                },
                 {"command": "at", "description": "Schedule a prompt: /at 30m <text>"},
                 {"command": "cancel", "description": "Abort the current run"},
                 {"command": "help", "description": "List commands"},
@@ -2665,6 +2866,15 @@ def run(cfg):
 
     # Startup sanity: a missing runner binary must not kill the bridge —
     # commands still work; warn once in the home chat, runs report the error.
+    # Full availability probe is logged here and served live via /runners.
+    probe = probe_runners()
+    log(
+        "runner probe: "
+        + ", ".join(
+            f"{name}={'ok' if p['available'] else 'missing'}"
+            for name, p in probe.items()
+        )
+    )
     rname = cfg.get("runner", "opencode")
     hc = home_chat(cfg)
     warn = None
@@ -2686,14 +2896,9 @@ def run(cfg):
     if not warn and mode == "server":
         adapter = SERVER_RUNNERS.get(rname)
         if not adapter:
-            warn = (
-                f"⚠️ runner {rname!r} has no server transport — "
-                "use runner_mode='cli'"
-            )
+            warn = f"⚠️ runner {rname!r} has no server transport — use runner_mode='cli'"
         elif not adapter["healthy"](cfg):
-            where = (
-                f" at {server_url(cfg)}" if rname == "opencode" else ""
-            )
+            where = f" at {server_url(cfg)}" if rname == "opencode" else ""
             warn = (
                 f"⚠️ {rname} server transport unavailable{where} — "
                 "start/install it before prompting or use runner_mode='cli'"
@@ -2709,9 +2914,7 @@ def run(cfg):
     backoff = 3
     poll_failures = 0
     try:
-        failure_exit_threshold = max(
-            0, int(cfg.get("poll_failure_exit_threshold", 20))
-        )
+        failure_exit_threshold = max(0, int(cfg.get("poll_failure_exit_threshold", 20)))
     except (TypeError, ValueError):
         failure_exit_threshold = 20
     while True:
@@ -2732,7 +2935,10 @@ def run(cfg):
                 status="unhealthy",
                 consecutive_poll_failures=poll_failures,
                 last_poll_error=poll_error
-                or {"kind": "invalid_response", "message": "Telegram returned no ok payload"},
+                or {
+                    "kind": "invalid_response",
+                    "message": "Telegram returned no ok payload",
+                },
             )
             if failure_exit_threshold and poll_failures >= failure_exit_threshold:
                 raise RuntimeError(
