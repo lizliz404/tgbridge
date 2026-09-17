@@ -1,6 +1,11 @@
 {
   "runner": "opencode",
   "runner_mode": "cli",
+  "runner_modes": {
+    "codex": "server",
+    "opencode": "cli",
+    "claude": "cli"
+  },
   "server_url": "http://127.0.0.1:4096",
   "server_poll_s": 0.5,
   "codex_yolo": false,
@@ -24,8 +29,11 @@
     "opencode": "opencode-go/muse-spark-1.3-contributor"
   },
   "runner_fallbacks": [
-    {"runner": "opencode", "model": "opencode-go/muse-spark-1.3-contributor"}
+    {"runner": "opencode", "model": "opencode-go/muse-spark-1.3-contributor"},
+    {"runner": "opencode", "model": "opencode/muse-spark-1.3-contributor-free"},
+    {"runner": "opencode", "model": "opencode-go/kimi-k2.7-code"}
   ],
+  "fallback_run_timeout_s": 300,
   "quota_markers": [],
   "transcribe_base_url": "https://api.openai.com/v1",
   "transcribe_key": "sk-REPLACE-OR-REMOVE",

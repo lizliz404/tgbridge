@@ -542,7 +542,71 @@ def effective_run_config(cfg, state):
     return out
 
 
-def run_with_fallbacks(cfg, session_id, prompt, live=None):
+def runner_session(state, chat_id, runner_name, legacy_runner=None):
+    """Return one runner's native session, migrating the legacy flat index.
+
+    Session identifiers are not portable across Codex, OpenCode, and Claude.
+    Keep a per-runner map while retaining the flat fields for older versions.
+    """
+    key = str(chat_id)
+    sessions = state.setdefault("runner_sessions", {}).setdefault(key, {})
+    legacy_sid = state.get("sessions", {}).get(key)
+    owner = state.get("session_runners", {}).get(key)
+    if legacy_sid and not owner:
+        owner = legacy_runner or runner_name
+        state.setdefault("session_runners", {})[key] = owner
+    if legacy_sid and owner and owner not in sessions:
+        sessions[owner] = legacy_sid
+    return sessions.get(runner_name)
+
+
+def store_runner_session(state, chat_id, runner_name, session_id):
+    """Persist a native session without overwriting other runners' sessions."""
+    if not session_id:
+        return
+    key = str(chat_id)
+    state.setdefault("runner_sessions", {}).setdefault(key, {})[
+        runner_name
+    ] = session_id
+    # Compatibility projection for older bridges and external state readers.
+    state.setdefault("sessions", {})[key] = session_id
+    state.setdefault("session_runners", {})[key] = runner_name
+
+
+def clear_runner_sessions(state, chat_id):
+    key = str(chat_id)
+    state.setdefault("sessions", {}).pop(key, None)
+    state.setdefault("session_runners", {}).pop(key, None)
+    state.setdefault("runner_sessions", {}).pop(key, None)
+
+
+def run_one(cfg, session_id, prompt, live=None):
+    """Run one configured runner through its declared CLI/server transport."""
+    rname = cfg.get("runner", "opencode")
+    mode = resolve_runner_mode(cfg, rname)
+    if mode == "cli":
+        return run_agent(cfg, session_id, prompt, live)
+    if mode != "server":
+        return session_id, None, f"unknown runner_mode {mode!r} (available: cli, server)"
+    adapter = SERVER_RUNNERS.get(rname)
+    if not adapter:
+        return (
+            session_id,
+            None,
+            f"runner {rname!r} has no server transport; use runner_mode='cli'",
+        )
+    if not adapter["healthy"](cfg):
+        where = f" at {server_url(cfg)}" if rname == "opencode" else ""
+        return (
+            session_id,
+            None,
+            f"{rname} server transport unavailable{where}; "
+            "start/install it or use runner_mode='cli'",
+        )
+    return adapter["run"](cfg, session_id, prompt, live)
+
+
+def run_with_fallbacks(cfg, session_id, prompt, live=None, result_meta=None):
     """Run the primary runner, failing over across runners on ANY failure.
 
     The bridge does not care how or why a runner broke — quota, dead
@@ -556,10 +620,12 @@ def run_with_fallbacks(cfg, session_id, prompt, live=None):
     """
     rname = cfg.get("runner", "opencode")
     model = resolve_model(cfg, rname)
-    new_sid, answer, err = run_agent(
+    new_sid, answer, err = run_one(
         dict(cfg, runner=rname, model=model), session_id, prompt, live
     )
     if answer is not None or (err or "") == CANCEL_MSG:
+        if result_meta is not None:
+            result_meta.update(runner=rname, model=model)
         return new_sid, answer, err
     kind = classify_run_error(err, cfg.get("quota_markers"))
     reason = "hit a limit" if kind == "quota" else "is unusable"
@@ -587,10 +653,18 @@ def run_with_fallbacks(cfg, session_id, prompt, live=None):
             if RUN_STATE.get("current"):
                 RUN_STATE["current"]["runner"] = step_runner
         step_cfg = dict(cfg, runner=step_runner, model=step_model)
-        new_sid, answer, err = run_agent(step_cfg, None, prompt, live)
+        try:
+            fallback_timeout = int(cfg.get("fallback_run_timeout_s", 0))
+        except (TypeError, ValueError):
+            fallback_timeout = 0
+        if fallback_timeout > 0:
+            step_cfg["run_timeout_s"] = min(run_timeout(cfg), fallback_timeout)
+        new_sid, answer, err = run_one(step_cfg, None, prompt, live)
         rname = step_runner
         tried.append((step_runner, step_model))
         if answer is not None:
+            if result_meta is not None:
+                result_meta.update(runner=step_runner, model=step_model)
             header = f"🔀 {tried[0][0]} {reason} — answered via {step_runner}"
             if step_model:
                 header += f" ({step_model})"
@@ -622,6 +696,14 @@ def runner_mode(cfg):
     if mode is None:
         return "server" if cfg.get("server_runner") else "cli"
     return str(mode).lower()
+
+
+def resolve_runner_mode(cfg, runner_name):
+    """Per-runner transport override with the legacy global mode as fallback."""
+    modes = cfg.get("runner_modes") or {}
+    if isinstance(modes, dict) and modes.get(runner_name):
+        return str(modes[runner_name]).lower()
+    return runner_mode(cfg)
 
 
 def server_url(cfg):
@@ -2080,7 +2162,7 @@ def worker(cfg, state):
             with STATE_LOCK:
                 run_cfg = effective_run_config(cfg, state)
             rname = run_cfg.get("runner", "opencode")
-            mode = runner_mode(run_cfg)
+            mode = resolve_runner_mode(run_cfg, rname)
             with RUN_LOCK:
                 RUN_STATE["busy"] = True
                 RUN_STATE["current"] = {
@@ -2091,7 +2173,12 @@ def worker(cfg, state):
                     "mode": mode,
                 }
             with STATE_LOCK:
-                session_id = state.get("sessions", {}).get(str(chat_id))
+                session_id = runner_session(
+                    state,
+                    chat_id,
+                    rname,
+                    legacy_runner=cfg.get("runner", "opencode"),
+                )
             outbox = outbox_dir(cfg)
             prompt = prompt + (
                 f"\n\n(To give files to the user, write them into {outbox}/ "
@@ -2133,38 +2220,15 @@ def worker(cfg, state):
                 f"chat={chat_id} run start (runner={rname}/{mode}, "
                 f"session={session_id}, q={PROMPT_Q.qsize()})"
             )
+            result_meta = {}
             try:
-                if mode == "server":
-                    adapter = SERVER_RUNNERS.get(rname)
-                    if not adapter:
-                        new_sid, answer, err = (
-                            session_id,
-                            None,
-                            f"runner {rname!r} has no server transport; "
-                            "use runner_mode='cli'",
-                        )
-                    elif not adapter["healthy"](cfg):
-                        where = f" at {server_url(cfg)}" if rname == "opencode" else ""
-                        new_sid, answer, err = (
-                            session_id,
-                            None,
-                            f"{rname} server transport unavailable{where}; "
-                            "start/install it or use runner_mode='cli'",
-                        )
-                    else:
-                        new_sid, answer, err = adapter["run"](
-                            run_cfg, session_id, prompt, live
-                        )
-                elif mode == "cli":
-                    new_sid, answer, err = run_with_fallbacks(
-                        run_cfg, session_id, prompt, live
-                    )
-                else:
-                    new_sid, answer, err = (
-                        session_id,
-                        None,
-                        f"unknown runner_mode {mode!r} (available: cli, server)",
-                    )
+                new_sid, answer, err = run_with_fallbacks(
+                    run_cfg,
+                    session_id,
+                    prompt,
+                    live,
+                    result_meta=result_meta,
+                )
             except Exception as e:
                 err = f"bridge error: {e}"
                 new_sid, answer = session_id, None
@@ -2173,14 +2237,24 @@ def worker(cfg, state):
                 with RUN_LOCK:
                     RUN_STATE["busy"] = False
                     RUN_STATE["current"] = None
-            if err and session_id and "failed rc=" in err and err != CANCEL_MSG:
+            if (
+                err
+                and session_id
+                and "failed rc=" in err
+                and not err.startswith("all runners exhausted")
+                and err != CANCEL_MSG
+            ):
                 live["trail"].append("♻️ stale session — retrying fresh")
-                new_sid, answer, err = run_with_fallbacks(run_cfg, None, prompt, live)
+                result_meta.clear()
+                new_sid, answer, err = run_with_fallbacks(
+                    run_cfg, None, prompt, live, result_meta=result_meta
+                )
             if live["status_id"]:
                 edit_status(cfg, live, final="✅ done" if not err else "🔴 failed")
             with STATE_LOCK:
-                if new_sid and new_sid != session_id:
-                    state.setdefault("sessions", {})[str(chat_id)] = new_sid
+                used_runner = result_meta.get("runner", rname)
+                if new_sid:
+                    store_runner_session(state, chat_id, used_runner, new_sid)
                 save_json(STATE_PATH, state)
             if err == CANCEL_MSG:
                 audit("run_cancelled", chat_id=chat_id)
@@ -2197,11 +2271,13 @@ def worker(cfg, state):
                 audit(
                     "run_done",
                     chat_id=chat_id,
+                    runner=used_runner,
                     chars=len(answer or ""),
                     secs=int(time.time() - live["start"]),
                 )
                 log(
-                    f"chat={chat_id} done ({len(answer or '')} chars, session={new_sid})"
+                    f"chat={chat_id} done ({len(answer or '')} chars, "
+                    f"runner={used_runner}, session={new_sid})"
                 )
         except Exception as e:
             log(f"worker item error: {e}")
@@ -2446,7 +2522,7 @@ def handle_update(cfg, state, upd, *, state_path=STATE_PATH):
         return
     if cmd == "/new":
         with STATE_LOCK:
-            state.setdefault("sessions", {}).pop(str(chat_id), None)
+            clear_runner_sessions(state, chat_id)
             if state_path is not None:
                 save_json(state_path, state)
         send(cfg["bot_token"], chat_id, "session cleared. next message starts fresh.")
@@ -2507,8 +2583,18 @@ def handle_update(cfg, state, upd, *, state_path=STATE_PATH):
         send(cfg["bot_token"], chat_id, "🛑 stopping current run…")
         return
     if cmd == "/status":
+        status_cfg = effective_run_config(cfg, state)
+        runner_name = status_cfg.get("runner", "opencode")
         with STATE_LOCK:
-            info = state.get("sessions", {}).get(str(chat_id)) or "(none)"
+            info = (
+                runner_session(
+                    state,
+                    chat_id,
+                    runner_name,
+                    legacy_runner=cfg.get("runner", "opencode"),
+                )
+                or "(none)"
+            )
             pending = sum(
                 1 for e in state.get("at", {}).values() if e.get("chat_id") == chat_id
             )
@@ -2523,9 +2609,7 @@ def handle_update(cfg, state, upd, *, state_path=STATE_PATH):
         cur = ""
         if c:
             cur = f"\nrunning: {c['prompt']}… ({int(time.time() - c['since'])}s)"
-        status_cfg = effective_run_config(cfg, state)
-        runner_name = status_cfg.get("runner", "opencode")
-        mode = runner_mode(status_cfg)
+        mode = resolve_runner_mode(status_cfg, runner_name)
         capability = (SERVER_RUNNERS.get(runner_name) or {}).get("feature")
         mode_label = (
             f"{mode}: {capability}" if mode == "server" and capability else mode
@@ -2737,7 +2821,7 @@ def doctor_report():
     report["state"] = {"writable": state_writable}
 
     rname = cfg.get("runner", "opencode")
-    mode = runner_mode(cfg)
+    mode = resolve_runner_mode(cfg, rname)
     runner_check = {"name": rname, "mode": mode, "ok": False}
     try:
         if rname not in RUNNERS:
@@ -2757,15 +2841,27 @@ def doctor_report():
     report["runner"] = runner_check
     fallback_checks = []
     for step_runner, step_model in fallback_chain(cfg):
+        step_mode = resolve_runner_mode(cfg, step_runner)
         check = {
             "runner": step_runner,
             "model": step_model or "runner default",
+            "mode": step_mode,
             "ok": False,
         }
         try:
             if step_runner not in RUNNERS:
                 raise RunnerError(f"unknown runner {step_runner!r}")
             RUNNERS[step_runner](None, "doctor", step_model or None)
+            if step_mode == "server":
+                adapter = SERVER_RUNNERS.get(step_runner)
+                if not adapter:
+                    raise RunnerError(
+                        f"runner {step_runner!r} has no server transport"
+                    )
+                if not adapter["healthy"](dict(cfg, runner=step_runner)):
+                    raise RunnerError("server transport unavailable")
+            elif step_mode != "cli":
+                raise RunnerError(f"unknown runner_mode {step_mode!r}")
             check["ok"] = True
         except Exception as e:
             check["error"] = str(e)[:200]
@@ -2890,7 +2986,7 @@ def run(cfg):
             warn = f"⚠️ startup check: {e} — commands work, runs will error"
         except Exception as e:
             log(f"startup runner check: {e}")
-    mode = runner_mode(cfg)
+    mode = resolve_runner_mode(cfg, rname)
     if not warn and mode not in ("cli", "server"):
         warn = f"⚠️ unknown runner_mode {mode!r} (available: cli, server)"
     if not warn and mode == "server":
