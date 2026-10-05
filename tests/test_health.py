@@ -6,6 +6,7 @@ from tgbridge_core.health import (
     classify_network_error,
     proxy_diagnostics,
     redact_proxy_url,
+    systemd_notify,
 )
 
 
@@ -41,6 +42,29 @@ class HealthTests(unittest.TestCase):
         )
         error = urllib.error.URLError(ConnectionRefusedError(61, "refused"))
         self.assertEqual(classify_network_error(error, info), "proxy_refused")
+
+    def test_notify_is_optional_and_nonblocking(self):
+        import os
+        with mock.patch.dict(os.environ, {'NOTIFY_SOCKET': ''}):
+            self.assertFalse(systemd_notify('WATCHDOG=1'))
+        sender = mock.MagicMock()
+        with mock.patch.dict(os.environ, {'NOTIFY_SOCKET': '@fixture', 'WATCHDOG_PID': str(os.getpid())}), \
+             mock.patch('tgbridge_core.health.socket.socket') as factory:
+            factory.return_value.__enter__.return_value = sender
+            self.assertTrue(systemd_notify('WATCHDOG=1'))
+        sender.setblocking.assert_called_once_with(False)
+        sender.connect.assert_called_once_with('\0fixture')
+        sender.send.assert_called_once_with(b'WATCHDOG=1')
+
+    def test_notify_failure_and_child_pid_do_not_break_bridge(self):
+        import os
+        with mock.patch.dict(os.environ, {'NOTIFY_SOCKET': '/missing', 'WATCHDOG_PID': str(os.getpid())}), \
+             mock.patch('tgbridge_core.health.socket.socket', side_effect=OSError):
+            self.assertFalse(systemd_notify('WATCHDOG=1'))
+        with mock.patch.dict(os.environ, {'NOTIFY_SOCKET': '/fixture', 'WATCHDOG_PID': '-1'}), \
+             mock.patch('tgbridge_core.health.socket.socket') as factory:
+            self.assertFalse(systemd_notify('WATCHDOG=1'))
+            factory.assert_not_called()
 
     def test_bypassed_dead_proxy_is_not_blamed(self):
         info = {

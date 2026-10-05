@@ -1,10 +1,35 @@
 """Cross-platform proxy inspection and network error classification."""
 
+import os
 import socket
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+def systemd_notify(message):
+    """Optional nonblocking sd_notify, adapted from Hermes gateway/systemd_notify.py.
+
+    Main-loop heartbeats let systemd restart a live but wedged bridge. No
+    timer, dependency or separate supervisor; noop outside a managed service.
+    """
+    address = os.environ.get("NOTIFY_SOCKET", "").strip()
+    if not address or not hasattr(socket, "AF_UNIX"):
+        return False
+    pid = os.environ.get("WATCHDOG_PID")
+    if pid and pid != str(os.getpid()):
+        return False  # agent child imports must not feed its parent's watchdog
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sender:
+            sender.setblocking(False)
+            sender.connect(address)
+            sender.send(message.encode("utf-8"))
+        return True
+    except (OSError, UnicodeError, ValueError):
+        return False
+
 
 def now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")

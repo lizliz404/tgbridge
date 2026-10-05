@@ -24,6 +24,7 @@ import os
 import queue
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -43,6 +44,7 @@ from tgbridge_core.health import (
     classify_network_error,
     now_iso,
     proxy_diagnostics,
+    systemd_notify,
 )
 from tgbridge_core.storage import ensure_private_dir, load_json, save_json
 from tgbridge_core.runners import (
@@ -455,6 +457,15 @@ def deliverable_answer(live, answer):
     return answer or ""
 
 
+def telegram_session_name(chat_id, bot_username=None):
+    """Origin label inside the agent's native session store, not a new store."""
+    parts = ["Telegram", socket.gethostname()]
+    if bot_username:
+        parts.append("@" + str(bot_username).lstrip("@"))
+    parts.append(f"chat {chat_id}")
+    return " · ".join(parts)
+
+
 def run_agent(cfg, session_id, prompt, live=None):
     """Stream the runner's JSON events live (Popen).
 
@@ -471,6 +482,14 @@ def run_agent(cfg, session_id, prompt, live=None):
         )
     try:
         cmd, parse = runner_fn(session_id, prompt, cfg.get("model"))
+        name = cfg.get("session_name")
+        if name and rname == "pi":
+            cmd[1:1] = ["--name", name]
+        elif name and rname == "opencode" and not session_id:
+            if "--title" in cmd:
+                cmd[cmd.index("--title") + 1] = name
+            else:
+                cmd[1:1] = ["--title", name]
         cmd = apply_runner_policy(rname, cmd, cfg)
     except RunnerError as e:
         return session_id, None, str(e)
@@ -2255,6 +2274,8 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
         live["thinking"] = ""
     try:
         command = [pi_binary(), "--mode", "rpc"]
+        if cfg.get("session_name"):
+            command += ["--name", cfg["session_name"]]
         if sid:
             command += ["--session-id", sid]
         model = resolve_model(cfg, "pi")
@@ -2799,6 +2820,7 @@ def worker(cfg, state):
             chat_id, message_id, prompt = unpack_entry(entry)
             with STATE_LOCK:
                 run_cfg = effective_run_config(cfg, state)
+            run_cfg["session_name"] = telegram_session_name(chat_id, state.get("bot_username"))
             rname = run_cfg.get("runner", "opencode")
             mode = resolve_runner_mode(run_cfg, rname)
             with RUN_LOCK:
@@ -2940,6 +2962,11 @@ def worker(cfg, state):
             if chat_id:
                 send(cfg["bot_token"], chat_id, f"⚠️ bridge error: {e}")
         finally:
+            # Early errors (status/reaction/setup) must not leave a phantom
+            # busy run which keeps subsequent input waiting for live steering.
+            with RUN_LOCK:
+                RUN_STATE["busy"] = False
+                RUN_STATE["current"] = None
             try:
                 outbox = outbox_dir(cfg)
                 for fn in sorted(os.listdir(outbox)):
@@ -3554,6 +3581,7 @@ def on_stop(signum, frame):
 
 
 def run(cfg):
+    systemd_notify("WATCHDOG=1")
     update_health(
         status="starting",
         pid=os.getpid(),
@@ -3566,6 +3594,7 @@ def run(cfg):
         state.pop("hints", None)
     me = None
     for attempt in range(1, 6):
+        systemd_notify("WATCHDOG=1")
         me = api(cfg["bot_token"], "getMe")
         if me and me.get("ok"):
             break
@@ -3584,8 +3613,10 @@ def run(cfg):
             if e.code == 401:
                 sys.exit("getMe failed: bad token (401 Unauthorized)")
             log(f"getMe attempt {attempt}/5 transient http {e.code}, retrying")
+        except BridgeStop:
+            raise
         except Exception as e:
-            log(f"getMe attempt {attempt}/5 transient {type(e).__name__}: {e}")
+            log(f"getMe attempt {attempt}/5 transient {type(e).__name__}")
         me = None
         time.sleep(3)
     if not me or not me.get("ok"):
@@ -3670,7 +3701,11 @@ def run(cfg):
         failure_exit_threshold = max(0, int(cfg.get("poll_failure_exit_threshold", 20)))
     except (TypeError, ValueError):
         failure_exit_threshold = 20
+    systemd_notify("READY=1\nSTATUS=Telegram bridge polling")
     while True:
+        # Feed only from this control loop, never an independent timer which
+        # would falsely report a wedged poll/handler as healthy (Hermes pattern).
+        systemd_notify("WATCHDOG=1")
         if not worker_t.is_alive():
             log("worker thread died — respawning")
             audit("worker_respawn")
@@ -3740,6 +3775,7 @@ def main():
     try:
         run(cfg)
     except BridgeStop:
+        systemd_notify("STOPPING=1")
         update_health(status="stopped", stopped_at=now_iso())
         with RUN_LOCK:
             p = RUN_STATE.get("proc")

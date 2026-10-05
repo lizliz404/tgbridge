@@ -9,7 +9,7 @@ long-poll in, local CLI agent out.
 ## Features
 
 - **DM + group chats** — groups are mention-triggered (@bot or reply-to-bot), DMs always answer
-- **Per-chat sessions** — each chat maps to one native runner session (`/new` forgets the mapping, `/status` inspects it)
+- **Per-chat sessions** — each chat maps to one native runner session (`/new` forgets the mapping, `/status` inspects it). Pi CLI/RPC sessions receive a native display name `Telegram · hostname · @bot · chat ID` on creation/resume; new OpenCode CLI sessions receive the same title. Storage locations and native IDs remain unchanged
 - **Agent failover + switching** — any failed CLI or server-mode run (quota, dead binary, broken network, timeout, empty answer) automatically walks `runner_fallbacks` with a fresh runner-native session and a one-line 🔀 header; only user cancel stops the chain. The same runner may appear repeatedly with different models, so a dead model/provider rotates without mixing Codex/OpenCode/Pi session IDs. `auto:opencode-go` discovers the current Go catalog and expands to the newest Muse Spark Contributor followed by the newest GLM, so model-version bumps do not require config edits. `/runners` shows the resolved chain and on-device availability probe; `/runner <name> [model]` switches the global primary without restarting (`/runner default` restores file config)
 - **Same-turn steering where supported** — Codex app-server uses `turn/steer`; OpenCode server mode uses `prompt_async`; Pi runs on its native RPC transport (`steer`, consumed after the current tool batch and before the next model request—not after the whole task). Live same-chat text bypasses idle burst debounce; injection is submitted before the Telegram acknowledgement, so a slow/rate-limited send cannot gate it. Inputs received during Pi/Codex startup wait for the live transport instead of being queued behind the whole run. Active tools are not cancelled
 - **Burst coalescing** — adjacent Telegram messages are held briefly and merged, so automatic 4096-character splits do not become many separate agent runs
@@ -71,8 +71,17 @@ Linux (systemd user service):
 cp systemd/tgbridge.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now tgbridge
+# Keep the user service running after logout and start it at boot:
+sudo loginctl enable-linger "$USER"
 journalctl --user -u tgbridge -f
 ```
+
+The Linux unit uses native systemd supervision: 5s restart, no restart-limit
+lockout, 300s main-loop watchdog, 20s stop deadline, and cgroup child cleanup.
+A progressing network-retry loop still feeds the watchdog; a wedged control
+loop does not. Installing the updated unit and restarting is required—updating
+Python alone does not enable the watchdog. Native sessions remain persistent,
+but in-memory queued inputs are not guaranteed to survive a bridge restart.
 
 macOS (launchd):
 

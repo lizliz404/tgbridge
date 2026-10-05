@@ -144,6 +144,19 @@ class Crosscheck(unittest.TestCase):
         self.assertNotIn('--session-dir', command)
         self.assertNotIn('--no-session', command)
 
+    def test_telegram_origin_is_native_pi_session_name(self):
+        with mock.patch.object(tgbridge.socket, 'gethostname', return_value='fixture-host'):
+            name = tgbridge.telegram_session_name(42, 'fixture_bot')
+        self.assertEqual(name, 'Telegram · fixture-host · @fixture_bot · chat 42')
+        with FakePiFixture(self) as fixture:
+            real_popen = tgbridge.subprocess.Popen
+            with mock.patch.object(tgbridge.subprocess, 'Popen', wraps=real_popen) as popen:
+                tgbridge.run_pi_rpc({'bot_token': 'fixture', 'workdir': fixture.tmp.name, 'session_name': name}, 'native-id', 'go')
+            command = popen.call_args.args[0]
+        self.assertEqual(command[command.index('--name') + 1], name)
+        self.assertNotIn('--session-dir', command)
+        self.assertNotIn('--no-session', command)
+
     def test_retry_is_chunk_local_and_never_replays_earlier_chunks(self):
         calls = []
         def api(token, method, _error=None, **params):
