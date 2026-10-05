@@ -59,7 +59,7 @@ def run_selftest(app):
     def fake_api(token, method, **params):
         sent.append(params)
         if params.get("parse_mode") == "HTML" and "<b>" in params["text"]:
-            return None  # simulate Telegram rejecting the entity
+            return {"ok": False, "error_code": 400, "description": "can't parse entities"}
         return {"ok": True}
 
     orig_api = api

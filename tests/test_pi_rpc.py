@@ -82,6 +82,8 @@ def handle(command):
         emit({"type": "agent_settled"})
     elif kind == "steer":
         respond(command["id"], "steer", {"disposition": "queued"})
+        emit({"type": "message_end", "message": {
+            "role": "user", "content": command["message"]}})
     elif kind == "clear_queue":
         respond(command["id"], "clear_queue", {"steering": [], "followUp": []})
     elif kind == "abort":
@@ -224,11 +226,11 @@ class PiRpcTransportTests(unittest.TestCase):
         self.assertIsNone(self.sent[1]["reply_to"])
         self.assertTrue(live["streamed"])
         self.assertEqual(answer, "first segment\n\nsecond segment")
-        self.assertIn("🔧 bash: ls -la /tmp", live["trail"])
-        self.assertEqual(live["trail"].count("🔧 bash: ls -la /tmp"), 1)
+        self.assertIn("🔧 bash", live["trail"])
+        self.assertEqual(live["trail"].count("🔧 bash"), 1)
         self.assertEqual(live["tokens"], 18)
         self.assertAlmostEqual(live["cost"], 0.03)
-        # Thinking never leaks into a chat message; it stays in the status line.
+        # Thinking is private: neither replies nor status lines may expose it.
         self.assertEqual(live["thinking"], "")
         self.assertNotIn("weighing options", " ".join(m["text"] for m in self.sent))
 

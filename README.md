@@ -11,7 +11,7 @@ long-poll in, local CLI agent out.
 - **DM + group chats** — groups are mention-triggered (@bot or reply-to-bot), DMs always answer
 - **Per-chat sessions** — each chat maps to one native runner session (`/new` forgets the mapping, `/status` inspects it)
 - **Agent failover + switching** — any failed CLI or server-mode run (quota, dead binary, broken network, timeout, empty answer) automatically walks `runner_fallbacks` with a fresh runner-native session and a one-line 🔀 header; only user cancel stops the chain. The same runner may appear repeatedly with different models, so a dead model/provider rotates without mixing Codex/OpenCode/Pi session IDs. `auto:opencode-go` discovers the current Go catalog and expands to the newest Muse Spark Contributor followed by the newest GLM, so model-version bumps do not require config edits. `/runners` shows the resolved chain and on-device availability probe; `/runner <name> [model]` switches the global primary without restarting (`/runner default` restores file config)
-- **Same-turn steering where supported** — Codex app-server uses `turn/steer`; OpenCode server mode uses `prompt_async`; Pi runs on its native RPC transport (`steer`, delivered after the current tool call). The bridge acknowledges the nuance immediately, then injects it without cancelling the active tool
+- **Same-turn steering where supported** — Codex app-server uses `turn/steer`; OpenCode server mode uses `prompt_async`; Pi runs on its native RPC transport (`steer`, consumed after the current tool batch and before the next model request—not after the whole task). Live same-chat text bypasses idle burst debounce; injection is submitted before the Telegram acknowledgement, so a slow/rate-limited send cannot gate it. Inputs received during Pi/Codex startup wait for the live transport instead of being queued behind the whole run. Active tools are not cancelled
 - **Burst coalescing** — adjacent Telegram messages are held briefly and merged, so automatic 4096-character splits do not become many separate agent runs
 - **Inbound photos + documents** — downloaded privately and passed as local paths; an unaddressed group upload is retained for the next @mention/reply, so the file itself needs no tag
 - **Live progress** — one status message, edited in place: elapsed seconds, real-time tool-call trail, and answer tail, read from CLI stdout or the server's persisted transcript
@@ -231,9 +231,9 @@ The bridge drives any of three agent CLIs (config key `runner`):
 
 | runner | non-interactive | resume | notes |
 |---|---|---|---|
-| `opencode` | `opencode run --format json` | `--session` | default; live tool trail + thinking + cost |
+| `opencode` | `opencode run --format json` | `--session` | default; live tool names + cost |
 | `codex` | `codex exec --json` or app-server | native thread resume | use `runner_mode: "server"` for true same-turn steering; set `CODEX_BIN` if needed |
-| `pi` | `pi --mode json` (or `--mode rpc` in server mode) | `--session-id` | native JSON events, tool trail, thinking, token and cost metadata; `runner_modes: {"pi": "server"}` adds per-segment Telegram messages and live `steer`; set `PI_BIN` if needed |
+| `pi` | `pi --mode json` (or `--mode rpc` in server mode) | `--session-id` | native JSON events, tool names, token and cost metadata; private thinking and raw tool arguments are never shown in status messages; `runner_modes: {"pi": "server"}` adds per-segment Telegram messages and live `steer`; set `PI_BIN` if needed |
 
 ### Codex permission mode
 

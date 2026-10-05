@@ -163,7 +163,8 @@ def api(token, method, _error=None, **params):
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")
             if _error is not None:
-                _error.update(kind=classify_network_error(e), message=f"HTTP {e.code}")
+                _error.update(kind=classify_network_error(e), message=f"HTTP {e.code}",
+                              code=e.code, description=body[:300])
             if e.code == 409:
                 log(
                     "409 CONFLICT: another poller holds this bot token — is an old bridge still running?"
@@ -178,12 +179,13 @@ def api(token, method, _error=None, **params):
                 except json.JSONDecodeError:
                     time.sleep(3)
                 continue
-            log(f"api {method} http {e.code}: {body[:150]}")
+            log(f"api {method} http {e.code}")
             return None
         except Exception as e:
             if _error is not None:
-                _error.update(kind=classify_network_error(e), message=str(e)[:200])
-            log(f"api {method} error: {type(e).__name__}: {e}")
+                _error.update(kind=classify_network_error(e), message=type(e).__name__)
+            # urllib exceptions may contain the request URL (and bot token).
+            log(f"api {method} error: {type(e).__name__}")
             return None
     return None
 
@@ -220,37 +222,57 @@ def send(token, chat_id, text, reply_to=None, chunk_limit=CHUNK):
             params["parse_mode"] = "HTML"
         if i == 0 and reply_to:
             params["reply_parameters"] = json.dumps({"message_id": reply_to})
-        res = api(token, "sendMessage", **params) if "parse_mode" in params else None
-        if not res or not res.get("ok"):
-            log("html send failed — resending chunk as plain text")
-            params.pop("parse_mode", None)
-            params.pop("link_preview_options", None)
-            params["text"] = _strip_html_markup(chunk) or chunk
-            res = api(token, "sendMessage", **params)
+        # Adapt Hermes Telegram adapter.send: retries belong to the current
+        # chunk, never the whole message; plain fallback is for parse errors
+        # only. Ambiguous read timeouts may have sent, so do not retry them.
+        res = None
+        for attempt in (1, 2):
+            error = {}
+            if "parse_mode" not in params:
+                params["text"] = _strip_html_markup(chunk) or chunk
+            res = api(token, "sendMessage", _error=error, **params)
+            if res and res.get("ok"):
+                break
+            code = error.get("code") or (res or {}).get("error_code")
+            description = (error.get("description") or
+                           (res or {}).get("description") or "").lower()
+            if code == 400 and any(s in description for s in ("parse", "entity", "too long")):
+                if "parse_mode" in params:
+                    params.pop("parse_mode", None)
+                    params["text"] = _strip_html_markup(chunk) or chunk
+                    res = api(token, "sendMessage", **params)
+                    break
+            if code == 400 and "message to be replied not found" in description:
+                if "reply_parameters" in params:
+                    params.pop("reply_parameters", None)
+                    continue
+            if attempt == 1 and (code == 429 or code in (500, 502, 503, 504)
+                    or error.get("kind") in ("connection_refused", "proxy_refused", "dns")):
+                time.sleep(2)
+                continue
+            break
         if not res or not res.get("ok"):
             ok = False
     return ok
 
 
 def send_retry(cfg, chat_id, text, reply_to=None):
-    """One retry with backoff for must-not-lose payloads (the run's answer).
+    """Send with per-chunk retries and preserve any unconfirmed payload.
 
-    A failed sendMessage otherwise silently deletes a 6-minute agent run. If
-    both attempts fail: audit + log loudly + persist to undelivered/ so the
-    content survives even though Telegram never saw it."""
+    Do not retry the whole answer: already delivered chunks would duplicate.
+    Generic read timeouts are ambiguous, matching Hermes's retry policy.
+    """
     limit = cfg.get("chunk") or CHUNK
-    for attempt in (1, 2):
-        if send(cfg["bot_token"], chat_id, text, reply_to=reply_to, chunk_limit=limit):
-            return True
-        if attempt == 1:
-            time.sleep(2)
+    if send(cfg["bot_token"], chat_id, text, reply_to=reply_to, chunk_limit=limit):
+        return True
     audit("delivery_failed", chat_id=chat_id, chars=len(text or ""))
-    log(f"chat={chat_id} DELIVERY FAILED after retry ({len(text or '')} chars)")
+    log(f"chat={chat_id} DELIVERY UNCONFIRMED ({len(text or '')} chars)")
     try:
         d = os.path.join(CONFIG_DIR, "undelivered")
         ensure_private_dir(d)
-        path = os.path.join(d, time.strftime("%Y%m%d-%H%M%S") + f"-{chat_id}.txt")
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        import tempfile
+
+        fd, path = tempfile.mkstemp(prefix=f"{chat_id}-", suffix=".txt", dir=d)
         with os.fdopen(fd, "w") as f:
             f.write(text or "")
         os.chmod(path, 0o600)
@@ -394,14 +416,15 @@ def edit_status(cfg, live, final=None):
             extra += f" · {live['tokens'] or 0} tok · ${live['cost']:.4f}"
         text = f"{final} · {elapsed}s · {len(live['trail'])} tool calls{extra}"
     else:
-        trail = "\n".join(live["trail"][-5:])
+        # Apply the same privacy boundary to CLI and fallback transports.
+        trail = "\n".join(
+            line.split(": ", 1)[0] if line.startswith("🔧 ") else line
+            for line in live["trail"][-5:]
+        )
         text = f"⚙️ working… {elapsed}s\n{trail}"
         notes = live.get("notes") or []
         if notes:
             text += "\n" + "\n".join(notes[-2:])
-        thinking = (live.get("thinking") or "").strip().replace("\n", " ")
-        if thinking:
-            text += f"\n💭 …{thinking[-200:]}"
         preview = (live.get("preview") or "").strip().replace("\n", " ")
         if preview:
             text += f"\n💬 …{preview[-200:]}"
@@ -423,6 +446,10 @@ def deliverable_answer(live, answer):
     conversation. Anything else — CLI runs, and server runs that fell back to
     another runner — returns the answer unchanged.
     """
+    # Hermes gateway/run.py: suppress only content confirmed delivered, not
+    # merely because some intermediate commentary reached the chat.
+    if (live or {}).get("missing_segments"):
+        return "\n\n".join(live["missing_segments"])
     if (live or {}).get("streamed"):
         return None
     return answer or ""
@@ -658,6 +685,7 @@ def run_with_fallbacks(cfg, session_id, prompt, live=None, result_meta=None):
         # Each attempt owns its own delivery state: a streamed Pi run that
         # dies must not make a fallback answer look already-delivered.
         live["streamed"] = False
+        live["missing_segments"] = []
     new_sid, answer, err = run_one(
         dict(cfg, runner=rname, model=model), session_id, prompt, live
     )
@@ -690,9 +718,11 @@ def run_with_fallbacks(cfg, session_id, prompt, live=None, result_meta=None):
         with RUN_LOCK:
             if RUN_STATE.get("current"):
                 RUN_STATE["current"]["runner"] = step_runner
+                RUN_STATE["current"]["mode"] = resolve_runner_mode(cfg, step_runner)
         step_cfg = dict(cfg, runner=step_runner, model=step_model)
         if live is not None:
             live["streamed"] = False
+            live["missing_segments"] = []
         try:
             fallback_timeout = int(cfg.get("fallback_run_timeout_s", 0))
         except (TypeError, ValueError):
@@ -702,13 +732,15 @@ def run_with_fallbacks(cfg, session_id, prompt, live=None, result_meta=None):
         new_sid, answer, err = run_one(step_cfg, None, prompt, live)
         rname = step_runner
         tried.append((step_runner, step_model))
+        if err == CANCEL_MSG:
+            return new_sid, answer, err
         if answer is not None:
             if result_meta is not None:
                 result_meta.update(runner=step_runner, model=step_model)
             header = f"🔀 {tried[0][0]} {reason} — answered via {step_runner}"
             if step_model:
                 header += f" ({step_model})"
-            return new_sid, header + "\n\n" + answer, None
+            return new_sid, header + "\n\n" + answer, err
     chain = " -> ".join(r for r, _ in tried)
     return session_id, None, f"all runners exhausted ({chain}): {err}"
 
@@ -830,7 +862,8 @@ def _begin_steer(chat_id):
     """Reserve a supported same-chat steer without racing run completion."""
     with RUN_LOCK:
         cur = RUN_STATE.get("current")
-        if not (RUN_STATE.get("busy") and cur and cur.get("chat") == chat_id):
+        if not (RUN_STATE.get("busy") and cur and cur.get("chat") == chat_id
+                and not RUN_STATE.get("cancel")):
             return None
         thread_id = RUN_STATE.get("codex_thread_id")
         turn_id = RUN_STATE.get("codex_turn_id")
@@ -872,6 +905,7 @@ def should_steer(chat_id):
             RUN_STATE.get("busy")
             and cur
             and cur.get("chat") == chat_id
+            and not RUN_STATE.get("cancel")
             and (
                 (RUN_STATE.get("pi_sid") and RUN_STATE.get("pi_run_id"))
                 or (RUN_STATE.get("server_sid") and RUN_STATE.get("server_api") == "v2")
@@ -2028,7 +2062,7 @@ def _pi_rpc_read_events(stream, events):
         events.put(None)
 
 
-def _pi_rpc_wait_response(events, request_id, timeout=30, keep=None):
+def _pi_rpc_wait_response(events, request_id, timeout=30, keep=None, proc=None):
     """Wait for one command response; session events are kept aside, not lost."""
     deadline = time.monotonic() + timeout
     while True:
@@ -2045,7 +2079,10 @@ def _pi_rpc_wait_response(events, request_id, timeout=30, keep=None):
             if not event.get("success", False):
                 raise RuntimeError(str(event.get("error") or "command failed")[:600])
             return event.get("data") or {}
-        if keep is not None:
+        if event.get("type") == "extension_ui_request" and proc is not None:
+            # session_start/input extensions can block *before* the command ack.
+            _pi_rpc_decline_ui(proc, event)
+        elif keep is not None:
             keep.append(event)
 
 
@@ -2096,6 +2133,10 @@ def _pi_send_segment(cfg, live, text, first=False):
     """Deliver one completed assistant segment as its own chat message."""
     chat_id = live.get("chat_id")
     if chat_id is None:
+        return False
+    # If one segment failed, keep the following ones for the final delivery;
+    # otherwise recovering connectivity could show later text before the hole.
+    if live.get("missing_segments"):
         return False
     return send_retry(
         cfg,
@@ -2157,11 +2198,19 @@ def _pi_handle_steer_response(cfg, event, run_id):
     if not isinstance(request_id, str) or not request_id.startswith("steer-"):
         return False
     with RUN_LOCK:
-        meta = RUN_STATE.setdefault("pi_steers", {}).pop(request_id, None)
-        if meta and RUN_STATE.get("pi_run_id") == run_id:
+        steers = RUN_STATE.setdefault("pi_steers", {})
+        meta = steers.get(request_id)
+        if meta and RUN_STATE.get("pi_run_id") == run_id and not meta.get("acknowledged"):
+            meta["acknowledged"] = True
             RUN_STATE["steer_pending"] = max(0, RUN_STATE.get("steer_pending", 1) - 1)
             if event.get("success", False):
                 RUN_STATE["steer_count"] = RUN_STATE.get("steer_count", 0) + 1
+            if (not event.get("success", False)
+                    or (event.get("data") or {}).get("disposition") == "handled"
+                    or meta.get("consumed")):
+                steers.pop(request_id, None)
+        else:
+            meta = None
     if not meta:
         return True
     if not event.get("success", False):
@@ -2192,7 +2241,6 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
     errbuf = []
     early_events = []
     segments = []
-    thinking = ""
     tokens = 0
     cost = 0.0
     turn_error = None
@@ -2201,8 +2249,10 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
     handled = False
     run_id = None
     queued_steers = 0
-    delivered_any = False
     stream_broken = False
+    if live is not None:
+        live["missing_segments"] = []
+        live["thinking"] = ""
     try:
         command = [pi_binary(), "--mode", "rpc"]
         if sid:
@@ -2219,6 +2269,7 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
             cwd=cfg["workdir"],
             start_new_session=True,
             bufsize=1,
+            encoding="utf-8",
         )
         assert proc.stdout and proc.stderr
         threading.Thread(
@@ -2244,7 +2295,7 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
         try:
             state = _pi_rpc_wait_response(
                 events, PI_RPC_STATE_CMD, timeout=PI_RPC_SETUP_TIMEOUT,
-                keep=early_events,
+                keep=early_events, proc=proc,
             )
         except RuntimeError as e:
             log(f"pi rpc get_state: {e}")
@@ -2261,7 +2312,8 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
             proc, {"id": PI_RPC_PROMPT_CMD, "type": "prompt", "message": prompt}
         )
         accepted = _pi_rpc_wait_response(
-            events, PI_RPC_PROMPT_CMD, timeout=PI_RPC_PROMPT_TIMEOUT, keep=early_events
+            events, PI_RPC_PROMPT_CMD, timeout=PI_RPC_PROMPT_TIMEOUT,
+            keep=early_events, proc=proc
         )
         handled = (accepted.get("disposition") or "") == "handled"
 
@@ -2295,33 +2347,29 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
             elif etype == "message_update":
                 update = event.get("assistantMessageEvent") or {}
                 utype = update.get("type")
-                if utype == "thinking_delta" and update.get("delta"):
-                    thinking += update["delta"]
-                    if live is not None:
-                        live["thinking"] = thinking
-                        edit_status(cfg, live)
-                elif utype == "thinking_end":
-                    thinking = update.get("content") or thinking
-                    if live is not None:
-                        live["thinking"] = thinking
-                        edit_status(cfg, live)
-                elif utype == "error":
+                # Private reasoning is not a user-facing progress channel.
+                if utype == "error":
                     turn_error = str(
                         update.get("error") or update.get("reason") or "stream error"
                     )[-600:]
             elif etype == "tool_execution_start":
                 if live is not None:
-                    live["trail"].append(
-                        trail_line(
-                            {
-                                "tool": event.get("toolName", "?"),
-                                "state": {"input": event.get("args") or {}},
-                            }
-                        )
-                    )
+                    live["trail"].append(f"🔧 {event.get('toolName', '?')}")
                     edit_status(cfg, live)
             elif etype == "message_end":
                 message = event.get("message") or {}
+                if message.get("role") == "user":
+                    # An RPC steer ack means queued, not consumed. Only its
+                    # user message proves the running agent received it.
+                    text = _pi_message_text(message)
+                    with RUN_LOCK:
+                        for request_id, meta in list(RUN_STATE.get("pi_steers", {}).items()):
+                            if not meta.get("consumed") and meta["text"].strip() == text:
+                                meta["consumed"] = True
+                                if meta.get("acknowledged"):
+                                    RUN_STATE["pi_steers"].pop(request_id, None)
+                                break
+                    continue
                 if message.get("role") != "assistant":
                     continue
                 usage = message.get("usage") or {}
@@ -2332,7 +2380,8 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
                     turn_error = str(
                         message.get("errorMessage") or f"Pi stopped with {stop_reason}"
                     )[-600:]
-                thinking = ""
+                else:
+                    turn_error = None
                 if live is not None:
                     live["thinking"] = ""
                 text = _pi_message_text(message)
@@ -2342,14 +2391,12 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
                 if live is None:
                     continue
                 if _pi_send_segment(cfg, live, text, first=len(segments) == 1):
-                    delivered_any = True
-                    live["streamed"] = True
+                    live["streamed"] = not stream_broken
                     live["preview"] = ""
-                elif delivered_any:
-                    # Earlier segments are already in the chat: do not mark the
-                    # answer delivered, so the worker re-sends the full text
-                    # instead of leaving a hole in the middle of the reply.
+                else:
+                    # Sticky failure: later success cannot hide a missing segment.
                     stream_broken = True
+                    live["missing_segments"].append(text)
                     live["streamed"] = False
             elif etype == "queue_update":
                 pending = len(event.get("steering") or [])
@@ -2362,10 +2409,13 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
                     )
                     live.setdefault("notes", []).append(note)
                     edit_status(cfg, live)
-            elif etype == "auto_retry_end" and not event.get("success", True):
-                turn_error = str(event.get("finalError") or "auto retry failed")[-600:]
+            elif etype == "auto_retry_end":
+                turn_error = (None if event.get("success", True) else
+                              str(event.get("finalError") or "auto retry failed")[-600:])
             elif etype == "agent_settled":
                 settled = True
+                with RUN_LOCK:
+                    RUN_STATE["pi_sid"] = None
 
         # A steer acknowledgement can land just before agent_settled; drain the
         # queue before concluding that an injection was never accepted.
@@ -2378,20 +2428,27 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
                 _pi_handle_steer_response(cfg, event, run_id)
 
         with RUN_LOCK:
+            RUN_STATE["pi_sid"] = None
             outstanding = list(RUN_STATE.get("pi_steers", {}).values())
             RUN_STATE["pi_steers"] = {}
             RUN_STATE["steer_pending"] = 0
             cancelled = bool(RUN_STATE.pop("cancel", False)) or cancelled
         for meta in outstanding:
-            _steer_fallback(cfg, meta, "Pi RPC closed before steer acknowledgement")
+            if not cancelled and not meta.get("consumed"):
+                _steer_fallback(cfg, meta, "Pi RPC closed before steering was consumed")
 
         if live is not None:
             live["tokens"] = tokens
             live["cost"] = cost
         answer = "\n\n".join(segments).strip()
-        if stream_broken and answer:
-            answer = "(complete answer — earlier segments were already sent)\n\n" + answer
         delivered = bool(live is not None and live.get("streamed"))
+        if live is not None and live.get("missing_segments"):
+            if timeout_reason:
+                live["missing_segments"].append(f"⚠️ (partial — hit the {timeout_reason} timeout)")
+            elif cancelled:
+                live["missing_segments"].append("🛑 (cancelled — partial answer)")
+            elif turn_error:
+                live["missing_segments"].append("⚠️ (agent turn ended with an error)")
         if timeout_reason:
             if delivered:
                 _pi_send_trailer(
@@ -2413,7 +2470,10 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
                 return sid, answer + "\n\n🛑 (cancelled — partial answer)", None
             return sid, None, CANCEL_MSG
         if handled:
-            return sid, None, "Pi handled the message without starting a run"
+            return sid, "", None
+        if not settled and not timeout_reason and not cancelled:
+            # Never replay a partially executed task automatically after a crash.
+            return sid, answer or None, "Pi RPC exited before agent_settled"
         if turn_error and answer:
             if delivered:
                 _pi_send_trailer(cfg, live, "⚠️ (agent turn ended with an error)")
@@ -2426,19 +2486,28 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
             return sid, None, "agent returned no text" + (f"\n{tail}" if tail else "")
         return sid, answer, None
     except Exception as e:
+        with RUN_LOCK:
+            if RUN_STATE.get("cancel"):
+                cancelled = True
+                return sid, "\n\n".join(segments) or None, CANCEL_MSG
         tail = (errbuf[0] if errbuf else "").strip()[-400:]
         detail = f"Pi RPC error: {e}"
         if tail:
             detail += "\n" + tail
-        return sid, None, detail
+        return sid, "\n\n".join(segments) or None, detail
     finally:
+        orphaned = []
         with RUN_LOCK:
             if RUN_STATE.get("pi_run_id") == run_id:
                 RUN_STATE["pi_sid"] = None
+                orphaned = list(RUN_STATE.get("pi_steers", {}).values())
                 RUN_STATE["pi_steers"] = {}
                 RUN_STATE["steer_pending"] = 0
                 RUN_STATE["proc"] = None
                 RUN_STATE.pop("cancel", None)
+        for meta in orphaned:
+            if not cancelled and not meta.get("consumed"):
+                _steer_fallback(cfg, meta, "Pi RPC closed before steering was consumed")
         if proc and proc.poll() is None:
             try:
                 if proc.stdin:
@@ -2550,6 +2619,22 @@ def _flush_prompt_batch(cfg, chat_id, batch):
         if steer_target:
             PENDING_PROMPTS.pop(chat_id, None)
         else:
+            with RUN_LOCK:
+                cur = RUN_STATE.get("current") or {}
+                starting = bool(
+                    RUN_STATE.get("busy") and cur.get("chat") == chat_id
+                    and cur.get("mode") == "server"
+                    and cur.get("runner") in ("pi", "codex")
+                    and not RUN_STATE.get("cancel")
+                )
+            if starting:
+                # Reuse the existing burst timer while the RPC/session starts.
+                # Do not commit this input to a queue stuck behind the live run.
+                timer = threading.Timer(0.1, _flush_prompt_batch, args=(cfg, chat_id, batch))
+                timer.daemon = True
+                batch["timer"] = timer
+                timer.start()
+                return
             batch["queued"] = True
     if steer_target:
         sid = steer_target["sid"]
@@ -2595,12 +2680,17 @@ def _flush_prompt_batch(cfg, chat_id, batch):
             )
         else:
             raise RuntimeError(f"unknown steer transport {steer_target['transport']}")
-        send(
-            cfg["bot_token"],
-            chat_id,
-            "🧭 received — it will be injected into this agent after the current tool call",
-        )
-        threading.Thread(target=target, args=args, daemon=True).start()
+        # Hermes injects first and acknowledges afterward. Telegram latency,
+        # rate limiting or a dead reply target must never gate the RPC write.
+        def inject_then_ack():
+            target(*args)
+            send(
+                cfg["bot_token"],
+                chat_id,
+                "🧭 received — steering this run at its next model/tool boundary",
+            )
+
+        threading.Thread(target=inject_then_ack, daemon=True).start()
         return
 
     PROMPT_Q.put(batch)
@@ -2616,6 +2706,7 @@ def _flush_prompt_batch(cfg, chat_id, batch):
 
 def defer_prompt(cfg, chat_id, message_id, text):
     """Merge adjacent messages, including Telegram's automatic text splits."""
+    live_steer = should_steer(chat_id)
     with INGRESS_LOCK:
         batch = PENDING_PROMPTS.get(chat_id)
         if batch:
@@ -2641,12 +2732,17 @@ def defer_prompt(cfg, chat_id, message_id, text):
                 "timer": None,
             }
             PENDING_PROMPTS[chat_id] = batch
-        timer = threading.Timer(
-            input_debounce(cfg), _flush_prompt_batch, args=(cfg, chat_id, batch)
-        )
-        timer.daemon = True
-        batch["timer"] = timer
-        timer.start()
+        if not live_steer:
+            timer = threading.Timer(
+                input_debounce(cfg), _flush_prompt_batch, args=(cfg, chat_id, batch)
+            )
+            timer.daemon = True
+            batch["timer"] = timer
+            timer.start()
+    if live_steer:
+        # Ordinary mid-run text should reach the native queue immediately;
+        # only idle/startup bursts need Telegram split-message coalescing.
+        _flush_prompt_batch(cfg, chat_id, batch)
 
 
 def merge_open_burst(cfg, chat_id, text):
@@ -2803,6 +2899,10 @@ def worker(cfg, state):
                 if new_sid:
                     store_runner_session(state, chat_id, used_runner, new_sid)
                 save_json(STATE_PATH, state)
+            # An error is new content, not proof earlier segments were delivered.
+            if err and live.get("missing_segments"):
+                for segment in live["missing_segments"]:
+                    send_retry(cfg, chat_id, segment, reply_to=message_id)
             if err == CANCEL_MSG:
                 audit("run_cancelled", chat_id=chat_id)
                 send_retry(cfg, chat_id, CANCEL_MSG)
@@ -2816,7 +2916,10 @@ def worker(cfg, state):
                 react(cfg, chat_id, message_id, "👍")
                 streamed = bool(live.get("streamed"))
                 payload = deliverable_answer(live, answer)
-                if payload:
+                if live.get("missing_segments"):
+                    for segment in live["missing_segments"]:
+                        send_retry(cfg, chat_id, segment, reply_to=message_id)
+                elif payload:
                     send_retry(cfg, chat_id, payload, reply_to=message_id)
                 audit(
                     "run_done",
@@ -3127,10 +3230,12 @@ def handle_update(cfg, state, upd, *, state_path=STATE_PATH):
                 f"run belongs to chat {cur['chat']} — cancel from there",
             )
             return
-        signal_run_process(proc, signal.SIGTERM)
-        kill_after(proc, 5)
         with RUN_LOCK:
             RUN_STATE["cancel"] = True
+            is_pi_rpc = bool(RUN_STATE.get("pi_sid"))
+        if not is_pi_rpc:
+            signal_run_process(proc, signal.SIGTERM)
+        kill_after(proc, 5)
         audit("cancel_requested", by_chat=chat_id, run_chat=cur["chat"])
         send(cfg["bot_token"], chat_id, "🛑 stopping current run…")
         return
