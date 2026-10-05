@@ -53,7 +53,7 @@ class ServerFailoverTests(unittest.TestCase):
             ],
         )
         self.assertEqual(sid, "open-session")
-        self.assertIn("answered via opencode", answer)
+        self.assertIn("answered via opencode", answer or "")
         self.assertIsNone(error)
         self.assertEqual(result_meta["runner"], "opencode")
 
@@ -92,7 +92,37 @@ class ServerFailoverTests(unittest.TestCase):
             ],
         )
         self.assertEqual(sid, "glm-session")
-        self.assertIn("glm answer", answer)
+        self.assertIn("glm answer", answer or "")
+        self.assertIsNone(error)
+
+    def test_provider_auth_failure_fails_over_instead_of_stopping(self):
+        calls = []
+
+        def run_one(cfg, session_id, prompt, live=None):
+            calls.append((cfg["runner"], session_id))
+            if cfg["runner"] == "opencode":
+                return (
+                    session_id,
+                    None,
+                    (
+                        "OpenCode v2 error: Provider request failed with HTTP 401: "
+                        "missing_api_key"
+                    ),
+                )
+            return "codex-session", "fallback answer", None
+
+        cfg = {
+            "runner": "opencode",
+            "runner_fallbacks": [{"runner": "codex"}],
+        }
+        with mock.patch.object(tgbridge, "run_one", side_effect=run_one):
+            sid, answer, error = tgbridge.run_with_fallbacks(
+                cfg, "open-session", "prompt"
+            )
+
+        self.assertEqual(calls, [("opencode", "open-session"), ("codex", None)])
+        self.assertEqual(sid, "codex-session")
+        self.assertIn("answered via codex", answer or "")
         self.assertIsNone(error)
 
 
