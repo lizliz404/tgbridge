@@ -151,6 +151,8 @@ def api(token, method, _error=None, **params):
         try:
             with urllib.request.urlopen(req, timeout=70) as r:
                 return json.load(r)
+        except BridgeStop:
+            raise
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")
             if _error is not None:
@@ -518,6 +520,8 @@ def run_agent(cfg, session_id, prompt, live=None):
             None,
             f"{cfg.get('runner', 'opencode')} failed rc={proc.returncode}\n{tail}",
         )
+    if acc.get("runner_error"):
+        return sid, None, str(acc["runner_error"])[-600:]
     if not acc["texts"]:
         return sid, None, "agent returned no text"
     return sid, "\n".join(acc["texts"]).strip(), None
@@ -547,7 +551,7 @@ def effective_run_config(cfg, state):
 def runner_session(state, chat_id, runner_name, legacy_runner=None):
     """Return one runner's native session, migrating the legacy flat index.
 
-    Session identifiers are not portable across Codex, OpenCode, and Claude.
+    Session identifiers are not portable across Codex, OpenCode, and Pi.
     Keep a per-runner map while retaining the flat fields for older versions.
     """
     key = str(chat_id)
@@ -2146,7 +2150,7 @@ def startup_smoke():
         raise RuntimeError("render smoke failed")
     if split_chunks("a" * 25, limit=10) != ["a" * 10, "a" * 10, "a" * 5]:
         raise RuntimeError("chunk smoke failed")
-    if runner_mode({}) != "cli" or not {"opencode", "claude", "codex"} <= set(RUNNERS):
+    if runner_mode({}) != "cli" or set(RUNNERS) != {"opencode", "codex", "pi"}:
         raise RuntimeError("runner registry smoke failed")
 
 

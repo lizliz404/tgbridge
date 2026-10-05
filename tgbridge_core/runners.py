@@ -10,6 +10,7 @@ import time
 OPENCODE = os.environ.get(
     "OPENCODE_BIN", os.path.expanduser("~/.local/share/mise/shims/opencode")
 )
+PI = os.environ.get("PI_BIN", os.path.expanduser("~/.local/share/mise/shims/pi"))
 CODEX_YOLO_FLAG = "--dangerously-bypass-approvals-and-sandbox"
 AUTO_OPENCODE_GO_MODEL = "auto:opencode-go"
 _MODEL_DISCOVERY_CACHE = {}
@@ -43,7 +44,7 @@ SERVER_RUNNERS = {}
 # Supported runner catalog, in probe/display order. A new agent CLI joins
 # this list only together with a verified adapter above — never as a bare
 # name. Probing never executes anything; it only proves the binary exists.
-RUNNER_CATALOG = ("opencode", "claude", "codex")
+RUNNER_CATALOG = ("opencode", "codex", "pi")
 
 
 def probe_runners():
@@ -119,40 +120,75 @@ def _opencode(session_id, prompt, model=None):
     return cmd, parse
 
 
-@runner("claude")
-def _claude(session_id, prompt, model=None):
-    """claude -p --output-format stream-json (resume via --resume)."""
-    cmd = [
-        _bin("CLAUDE_BIN", "claude"),
-        "-p",
-        prompt,
-        "--output-format",
-        "stream-json",
-        "--verbose",
-    ]
+@runner("pi")
+def _pi(session_id, prompt, model=None):
+    """pi --mode json (resume via stable native --session-id)."""
+    p = PI if os.path.exists(PI) else shutil.which("pi")
+    if not p:
+        raise RunnerError("runner 'pi' not found; install pi or set PI_BIN")
+    cmd = [p, "--mode", "json"]
     if session_id:
-        cmd += ["--resume", session_id]
+        cmd += ["--session-id", session_id]
     if model:
         cmd += ["--model", model]
+    cmd.append(prompt)
 
     def parse(ev, acc):
-        t = ev.get("type")
-        if t == "system" and ev.get("session_id"):
-            acc["sid"] = ev["session_id"]
-        if t == "assistant":
-            trail = None
-            for blk in (ev.get("message") or {}).get("content") or []:
-                bt = blk.get("type")
-                if bt == "tool_use":
-                    inp = blk.get("input") or {}
-                    s = next((v for v in inp.values() if isinstance(v, str)), "")
-                    trail = f"🔧 {blk.get('tool', '?')}: " + s.replace("\n", " ")[:60]
-                elif bt == "text" and blk.get("text"):
-                    acc["texts"].append(blk["text"])
-                    acc["thinking"] = None
-                elif bt == "thinking" and blk.get("thinking"):
-                    acc["thinking"] = blk["thinking"]
-            return trail
+        event_type = ev.get("type")
+        if event_type == "session" and ev.get("id"):
+            acc["sid"] = ev["id"]
+            return None
+
+        if event_type == "tool_execution_start":
+            return trail_line(
+                {
+                    "tool": ev.get("toolName", "?"),
+                    "state": {"input": ev.get("args") or {}},
+                }
+            )
+
+        if event_type == "message_update":
+            update = ev.get("assistantMessageEvent") or {}
+            update_type = update.get("type")
+            if update_type == "text_delta" and update.get("delta"):
+                current = acc.get("_pi_text", "") + update["delta"]
+                acc["_pi_text"] = current
+                acc["texts"] = [current]
+                acc["thinking"] = None
+            elif update_type == "thinking_delta" and update.get("delta"):
+                acc["thinking"] = acc.get("_pi_thinking", "") + update["delta"]
+                acc["_pi_thinking"] = acc["thinking"]
+            elif update_type == "thinking_end":
+                acc["thinking"] = update.get("content") or acc.get("thinking")
+            return None
+
+        if event_type == "message_end":
+            message = ev.get("message") or {}
+            if message.get("role") != "assistant":
+                return None
+            content = message.get("content") or []
+            texts = [
+                block.get("text", "")
+                for block in content
+                if block.get("type") == "text" and block.get("text")
+            ]
+            if texts:
+                acc["texts"] = texts
+                acc["thinking"] = None
+            usage = message.get("usage") or {}
+            acc["tokens"] = (acc.get("tokens") or 0) + (usage.get("totalTokens") or 0)
+            acc["cost"] = acc.get("cost", 0.0) + (
+                (usage.get("cost") or {}).get("total") or 0.0
+            )
+            stop_reason = message.get("stopReason")
+            if stop_reason in ("error", "aborted"):
+                acc["runner_error"] = (
+                    message.get("errorMessage") or f"Pi stopped with {stop_reason}"
+                )
+            else:
+                acc.pop("runner_error", None)
+            acc.pop("_pi_text", None)
+            acc.pop("_pi_thinking", None)
         return None
 
     return cmd, parse

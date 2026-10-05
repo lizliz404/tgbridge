@@ -115,9 +115,10 @@ def run_selftest(app):
         fails.append("codex yolo flag")
     if apply_runner_policy("codex", codex_cmd, {}) != codex_cmd:
         fails.append("codex yolo default off")
-    if apply_runner_policy("claude", ["claude", "-p"], {"codex_yolo": True}) != [
-        "claude",
-        "-p",
+    if apply_runner_policy("pi", ["pi", "--mode", "json"], {"codex_yolo": True}) != [
+        "pi",
+        "--mode",
+        "json",
     ]:
         fails.append("codex yolo isolation")
 
@@ -131,23 +132,23 @@ def run_selftest(app):
     if parse(ev, acc) is None or acc["sid"] != "s1":
         fails.append("opencode parse")
 
-    cmd, parse = RUNNERS["claude"](None, "hi", None)
+    cmd, parse = RUNNERS["pi"](None, "hi", None)
     acc = {"sid": None, "texts": [], "thinking": None, "cost": 0.0, "tokens": None}
-    parse({"type": "system", "session_id": "s2"}, acc)
+    parse({"type": "session", "id": "s2"}, acc)
     parse(
         {
-            "type": "assistant",
+            "type": "message_end",
             "message": {
-                "content": [
-                    {"type": "tool_use", "tool": "Bash", "input": {"command": "ls"}},
-                    {"type": "text", "text": "ok"},
-                ]
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "stopReason": "stop",
+                "usage": {"totalTokens": 2, "cost": {"total": 0}},
             },
         },
         acc,
     )
     if acc["sid"] != "s2" or acc["texts"] != ["ok"]:
-        fails.append("claude parse")
+        fails.append("pi parse")
 
     # death announcement: one call per chat, one bad chat must not raise
     calls = []
