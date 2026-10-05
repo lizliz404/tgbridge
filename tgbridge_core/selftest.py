@@ -490,6 +490,7 @@ def run_selftest(app):
         or runner_mode({"server_runner": True}) != "server"
         or runner_mode({"server_runner": True, "runner_mode": "cli"}) != "cli"
         or "opencode" not in SERVER_RUNNERS
+        or "pi" not in SERVER_RUNNERS
     ):
         fails.append("runner transport config")
 
@@ -558,6 +559,32 @@ def run_selftest(app):
         RUN_STATE["codex_turn_id"] = None
         RUN_STATE["steer_pending"] = 0
         RUN_STATE["current"] = None
+    # Pi RPC steering is bound to the live RPC child and its session.
+    with RUN_LOCK:
+        RUN_STATE["busy"] = True
+        RUN_STATE["pi_sid"] = "pi-session"
+        RUN_STATE["pi_run_id"] = 12
+        RUN_STATE["steer_pending"] = 0
+        RUN_STATE["current"] = {"chat": 7, "runner": "pi"}
+    pi_target = _begin_steer(7)
+    if pi_target != {
+        "transport": "pi_rpc_steer",
+        "sid": "pi-session",
+        "run_id": 12,
+    }:
+        fails.append("pi rpc steer reservation")
+    if not should_steer(7) or should_steer(8):
+        fails.append("pi rpc steer route")
+    with RUN_LOCK:
+        if RUN_STATE["steer_pending"] != 1:
+            fails.append("pi rpc steer pending")
+        RUN_STATE["busy"] = False
+        RUN_STATE["pi_sid"] = None
+        RUN_STATE["pi_run_id"] = 0
+        RUN_STATE["steer_pending"] = 0
+        RUN_STATE["current"] = None
+    if should_steer(7):
+        fails.append("pi rpc steer route idle")
     # An allowed group member can prompt. Human group messages are captured by
     # default for ambient context, but the bot still speaks only when mentioned.
     auth_state = {

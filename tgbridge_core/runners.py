@@ -38,6 +38,21 @@ def _bin(env_key, name):
     return p
 
 
+def pi_binary():
+    """Resolved Pi executable, shared by the CLI and RPC transports.
+
+    Read from the environment on every call so a service can repoint PI_BIN
+    without reimporting, and so tests can inject a fixture binary.
+    """
+    for candidate in (os.environ.get("PI_BIN"), PI):
+        if candidate and os.path.exists(candidate):
+            return candidate
+    found = shutil.which("pi")
+    if not found:
+        raise RunnerError("runner 'pi' not found; install pi or set PI_BIN")
+    return found
+
+
 RUNNERS = {}
 SERVER_RUNNERS = {}
 
@@ -123,10 +138,7 @@ def _opencode(session_id, prompt, model=None):
 @runner("pi")
 def _pi(session_id, prompt, model=None):
     """pi --mode json (resume via stable native --session-id)."""
-    p = PI if os.path.exists(PI) else shutil.which("pi")
-    if not p:
-        raise RunnerError("runner 'pi' not found; install pi or set PI_BIN")
-    cmd = [p, "--mode", "json"]
+    cmd = [pi_binary(), "--mode", "json"]
     if session_id:
         cmd += ["--session-id", session_id]
     if model:

@@ -4,7 +4,7 @@
   "runner_modes": {
     "codex": "server",
     "opencode": "cli",
-    "pi": "cli"
+    "pi": "server"
   },
   "server_url": "http://127.0.0.1:4096",
   "server_poll_s": 0.5,

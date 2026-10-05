@@ -11,10 +11,11 @@ long-poll in, local CLI agent out.
 - **DM + group chats** — groups are mention-triggered (@bot or reply-to-bot), DMs always answer
 - **Per-chat sessions** — each chat maps to one native runner session (`/new` forgets the mapping, `/status` inspects it)
 - **Agent failover + switching** — any failed CLI or server-mode run (quota, dead binary, broken network, timeout, empty answer) automatically walks `runner_fallbacks` with a fresh runner-native session and a one-line 🔀 header; only user cancel stops the chain. The same runner may appear repeatedly with different models, so a dead model/provider rotates without mixing Codex/OpenCode/Pi session IDs. `auto:opencode-go` discovers the current Go catalog and expands to the newest Muse Spark Contributor followed by the newest GLM, so model-version bumps do not require config edits. `/runners` shows the resolved chain and on-device availability probe; `/runner <name> [model]` switches the global primary without restarting (`/runner default` restores file config)
-- **Same-turn steering where supported** — Codex app-server uses `turn/steer`; OpenCode server mode uses `prompt_async`; the bridge acknowledges the nuance immediately, then injects it without cancelling the active tool
+- **Same-turn steering where supported** — Codex app-server uses `turn/steer`; OpenCode server mode uses `prompt_async`; Pi runs on its native RPC transport (`steer`, delivered after the current tool call). The bridge acknowledges the nuance immediately, then injects it without cancelling the active tool
 - **Burst coalescing** — adjacent Telegram messages are held briefly and merged, so automatic 4096-character splits do not become many separate agent runs
 - **Inbound photos + documents** — downloaded privately and passed as local paths; an unaddressed group upload is retained for the next @mention/reply, so the file itself needs no tag
 - **Live progress** — one status message, edited in place: elapsed seconds, real-time tool-call trail, and answer tail, read from CLI stdout or the server's persisted transcript
+- **Segmented replies on Pi RPC** — because Pi's `--mode json` is one-shot and every `message_end` overwrites the previous segment, a long multi-step turn used to arrive as a single final block. With `runner_modes: {"pi": "server"}` each completed assistant segment is sent as its own Telegram message while tool calls stay in the status line, so the process is visible step by step instead of only at the end
 - **Voice notes** — auto-transcribed via any OpenAI-compatible `/audio/transcriptions` API (Groq Whisper, OpenAI, self-hosted) and fed to the agent as text; opt-in via config
 - **Scheduled prompts** — `/at 30m <prompt>` (also `s`/`h`); persisted in state and re-armed on restart
 - **Agent-initiated outbound** — `python3 tgbridge.py --send <chat_id> <text>` posts to allowlisted chats only, so the agent can proactively notify the group
@@ -143,8 +144,8 @@ To post to Telegram yourself: python3 /path/to/tgbridge/tgbridge.py --send <chat
 | `workdir` | Working directory for the agent |
 | `runner` | `opencode` (default), `codex`, or `pi` |
 | `codex_yolo` | Pass Codex `--dangerously-bypass-approvals-and-sandbox`; grants authorized Telegram users unsandboxed access as the local OS user (default `false`) |
-| `runner_mode` | `cli` (portable default) or `server`; Codex and OpenCode server adapters implement same-turn steering |
-| `runner_modes` | Optional per-runner transport overrides, e.g. Codex `server` with OpenCode/Pi `cli`; prevents one runner's transport requirement from weakening the whole fallback chain |
+| `runner_mode` | `cli` (portable default) or `server`; the Codex, OpenCode, and Pi server adapters implement same-turn steering |
+| `runner_modes` | Optional per-runner transport overrides, e.g. Pi `server` with Codex `cli`; prevents one runner's transport requirement from weakening the whole fallback chain |
 | `server_url` | Local runner server URL (default `http://127.0.0.1:4096`; `OPENCODE_SERVER` remains supported) |
 | `server_poll_s` | Local transcript polling interval in server mode (default `0.5`, clamped to `0.1`–`5.0`) |
 | `run_timeout_s` | Inactivity timeout in seconds (default `900`); model/tool output and accepted steering renew the lease |
@@ -232,7 +233,7 @@ The bridge drives any of three agent CLIs (config key `runner`):
 |---|---|---|---|
 | `opencode` | `opencode run --format json` | `--session` | default; live tool trail + thinking + cost |
 | `codex` | `codex exec --json` or app-server | native thread resume | use `runner_mode: "server"` for true same-turn steering; set `CODEX_BIN` if needed |
-| `pi` | `pi --mode json` | `--session-id` | native JSON events, tool trail, thinking, token and cost metadata; set `PI_BIN` if needed |
+| `pi` | `pi --mode json` (or `--mode rpc` in server mode) | `--session-id` | native JSON events, tool trail, thinking, token and cost metadata; `runner_modes: {"pi": "server"}` adds per-segment Telegram messages and live `steer`; set `PI_BIN` if needed |
 
 ### Codex permission mode
 

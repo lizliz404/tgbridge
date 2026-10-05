@@ -55,8 +55,10 @@ from tgbridge_core.runners import (
     classify_run_error,
     discover_opencode_go_models,
     fallback_chain,
+    pi_binary,
     probe_runners,
     resolve_model,
+    trail_line,
 )
 
 CONFIG_DIR = os.path.expanduser("~/.config/tgbridge")
@@ -79,6 +81,7 @@ AUDIT_LOCK = threading.Lock()
 RUN_LOCK = threading.Lock()
 INGRESS_LOCK = threading.Lock()
 CODEX_WRITE_LOCK = threading.Lock()
+PI_RPC_WRITE_LOCK = threading.Lock()
 PENDING_PROMPTS: dict = {}
 RUN_STATE: dict = {
     "busy": False,
@@ -95,6 +98,10 @@ RUN_STATE: dict = {
     "codex_turn_id": None,
     "codex_run_id": 0,
     "codex_steers": {},
+    "pi_sid": None,
+    "pi_run_id": 0,
+    "pi_request_id": 0,
+    "pi_steers": {},
     "steer_count": 0,
     "steer_pending": 0,
     "steer_errors": [],
@@ -389,6 +396,9 @@ def edit_status(cfg, live, final=None):
     else:
         trail = "\n".join(live["trail"][-5:])
         text = f"⚙️ working… {elapsed}s\n{trail}"
+        notes = live.get("notes") or []
+        if notes:
+            text += "\n" + "\n".join(notes[-2:])
         thinking = (live.get("thinking") or "").strip().replace("\n", " ")
         if thinking:
             text += f"\n💭 …{thinking[-200:]}"
@@ -403,6 +413,19 @@ def edit_status(cfg, live, final=None):
             message_id=live["status_id"],
             text=text,
         )
+
+
+def deliverable_answer(live, answer):
+    """Text the worker still owes the chat after a finished run.
+
+    A transport that delivered the assistant segments itself (Pi RPC) marks
+    `live["streamed"]`: re-sending the joined answer would duplicate the
+    conversation. Anything else — CLI runs, and server runs that fell back to
+    another runner — returns the answer unchanged.
+    """
+    if (live or {}).get("streamed"):
+        return None
+    return answer or ""
 
 
 def run_agent(cfg, session_id, prompt, live=None):
@@ -631,6 +654,10 @@ def run_with_fallbacks(cfg, session_id, prompt, live=None, result_meta=None):
     """
     rname = cfg.get("runner", "opencode")
     model = resolve_model(cfg, rname)
+    if live is not None:
+        # Each attempt owns its own delivery state: a streamed Pi run that
+        # dies must not make a fallback answer look already-delivered.
+        live["streamed"] = False
     new_sid, answer, err = run_one(
         dict(cfg, runner=rname, model=model), session_id, prompt, live
     )
@@ -664,6 +691,8 @@ def run_with_fallbacks(cfg, session_id, prompt, live=None, result_meta=None):
             if RUN_STATE.get("current"):
                 RUN_STATE["current"]["runner"] = step_runner
         step_cfg = dict(cfg, runner=step_runner, model=step_model)
+        if live is not None:
+            live["streamed"] = False
         try:
             fallback_timeout = int(cfg.get("fallback_run_timeout_s", 0))
         except (TypeError, ValueError):
@@ -814,6 +843,14 @@ def _begin_steer(chat_id):
                 "turn_id": turn_id,
                 "run_id": RUN_STATE.get("codex_run_id", 0),
             }
+        if RUN_STATE.get("pi_sid") and RUN_STATE.get("pi_run_id"):
+            RUN_STATE["steer_pending"] = RUN_STATE.get("steer_pending", 0) + 1
+            RUN_STATE["last_progress"] = time.monotonic()
+            return {
+                "transport": "pi_rpc_steer",
+                "sid": RUN_STATE["pi_sid"],
+                "run_id": RUN_STATE["pi_run_id"],
+            }
         sid = RUN_STATE.get("server_sid")
         if sid and RUN_STATE.get("server_api") == "v2":
             RUN_STATE["steer_pending"] = RUN_STATE.get("steer_pending", 0) + 1
@@ -836,7 +873,8 @@ def should_steer(chat_id):
             and cur
             and cur.get("chat") == chat_id
             and (
-                (RUN_STATE.get("server_sid") and RUN_STATE.get("server_api") == "v2")
+                (RUN_STATE.get("pi_sid") and RUN_STATE.get("pi_run_id"))
+                or (RUN_STATE.get("server_sid") and RUN_STATE.get("server_api") == "v2")
                 or (RUN_STATE.get("codex_thread_id") and RUN_STATE.get("codex_turn_id"))
             )
         )
@@ -1935,6 +1973,489 @@ SERVER_RUNNERS["codex"] = {
 }
 
 
+# --- Pi RPC transport -------------------------------------------------------
+#
+# Pi's `--mode json` is one-shot (the CLI adapter in tgbridge_core/runners.py):
+# text deltas can only be re-rendered into a throwaway status line and every
+# `message_end` overwrites the previous segment, so a long multi-step turn
+# reaches the chat as one final block. `--mode rpc` is the same session-event
+# stream on a long-lived JSONL child, plus the commands this bridge needs:
+# every completed assistant segment is delivered as its own chat message,
+# `steer` injects a human message into the live turn (after the current tool
+# call, before the next LLM call), and `clear_queue`/`abort` stop it cleanly.
+
+PI_RPC_STATE_CMD = "tgbridge-state"
+PI_RPC_PROMPT_CMD = "tgbridge-prompt"
+PI_RPC_SETUP_TIMEOUT = 30
+PI_RPC_PROMPT_TIMEOUT = 60
+
+
+def pi_rpc_ok(_cfg=None):
+    """Installed Pi must expose the RPC transport used for streaming/steering."""
+    try:
+        result = subprocess.run(
+            [pi_binary(), "--help"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0 and "rpc" in (result.stdout or "")
+
+
+def _pi_rpc_write(proc, payload):
+    """Write one JSONL command; stdin is shared with the steering thread."""
+    if proc is None or proc.stdin is None or proc.poll() is not None:
+        raise RuntimeError("Pi RPC process is not running")
+    line = json.dumps(payload, ensure_ascii=False)
+    with PI_RPC_WRITE_LOCK:
+        proc.stdin.write(line + "\n")
+        proc.stdin.flush()
+
+
+def _pi_rpc_read_events(stream, events):
+    try:
+        for raw in stream:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                events.put(json.loads(raw))
+            except json.JSONDecodeError:
+                continue
+    finally:
+        events.put(None)
+
+
+def _pi_rpc_wait_response(events, request_id, timeout=30, keep=None):
+    """Wait for one command response; session events are kept aside, not lost."""
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(f"Pi RPC {request_id} timed out")
+        try:
+            event = events.get(timeout=min(0.5, remaining))
+        except queue.Empty:
+            continue
+        if event is None:
+            raise RuntimeError("Pi RPC exited during setup")
+        if event.get("type") == "response" and event.get("id") == request_id:
+            if not event.get("success", False):
+                raise RuntimeError(str(event.get("error") or "command failed")[:600])
+            return event.get("data") or {}
+        if keep is not None:
+            keep.append(event)
+
+
+def _pi_message_text(message):
+    """Join the text blocks of one assistant message."""
+    blocks = message.get("content")
+    if isinstance(blocks, str):
+        return blocks.strip()
+    texts = [
+        block.get("text", "")
+        for block in (blocks or [])
+        if isinstance(block, dict)
+        and block.get("type") == "text"
+        and block.get("text")
+    ]
+    return "\n\n".join(texts).strip()
+
+
+def _pi_rpc_decline_ui(proc, event):
+    """Decline extension dialogs: the bridge has no interactive UI for them."""
+    method = event.get("method")
+    if method not in ("select", "confirm", "input", "editor"):
+        return
+    try:
+        _pi_rpc_write(
+            proc,
+            {
+                "type": "extension_ui_response",
+                "id": event.get("id"),
+                "cancelled": True,
+            },
+        )
+    except Exception as e:
+        log(f"pi rpc extension ui decline: {e}")
+    audit("pi_extension_ui_declined", method=method, title=str(event.get("title"))[:80])
+
+
+def _pi_rpc_abort(proc):
+    """Drop queued input, then stop the active turn."""
+    try:
+        _pi_rpc_write(proc, {"type": "clear_queue"})
+        _pi_rpc_write(proc, {"type": "abort"})
+    except Exception as e:
+        log(f"pi rpc abort: {e}")
+
+
+def _pi_send_segment(cfg, live, text, first=False):
+    """Deliver one completed assistant segment as its own chat message."""
+    chat_id = live.get("chat_id")
+    if chat_id is None:
+        return False
+    return send_retry(
+        cfg,
+        chat_id,
+        text,
+        reply_to=live.get("reply_to") if first else None,
+    )
+
+
+def _pi_send_trailer(cfg, live, text):
+    """A one-line footer for a streamed run (partial / cancelled / error)."""
+    chat_id = live.get("chat_id")
+    if chat_id is not None:
+        send_retry(cfg, chat_id, text)
+
+
+def _pi_steer_deliver(cfg, sid, run_id, text, chat_id=None, message_id=None):
+    """Send true same-turn steering to the live Pi RPC child."""
+    meta = {
+        "sid": sid,
+        "text": text,
+        "chat_id": chat_id,
+        "message_id": message_id,
+    }
+    request_id = None
+    try:
+        with RUN_LOCK:
+            if not (
+                RUN_STATE.get("pi_sid") == sid
+                and RUN_STATE.get("pi_run_id") == run_id
+            ):
+                raise RuntimeError("active Pi run changed before steering delivery")
+            proc = RUN_STATE.get("proc")
+            seq = RUN_STATE.get("pi_request_id", 0) + 1
+            RUN_STATE["pi_request_id"] = seq
+            request_id = f"steer-{run_id}-{seq}"
+            RUN_STATE.setdefault("pi_steers", {})[request_id] = meta
+        _pi_rpc_write(proc, {"id": request_id, "type": "steer", "message": text})
+    except Exception as e:
+        with RUN_LOCK:
+            if request_id:
+                RUN_STATE.setdefault("pi_steers", {}).pop(request_id, None)
+            if RUN_STATE.get("pi_run_id") == run_id:
+                RUN_STATE["steer_pending"] = max(
+                    0, RUN_STATE.get("steer_pending", 1) - 1
+                )
+        audit(
+            "steer_error",
+            session=sid,
+            transport="pi_rpc_steer",
+            err=str(e)[:200],
+        )
+        log(f"pi rpc steer write: {e}")
+        _steer_fallback(cfg, meta, e)
+
+
+def _pi_handle_steer_response(cfg, event, run_id):
+    request_id = event.get("id")
+    if not isinstance(request_id, str) or not request_id.startswith("steer-"):
+        return False
+    with RUN_LOCK:
+        meta = RUN_STATE.setdefault("pi_steers", {}).pop(request_id, None)
+        if meta and RUN_STATE.get("pi_run_id") == run_id:
+            RUN_STATE["steer_pending"] = max(0, RUN_STATE.get("steer_pending", 1) - 1)
+            if event.get("success", False):
+                RUN_STATE["steer_count"] = RUN_STATE.get("steer_count", 0) + 1
+    if not meta:
+        return True
+    if not event.get("success", False):
+        detail = str(event.get("error") or "steer rejected")[:500]
+        audit("steer_error", session=meta["sid"], transport="pi_rpc_steer", err=detail)
+        _steer_fallback(cfg, meta, detail)
+    else:
+        audit(
+            "steer_delivered",
+            session=meta["sid"],
+            transport="pi_rpc_steer",
+            chars=len(meta["text"]),
+        )
+    return True
+
+
+def run_pi_rpc(cfg, session_id, prompt, live=None):
+    """Run Pi over `--mode rpc`.
+
+    Turns one agent run into a chat-shaped stream: each completed assistant
+    segment is sent as its own message, tool calls stay in the editable status
+    line, and a same-chat human message is steered into the live turn instead
+    of waiting for a possibly 30-minute run to finish.
+    """
+    sid = session_id
+    proc = None
+    events: queue.Queue = queue.Queue()
+    errbuf = []
+    early_events = []
+    segments = []
+    thinking = ""
+    tokens = 0
+    cost = 0.0
+    turn_error = None
+    timeout_reason = None
+    cancelled = False
+    handled = False
+    run_id = None
+    queued_steers = 0
+    delivered_any = False
+    stream_broken = False
+    try:
+        command = [pi_binary(), "--mode", "rpc"]
+        if sid:
+            command += ["--session-id", sid]
+        model = resolve_model(cfg, "pi")
+        if model:
+            command += ["--model", model]
+        proc = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=cfg["workdir"],
+            start_new_session=True,
+            bufsize=1,
+        )
+        assert proc.stdout and proc.stderr
+        threading.Thread(
+            target=_pi_rpc_read_events, args=(proc.stdout, events), daemon=True
+        ).start()
+        stderr = proc.stderr
+        threading.Thread(
+            target=lambda: errbuf.append(stderr.read() or ""), daemon=True
+        ).start()
+        with RUN_LOCK:
+            RUN_STATE["proc"] = proc
+            RUN_STATE["pi_run_id"] = RUN_STATE.get("pi_run_id", 0) + 1
+            run_id = RUN_STATE["pi_run_id"]
+            RUN_STATE["pi_sid"] = None
+            RUN_STATE["pi_steers"] = {}
+            RUN_STATE["pi_request_id"] = 0
+            RUN_STATE["steer_count"] = 0
+            RUN_STATE["steer_pending"] = 0
+            RUN_STATE["steer_errors"] = []
+            RUN_STATE["cancel"] = False
+
+        _pi_rpc_write(proc, {"id": PI_RPC_STATE_CMD, "type": "get_state"})
+        try:
+            state = _pi_rpc_wait_response(
+                events, PI_RPC_STATE_CMD, timeout=PI_RPC_SETUP_TIMEOUT,
+                keep=early_events,
+            )
+        except RuntimeError as e:
+            log(f"pi rpc get_state: {e}")
+            state = {}
+        sid = state.get("sessionId") or sid
+        if sid:
+            with RUN_LOCK:
+                if RUN_STATE.get("pi_run_id") == run_id:
+                    RUN_STATE["pi_sid"] = sid
+                    if RUN_STATE.get("current"):
+                        RUN_STATE["current"]["session"] = sid
+
+        _pi_rpc_write(
+            proc, {"id": PI_RPC_PROMPT_CMD, "type": "prompt", "message": prompt}
+        )
+        accepted = _pi_rpc_wait_response(
+            events, PI_RPC_PROMPT_CMD, timeout=PI_RPC_PROMPT_TIMEOUT, keep=early_events
+        )
+        handled = (accepted.get("disposition") or "") == "handled"
+
+        clock_started = start_run_clock()
+        settled = handled
+        while not settled:
+            with RUN_LOCK:
+                cancelled = bool(RUN_STATE.get("cancel"))
+            if cancelled:
+                _pi_rpc_abort(proc)
+                break
+            timeout_reason = run_expiry(cfg, clock_started)
+            if timeout_reason:
+                signal_run_process(proc, signal.SIGKILL)
+                break
+            if early_events:
+                event = early_events.pop(0)
+            else:
+                try:
+                    event = events.get(timeout=0.25)
+                except queue.Empty:
+                    continue
+            if event is None:
+                break
+            mark_run_progress()
+            if _pi_handle_steer_response(cfg, event, run_id):
+                continue
+            etype = event.get("type")
+            if etype == "extension_ui_request":
+                _pi_rpc_decline_ui(proc, event)
+            elif etype == "message_update":
+                update = event.get("assistantMessageEvent") or {}
+                utype = update.get("type")
+                if utype == "thinking_delta" and update.get("delta"):
+                    thinking += update["delta"]
+                    if live is not None:
+                        live["thinking"] = thinking
+                        edit_status(cfg, live)
+                elif utype == "thinking_end":
+                    thinking = update.get("content") or thinking
+                    if live is not None:
+                        live["thinking"] = thinking
+                        edit_status(cfg, live)
+                elif utype == "error":
+                    turn_error = str(
+                        update.get("error") or update.get("reason") or "stream error"
+                    )[-600:]
+            elif etype == "tool_execution_start":
+                if live is not None:
+                    live["trail"].append(
+                        trail_line(
+                            {
+                                "tool": event.get("toolName", "?"),
+                                "state": {"input": event.get("args") or {}},
+                            }
+                        )
+                    )
+                    edit_status(cfg, live)
+            elif etype == "message_end":
+                message = event.get("message") or {}
+                if message.get("role") != "assistant":
+                    continue
+                usage = message.get("usage") or {}
+                tokens += usage.get("totalTokens") or 0
+                cost += (usage.get("cost") or {}).get("total") or 0.0
+                stop_reason = message.get("stopReason")
+                if stop_reason in ("error", "aborted"):
+                    turn_error = str(
+                        message.get("errorMessage") or f"Pi stopped with {stop_reason}"
+                    )[-600:]
+                thinking = ""
+                if live is not None:
+                    live["thinking"] = ""
+                text = _pi_message_text(message)
+                if not text:
+                    continue
+                segments.append(text)
+                if live is None:
+                    continue
+                if _pi_send_segment(cfg, live, text, first=len(segments) == 1):
+                    delivered_any = True
+                    live["streamed"] = True
+                    live["preview"] = ""
+                elif delivered_any:
+                    # Earlier segments are already in the chat: do not mark the
+                    # answer delivered, so the worker re-sends the full text
+                    # instead of leaving a hole in the middle of the reply.
+                    stream_broken = True
+                    live["streamed"] = False
+            elif etype == "queue_update":
+                pending = len(event.get("steering") or [])
+                if live is not None and pending != queued_steers:
+                    queued_steers = pending
+                    note = (
+                        f"🧭 steering queued ({pending})"
+                        if pending
+                        else "🧭 steering delivered"
+                    )
+                    live.setdefault("notes", []).append(note)
+                    edit_status(cfg, live)
+            elif etype == "auto_retry_end" and not event.get("success", True):
+                turn_error = str(event.get("finalError") or "auto retry failed")[-600:]
+            elif etype == "agent_settled":
+                settled = True
+
+        # A steer acknowledgement can land just before agent_settled; drain the
+        # queue before concluding that an injection was never accepted.
+        while True:
+            try:
+                event = events.get_nowait()
+            except queue.Empty:
+                break
+            if event is not None:
+                _pi_handle_steer_response(cfg, event, run_id)
+
+        with RUN_LOCK:
+            outstanding = list(RUN_STATE.get("pi_steers", {}).values())
+            RUN_STATE["pi_steers"] = {}
+            RUN_STATE["steer_pending"] = 0
+            cancelled = bool(RUN_STATE.pop("cancel", False)) or cancelled
+        for meta in outstanding:
+            _steer_fallback(cfg, meta, "Pi RPC closed before steer acknowledgement")
+
+        if live is not None:
+            live["tokens"] = tokens
+            live["cost"] = cost
+        answer = "\n\n".join(segments).strip()
+        if stream_broken and answer:
+            answer = "(complete answer — earlier segments were already sent)\n\n" + answer
+        delivered = bool(live is not None and live.get("streamed"))
+        if timeout_reason:
+            if delivered:
+                _pi_send_trailer(
+                    cfg, live, f"⚠️ (partial — hit the {timeout_reason} timeout)"
+                )
+                return sid, answer, None
+            if answer:
+                return (
+                    sid,
+                    answer + f"\n\n⚠️ (partial — hit the {timeout_reason} timeout)",
+                    None,
+                )
+            return sid, None, f"agent hit the {timeout_reason} timeout"
+        if cancelled:
+            if delivered:
+                _pi_send_trailer(cfg, live, "🛑 (cancelled — partial answer)")
+                return sid, answer, None
+            if answer:
+                return sid, answer + "\n\n🛑 (cancelled — partial answer)", None
+            return sid, None, CANCEL_MSG
+        if handled:
+            return sid, None, "Pi handled the message without starting a run"
+        if turn_error and answer:
+            if delivered:
+                _pi_send_trailer(cfg, live, "⚠️ (agent turn ended with an error)")
+                return sid, answer, None
+            return sid, answer + "\n\n⚠️ (agent turn ended with an error)", None
+        if turn_error:
+            return sid, None, f"Pi error: {turn_error}"
+        if not answer:
+            tail = (errbuf[0] if errbuf else "").strip()[-500:]
+            return sid, None, "agent returned no text" + (f"\n{tail}" if tail else "")
+        return sid, answer, None
+    except Exception as e:
+        tail = (errbuf[0] if errbuf else "").strip()[-400:]
+        detail = f"Pi RPC error: {e}"
+        if tail:
+            detail += "\n" + tail
+        return sid, None, detail
+    finally:
+        with RUN_LOCK:
+            if RUN_STATE.get("pi_run_id") == run_id:
+                RUN_STATE["pi_sid"] = None
+                RUN_STATE["pi_steers"] = {}
+                RUN_STATE["steer_pending"] = 0
+                RUN_STATE["proc"] = None
+                RUN_STATE.pop("cancel", None)
+        if proc and proc.poll() is None:
+            try:
+                if proc.stdin:
+                    proc.stdin.close()
+                proc.wait(timeout=3)
+            except Exception:
+                signal_run_process(proc, signal.SIGTERM)
+                kill_after(proc, 2)
+
+
+SERVER_RUNNERS["pi"] = {
+    "run": run_pi_rpc,
+    "healthy": pi_rpc_ok,
+    "feature": "segmented replies + live steer (rpc)",
+}
+
+
 def multipart(fields, file_field, filename, data, ctype):
     b = "----tgbridge" + os.urandom(12).hex()
     body = bytearray()
@@ -2057,6 +2578,16 @@ def _flush_prompt_batch(cfg, chat_id, batch):
                 cfg,
                 sid,
                 steer_target["turn_id"],
+                steer_target["run_id"],
+                text,
+                chat_id,
+                batch["message_id"],
+            )
+        elif steer_target["transport"] == "pi_rpc_steer":
+            target = _pi_steer_deliver
+            args = (
+                cfg,
+                sid,
                 steer_target["run_id"],
                 text,
                 chat_id,
@@ -2218,8 +2749,13 @@ def worker(cfg, state):
                 if status
                 else None,
                 "trail": [],
+                "notes": [],
                 "start": time.time(),
                 "last_edit": 0,
+                "reply_to": message_id,
+                "streamed": False,
+                "tokens": 0,
+                "cost": 0.0,
             }
             stop_typing = threading.Event()
             threading.Thread(
@@ -2278,17 +2814,22 @@ def worker(cfg, state):
                 log(f"chat={chat_id} error: {err[:120]}")
             else:
                 react(cfg, chat_id, message_id, "👍")
-                send_retry(cfg, chat_id, answer or "", reply_to=message_id)
+                streamed = bool(live.get("streamed"))
+                payload = deliverable_answer(live, answer)
+                if payload:
+                    send_retry(cfg, chat_id, payload, reply_to=message_id)
                 audit(
                     "run_done",
                     chat_id=chat_id,
                     runner=used_runner,
                     chars=len(answer or ""),
                     secs=int(time.time() - live["start"]),
+                    streamed=streamed,
                 )
                 log(
                     f"chat={chat_id} done ({len(answer or '')} chars, "
-                    f"runner={used_runner}, session={new_sid})"
+                    f"runner={used_runner}, session={new_sid}"
+                    f"{', streamed' if streamed else ''})"
                 )
         except Exception as e:
             log(f"worker item error: {e}")
