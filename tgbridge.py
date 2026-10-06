@@ -43,6 +43,7 @@ from tgbridge_core.rendering import (
 from tgbridge_core.health import (
     classify_network_error,
     now_iso,
+    polling_health,
     proxy_diagnostics,
     systemd_notify,
 )
@@ -144,7 +145,9 @@ def audit(event, **fields):
 
 
 def update_health(**fields):
-    health = load_json(HEALTH_PATH, {})
+    # One snapshot per service lifetime. Prior stop/crash details belong in
+    # the audit log, not alongside this process's current healthy status.
+    health = {} if fields.get("status") == "starting" else load_json(HEALTH_PATH, {})
     health.update(fields)
     health["updated_at"] = now_iso()
     save_json(HEALTH_PATH, health)
@@ -3494,6 +3497,7 @@ def doctor_report():
         "proxy": proxy_diagnostics(),
         "health": load_json(HEALTH_PATH, {}),
     }
+    report["service"] = polling_health(report["health"])
     if not cfg:
         report["config"] = {"ok": False, "error": "missing or invalid config"}
         return report
@@ -3504,6 +3508,7 @@ def doctor_report():
     )
     report["state"] = {"writable": state_writable}
 
+    cfg = effective_run_config(cfg, load_json(STATE_PATH, {}))
     rname = cfg.get("runner", "opencode")
     mode = resolve_runner_mode(cfg, rname)
     runner_check = {"name": rname, "mode": mode, "ok": False}
@@ -3562,7 +3567,9 @@ def doctor_report():
         else None,
         "error": telegram_error or None,
     }
-    report["ok"] = bool(state_writable and runner_check["ok"] and telegram_ok)
+    report["ok"] = bool(
+        state_writable and runner_check["ok"] and telegram_ok and report["service"]["ok"]
+    )
     return report
 
 

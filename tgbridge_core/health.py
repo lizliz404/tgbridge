@@ -1,5 +1,6 @@
 """Cross-platform proxy inspection and network error classification."""
 
+import datetime
 import os
 import socket
 import time
@@ -33,6 +34,43 @@ def systemd_notify(message):
 
 def now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def polling_health(health, stale_after_s=180):
+    """Require a live service and recent successful poll, not just getMe.
+
+    The freshness window covers the 50-second long poll and bounded network
+    retry. Runtime readiness stays distinct from one-off API reachability.
+    """
+    result = {"ok": False, "pid_alive": False, "poll_age_s": None}
+    pid = health.get("pid")
+    if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+        try:
+            os.kill(pid, 0)
+            result["pid_alive"] = True
+        except PermissionError:
+            result["pid_alive"] = True
+        except (OSError, OverflowError):
+            pass
+    if not result["pid_alive"]:
+        result["error"] = "service_not_running"
+        return result
+    if health.get("status") != "healthy":
+        result["error"] = "poll_not_healthy"
+        return result
+    try:
+        # now_iso uses +HHMM; fromisoformat only accepts that on Python 3.11+.
+        stamp = datetime.datetime.strptime(health["last_poll_ok_at"], "%Y-%m-%dT%H:%M:%S%z")
+        age = time.time() - stamp.timestamp()
+    except (KeyError, TypeError, ValueError, OverflowError):
+        result["error"] = "invalid_poll_timestamp"
+        return result
+    result["poll_age_s"] = round(age, 1)
+    if not -5 <= age <= stale_after_s:
+        result["error"] = "stale_poll"
+        return result
+    result["ok"] = True
+    return result
 
 
 def redact_proxy_url(value):
@@ -112,4 +150,3 @@ def classify_network_error(exc, proxy_info=None):
     if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError):
         return "timeout"
     return type(reason).__name__.lower()
-

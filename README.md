@@ -100,9 +100,11 @@ Check the complete service environment before relying on it:
 python3 tgbridge.py --doctor
 ```
 
-The command exits nonzero when config/state, the selected runner, or Telegram
-is unavailable. Its JSON output redacts proxy credentials and reports dead
-localhost proxy endpoints.
+The command exits nonzero when config/state, the effective selected runner,
+Telegram, or the running bridge is unavailable. It checks the service PID and
+requires a successful long poll within the last 180 seconds; a successful
+`getMe` alone cannot make a stopped or wedged service healthy. Its JSON output
+redacts proxy credentials and reports dead localhost proxy endpoints.
 
 **4. Talk to it.** DM the bot, or add it to a group and @mention it.
 For groups you may want BotFather → `/setprivacy` → Disable, or make the bot
