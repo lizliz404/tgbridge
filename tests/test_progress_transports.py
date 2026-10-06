@@ -44,16 +44,18 @@ class TransportProgressTests(unittest.TestCase):
         self.texts = []
         self.actions = {}
         self.next_id = 100
+        self.records = []
+        self.status_updates = []
         self.addCleanup(mock.patch.stopall)
-        mock.patch.object(tgbridge, 'audit').start()
+        mock.patch.object(tgbridge, 'audit', side_effect=lambda event, **kw: self.records.append(kw) if event == 'tool_action' else None).start()
         mock.patch.object(tgbridge, 'send_retry', side_effect=lambda cfg, chat, text, **kw: self.texts.append(text) or True).start()
         def api(token, method, **params):
             if method == 'sendMessage':
                 self.next_id += 1
                 self.actions[self.next_id] = params['text']
                 return {'ok': True, 'result': {'message_id': self.next_id}}
-            if method == 'editMessageText' and params['message_id'] != 5:
-                self.actions[params['message_id']] = params['text']
+            if method == 'editMessageText':
+                self.status_updates.append(params)
             return {'ok': True}
         mock.patch.object(tgbridge, 'api', side_effect=api).start()
         with tgbridge.RUN_LOCK:
@@ -82,8 +84,9 @@ class TransportProgressTests(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(sid, 'thread1')
         self.assertEqual(self.texts, ['checking files', 'finished'])
-        self.assertEqual(len(self.actions), 2)
-        action_text = '\n'.join(self.actions.values())
+        self.assertEqual(len(self.actions), 0)
+        self.assertTrue(all(p['message_id'] == 5 for p in self.status_updates))
+        action_text = '\n'.join(p['body'] for p in self.records)
         self.assertIn('python3 check.py', action_text)
         self.assertIn('output:\nOK', action_text)
         self.assertIn('/fixture/a.py', action_text)
@@ -109,6 +112,7 @@ class TransportProgressTests(unittest.TestCase):
             with self.subTest(runner=runner), tempfile.TemporaryDirectory() as root:
                 self.texts.clear()
                 self.actions.clear()
+                self.records.clear()
                 binary = self.binary(root, 'import json\nfor record in ' + repr(records) + ':\n    print(json.dumps(record), flush=True)\n')
                 env = 'PI_BIN' if runner == 'pi' else 'OPENCODE_BIN'
                 live = self.live()
@@ -116,9 +120,10 @@ class TransportProgressTests(unittest.TestCase):
                     _, answer, err = tgbridge.run_agent({'runner': runner, 'bot_token': '123456789:fixture-test-token', 'workdir': root}, None, 'go', live)
                 self.assertIsNone(err)
                 self.assertEqual(self.texts, ['checking files', 'finished'])
-                self.assertEqual(len(self.actions), 1)
-                self.assertIn('python3 check.py', next(iter(self.actions.values())))
-                self.assertIn('OK', next(iter(self.actions.values())))
+                self.assertEqual(len(self.actions), 0)
+                recorded = '\n'.join(p['body'] for p in self.records)
+                self.assertIn('python3 check.py', recorded)
+                self.assertIn('OK', recorded)
                 self.assertIsNone(tgbridge.deliverable_answer(live, answer))
 
 

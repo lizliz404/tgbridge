@@ -30,12 +30,12 @@ def main():
     wrapper.write_text('#!/bin/sh\nexec ' + shlex.quote(binary)
                        + ' --no-extensions --no-skills --no-prompt-templates --no-context-files "$@"\n')
     wrapper.chmod(0o700)
-    texts, calls, edits = [], [], []
+    texts, calls, edits, records = [], [], [], []
     submitted = False
     token = 'STEER_BEHAVIOR_QA_7264'
     cfg = {'runner': 'pi', 'runner_mode': 'server', 'bot_token': 'fixture-not-a-real-bot',
            'workdir': str(root), 'run_timeout_s': 90, 'run_max_s': 120}
-    live = {'chat_id': 42, 'reply_to': 1, 'trail': [], 'start': time.time()}
+    live = {'chat_id': 42, 'reply_to': 1, 'status_id': 5, 'trail': [], 'start': time.time()}
     original = tgbridge.publish_progress
 
     def publish(cfg, live, event):
@@ -61,7 +61,7 @@ def main():
          mock.patch.object(tgbridge, 'api', side_effect=api), \
          mock.patch.object(tgbridge, 'send_retry', side_effect=lambda cfg, chat, text, **kw: texts.append(text) or True), \
          mock.patch.object(tgbridge, 'send', return_value=True), \
-         mock.patch.object(tgbridge, 'audit'), \
+         mock.patch.object(tgbridge, 'audit', side_effect=lambda event, **kw: records.append(kw) if event == 'tool_action' else None), \
          mock.patch.object(tgbridge, 'publish_progress', side_effect=publish):
         with tgbridge.RUN_LOCK:
             tgbridge.RUN_STATE.update(busy=True, current={'chat': 42, 'runner': 'pi', 'mode': 'server'}, cancel=False)
@@ -86,12 +86,15 @@ def main():
               'steer_in_native_transcript': any(token in x for x in user_text),
               'steer_changes_answer': token in (answer or ''),
               'final_not_repeated': tgbridge.deliverable_answer(live, answer) is None,
-              'action_message_count': sum(e['method'] == 'sendMessage' for e in edits)}
+              'action_message_count': sum(e['method'] == 'sendMessage' for e in edits),
+              'action_record_count': len(records),
+              'single_status_message': bool(edits) and all(e['id'] == 5 for e in edits)}
     (root / 'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2))
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if (not error and submitted and report['steer_in_native_transcript']
                  and report['steer_changes_answer'] and len(texts) >= 2
-                 and report['action_message_count'] >= 2 and report['final_not_repeated']) else 1
+                 and report['action_message_count'] == 0 and report['action_record_count'] >= 2
+                 and report['single_status_message'] and report['final_not_repeated']) else 1
 
 
 if __name__ == '__main__':

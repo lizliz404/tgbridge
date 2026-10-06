@@ -58,7 +58,7 @@ class Crosscheck(unittest.TestCase):
                   {'type': 'tool_execution_start', 'toolName': 'bash', 'args': {'command': 'API_KEY=SECRET_SENTINEL python3 build.py'}}, end('public')]
         _, live = self.run_events(events)
         # Exercise status again: its 8s throttle must not mask tool leakage.
-        live['last_edit'] = 0
+        live['last_status_edit'] = -8
         tgbridge.edit_status({'bot_token': 'fixture'}, live)
         outbound = json.dumps(self.status) + json.dumps(self.sent)
         self.assertNotIn('PRIVATE_SENTINEL', outbound)

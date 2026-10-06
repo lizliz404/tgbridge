@@ -10,12 +10,11 @@ class JournalTests(unittest.TestCase):
         self.sent = []
         self.actions = []
         self.live = {}
-        def send_action(content, message_id):
-            self.actions.append((message_id, content))
-            return message_id if message_id is not None else len(self.actions) + 100
-        self.journal = Journal(self.live, lambda content, first: self.sent.append(content) or True, send_action)
+        def record_action(identity, content):
+            self.actions.append((identity, content))
+        self.journal = Journal(self.live, lambda content, first: self.sent.append(content) or True, record_action)
 
-    def test_each_action_is_durable_and_completion_edits_its_own_message(self):
+    def test_each_action_is_recorded_locally_and_completion_keeps_identity(self):
         start = {'method': 'item/started', 'params': {'item': {
             'id': 'bash1', 'type': 'commandExecution', 'command': 'python3 tests/run_offline.py', 'cwd': '/repo'}}}
         end = {'method': 'item/completed', 'params': {'item': {
@@ -26,8 +25,8 @@ class JournalTests(unittest.TestCase):
         self.journal.emit(codex_event(end))
         self.journal.emit(codex_event(end))
         self.assertEqual(len(self.actions), 2)
-        self.assertIsNone(self.actions[0][0])
-        self.assertEqual(self.actions[1][0], 101)
+        self.assertEqual(self.actions[0][0], "bash1")
+        self.assertEqual(self.actions[1][0], "bash1")
         self.assertIn('python3 tests/run_offline.py', self.actions[1][1])
         self.assertIn('78 tests OK', self.actions[1][1])
         self.assertIn('exit code:\n0', self.actions[1][1])
@@ -38,13 +37,13 @@ class JournalTests(unittest.TestCase):
             'id': 'bash1', 'type': 'commandExecution', 'status': 'inProgress', 'command': 'pwd'}}})
         self.assertEqual(event['state'], 'running')
 
-    def test_ambiguous_action_send_is_not_replayed_on_completion(self):
+    def test_tool_updates_only_record_changes_without_chat_delivery(self):
         calls = []
-        self.journal.send_action = lambda content, message_id: calls.append(content)
+        self.journal.record_action = lambda identity, content: calls.append(content)
         for method in ('item/started', 'item/completed'):
             self.journal.emit(codex_event({'method': method, 'params': {'item': {
                 'id': 'bash1', 'type': 'commandExecution', 'command': 'pwd'}}}))
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
 
     def test_public_text_segments_are_ordered_deduplicated_and_not_repeated_at_end(self):
         for identity, phase, content in [('a', 'commentary', 'checking now'), ('b', 'final_answer', 'fixed it')]:
@@ -87,16 +86,15 @@ class JournalTests(unittest.TestCase):
         self.assertIn('before', self.actions[2][1])
         self.assertIn('after', self.actions[2][1])
 
-    def test_long_commands_and_diffs_are_split_instead_of_discarded(self):
+    def test_long_diffs_are_preserved_locally_without_splitting_into_chat_messages(self):
         diff = '+ 中文😀\n' * 1200
         self.journal.emit(codex_event({'method': 'item/completed', 'params': {'item': {
             'id': 'file1', 'type': 'fileChange', 'status': 'completed',
             'changes': [{'path': '/repo/a.py', 'kind': {'type': 'update'}, 'diff': diff}]}}}))
         combined = ''.join(content for _, content in self.actions)
         self.assertIn(diff.strip(), combined)
-        self.assertGreater(len(self.actions), 1)
-        for _, content in self.actions:
-            self.assertLessEqual(len(content.encode('utf-16-le')) // 2, 3900)
+        self.assertEqual(len(self.actions), 1)
+        self.assertEqual(self.sent, [])
 
     def test_reasoning_and_credentials_do_not_become_public_progress(self):
         self.journal.emit(codex_event({'method': 'item/completed', 'params': {'item': {
@@ -120,10 +118,10 @@ class JournalTests(unittest.TestCase):
                           'state': {'input': {'command': 'pwd'}, 'status': 'running'}}]
                 message = {**meta, 'content': parts} if v2 else {'info': meta, 'parts': parts}
                 response = {'data': [message]} if v2 else [message]
-                self.assertEqual([e['kind'] for e in opencode_snapshot(response, set(), v2)], ['action'])
+                self.assertEqual([e['kind'] for e in opencode_snapshot(response, set(), v2)], ['activity', 'action'])
                 self.assertEqual(list(opencode_snapshot(response, {'new'}, v2)), [])
                 meta['time']['completed'] = 3
-                self.assertEqual([e['kind'] for e in opencode_snapshot(response, set(), v2)], ['text', 'action'])
+                self.assertEqual([e['kind'] for e in opencode_snapshot(response, set(), v2)], ['activity', 'text', 'action'])
 
 
 if __name__ == '__main__':

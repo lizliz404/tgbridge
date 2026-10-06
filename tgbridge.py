@@ -19,6 +19,7 @@ fallback, fence-language carry across chunks, one-element blockquote
 merging (incl. expandable), and native bullet markers.
 """
 
+import html
 import json
 import os
 import queue
@@ -52,7 +53,8 @@ from tgbridge_core.runtime import LOADED_CODE, source_identity
 from tgbridge_core.context import reply_context
 from tgbridge_core.ownership import AlreadyRunning, ProcessLease
 from tgbridge_core.inbox import Inbox, InboxError
-from tgbridge_core.progress import Journal, cli_event, codex_event, opencode_snapshot, pi_event, redact
+from tgbridge_core.questions import Questions
+from tgbridge_core.progress import Journal, activity_body, short_preview, cli_event, codex_event, opencode_snapshot, pi_event, redact
 from tgbridge_core.runners import (
     AUTO_OPENCODE_GO_MODEL,
     RUNNERS,
@@ -310,28 +312,13 @@ def progress_journal(cfg, live):
             return send_retry(cfg, live["chat_id"], text,
                               reply_to=live.get("reply_to") if first else None)
 
-        def send_action(text, message_id):
-            params = {"chat_id": live["chat_id"], "text": text}
-            if text.startswith("<b>"):
-                params["parse_mode"] = "HTML"
-            method = "editMessageText" if message_id is not None else "sendMessage"
-            if message_id is not None:
-                params["message_id"] = message_id
-            else:
-                params["disable_notification"] = True
-                params["link_preview_options"] = json.dumps({"is_disabled": True})
-            error = {}
-            result = api(cfg["bot_token"], method, _error=error, **params)
-            if result and result.get("ok"):
-                return message_id if message_id is not None else (result.get("result") or {}).get("message_id")
-            if message_id is not None and "message is not modified" in str(error.get("description", "")).lower():
-                return message_id
-            preserve_unconfirmed(live["chat_id"], text)
-            return None
+        def record_action(identity, body):
+            audit("tool_action", chat_id=live["chat_id"], action_id=identity,
+                  run_status_id=live.get("status_id"), body=body)
 
         secrets = [cfg.get("bot_token"), cfg.get("transcribe_key")]
-        live["journal"] = Journal(live, send_text, send_action, secrets,
-                                  compact=cfg.get("action_presentation", "compact") != "verbose")
+        live["journal"] = Journal(live, send_text, record_action, secrets,
+                                  update_status=lambda: edit_status(cfg, live))
     return live["journal"]
 
 
@@ -469,26 +456,31 @@ def typing_loop(token, chat_id, stop_event):
 
 
 def edit_status(cfg, live, final=None):
-    now = time.time()
-    if not final and now - live.get("last_edit", 0) < 8:
+    now = time.monotonic()
+    if not final and now - live.get("last_status_edit", -8) < 8:
         return
-    live["last_edit"] = now
-    elapsed = int(now - live["start"])
+    live["last_status_edit"] = now
+    elapsed = max(0, int(time.time() - live["start"]))
     if final:
         extra = ""
         if live.get("cost"):
             extra += f" · {live['tokens'] or 0} tok · ${live['cost']:.4f}"
-        text = f"{final} · {elapsed}s · {len(live['trail'])} tool calls{extra}"
+        text = f"{final} · {elapsed}s{extra}"
     else:
-        trail = redact("\n".join(live["trail"][-5:]),
-                       [cfg.get("bot_token"), cfg.get("transcribe_key")])
-        text = f"⚙️ working… {elapsed}s\n{trail}"
+        secrets = [cfg.get("bot_token"), cfg.get("transcribe_key")]
+        text = f"⚙️ working… {elapsed}s"
+        activity = live.get("activity")
+        if not activity and live.get("trail"):
+            label, _, detail = live["trail"][-1].removeprefix("🔧 ").partition(": ")
+            activity = {"label": label, "preview": detail}
+        if activity:
+            text += "\n" + activity_body(activity, secrets)
         notes = live.get("notes") or []
         if notes:
-            text += "\n" + "\n".join(notes[-2:])
+            text += "\n" + html.escape(short_preview(notes[-1], secrets))
         preview = (live.get("preview") or "").strip().replace("\n", " ")
-        if preview:
-            text += f"\n💬 …{preview[-200:]}"
+        if preview and not (activity and activity.get("label") == "thinking"):
+            text += "\n💬 " + html.escape(short_preview(preview, secrets))
     if live.get("status_id"):
         api(
             cfg["bot_token"],
@@ -496,6 +488,7 @@ def edit_status(cfg, live, final=None):
             chat_id=live["chat_id"],
             message_id=live["status_id"],
             text=text,
+            parse_mode="HTML",
         )
 
 
@@ -1833,6 +1826,48 @@ def _codex_handle_steer_response(cfg, event, run_id):
     return True
 
 
+def _codex_user_question(cfg, proc, event, live, run_id):
+    """Return actual human answers under the native question ids."""
+    questions = (event.get('params') or {}).get('questions') or []
+    broker = cfg.get('_questions')
+    answers = {}
+    replied = False
+    def respond():
+        nonlocal replied
+        if replied:
+            return
+        with RUN_LOCK:
+            if RUN_STATE.get('proc') is not proc or RUN_STATE.get('codex_run_id') != run_id or RUN_STATE.get('cancel'):
+                raise RuntimeError('question belongs to an ended Codex task')
+        _codex_rpc_write(proc, {'id': event['id'], 'result': {'answers': answers}})
+        replied = True
+        mark_run_progress()
+    def offer(index):
+        if index >= len(questions):
+            respond()
+            return
+        question = questions[index]
+        options = question.get('options') or []
+        def selected(value):
+            answers[question['id']] = {'answers': [] if value is None else [value]}
+            if value is None:
+                respond()
+            else:
+                offer(index + 1)
+        broker.offer(live['chat_id'], live.get('requester_user_id'), question['question'],
+                     [option['label'] for option in options], selected, owner=('codex', run_id),
+                     message='\n'.join(option['label'] + '：' + option.get('description', '') for option in options),
+                     timeout=run_max(cfg) * 1000, echo_answer=not question.get('isSecret'))
+    if not broker or not live or live.get('chat_id') is None:
+        respond()  # an unavailable UI never means a default selection
+        return
+    try:
+        offer(0)
+    except Exception as error:
+        audit('codex_question_failed', error=type(error).__name__)
+        respond()
+
+
 def run_codex_app_server(cfg, session_id, prompt, live=None):
     """Run Codex through app-server so `turn/steer` reaches the active turn."""
     sid = session_id
@@ -1977,6 +2012,8 @@ def run_codex_app_server(cfg, session_id, prompt, live=None):
                 signal_run_process(proc, signal.SIGTERM)
                 kill_after(proc, 3)
                 break
+            if cfg.get('_questions') and cfg['_questions'].has_owner(('codex', run_id)):
+                mark_run_progress()
             timeout_reason = run_expiry(cfg, clock_started)
             if timeout_reason:
                 timed_out = True
@@ -2000,6 +2037,9 @@ def run_codex_app_server(cfg, session_id, prompt, live=None):
             if params.get("turnId") not in (None, turn_id):
                 continue
             item = params.get("item") or {}
+            if method == 'item/tool/requestUserInput' and 'id' in event:
+                _codex_user_question(cfg, proc, event, live, run_id)
+                continue
             publish_progress(cfg, live, codex_event(event))
             if method == "item/started":
                 trail = _codex_item_trail(item)
@@ -2083,6 +2123,8 @@ def run_codex_app_server(cfg, session_id, prompt, live=None):
             detail += "\n" + tail
         return sid, None, detail
     finally:
+        if cfg.get('_questions') and run_id is not None:
+            cfg['_questions'].close_owner(('codex', run_id))
         with RUN_LOCK:
             if RUN_STATE.get("codex_run_id") == run_id:
                 RUN_STATE["codex_thread_id"] = None
@@ -2163,10 +2205,12 @@ def _pi_rpc_read_events(stream, events):
         events.put(None)
 
 
-def _pi_rpc_wait_response(events, request_id, timeout=30, keep=None, proc=None):
+def _pi_rpc_wait_response(events, request_id, timeout=30, keep=None, proc=None, ui_handler=None, ui_waiting=None):
     """Wait for one command response; session events are kept aside, not lost."""
     deadline = time.monotonic() + timeout
     while True:
+        if ui_waiting and ui_waiting():
+            deadline = time.monotonic() + timeout
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise RuntimeError(f"Pi RPC {request_id} timed out")
@@ -2181,8 +2225,8 @@ def _pi_rpc_wait_response(events, request_id, timeout=30, keep=None, proc=None):
                 raise RuntimeError(str(event.get("error") or "command failed")[:600])
             return event.get("data") or {}
         if event.get("type") == "extension_ui_request" and proc is not None:
-            # session_start/input extensions can block *before* the command ack.
-            _pi_rpc_decline_ui(proc, event)
+            # Startup/input extensions may ask before the command acknowledgement.
+            (ui_handler or (lambda e: _pi_rpc_decline_ui(proc, e)))(event)
         elif keep is not None:
             keep.append(event)
 
@@ -2219,6 +2263,57 @@ def _pi_rpc_decline_ui(proc, event):
     except Exception as e:
         log(f"pi rpc extension ui decline: {e}")
     audit("pi_extension_ui_declined", method=method, title=str(event.get("title"))[:80])
+
+
+def question_broker(cfg):
+    def send_question(chat, body, keyboard):
+        result = api(cfg['bot_token'], 'sendMessage', chat_id=chat, text=body,
+                     reply_markup=json.dumps({'inline_keyboard': keyboard}))
+        return (result.get('result') or {}).get('message_id') if result and result.get('ok') else None
+    def edit_question(chat, message, body, keyboard):
+        if message is not None:
+            api(cfg['bot_token'], 'editMessageText', chat_id=chat, message_id=message, text=body,
+                reply_markup=json.dumps({'inline_keyboard': keyboard}))
+    def acknowledge(identity, text):
+        api(cfg['bot_token'], 'answerCallbackQuery', callback_query_id=identity, text=text)
+    return Questions(send_question, edit_question, acknowledge, record=audit)
+
+
+def _pi_rpc_ui(cfg, proc, event, live, run_id):
+    broker = cfg.get('_questions')
+    method = event.get('method')
+    if method not in ('select', 'confirm', 'input', 'editor'):
+        if live is not None and method in ('notify', 'setStatus', 'setWidget'):
+            summary = event.get('message') or event.get('statusText') or '\n'.join(event.get('widgetLines') or [])
+            live['activity'] = {'label': 'status', 'preview': summary}
+            edit_status(cfg, live)
+        return
+    if not broker or not live or live.get('chat_id') is None:
+        _pi_rpc_decline_ui(proc, event)
+        return
+    def respond(value):
+        with RUN_LOCK:
+            if RUN_STATE.get('proc') is not proc or RUN_STATE.get('pi_run_id') != run_id or RUN_STATE.get('cancel'):
+                raise RuntimeError('question belongs to an ended Pi task')
+        payload = {'type': 'extension_ui_response', 'id': event['id']}
+        if value is None:
+            payload['cancelled'] = True
+        elif method == 'confirm':
+            payload['confirmed'] = value == '是'
+        else:
+            payload['value'] = value
+        _pi_rpc_write(proc, payload)
+        mark_run_progress()
+    try:
+        broker.offer(live['chat_id'], live.get('requester_user_id'), event.get('title') or '请补充信息',
+                     ['是', '否'] if method == 'confirm' else event.get('options', []), respond,
+                     owner=('pi', run_id), method=method, message=event.get('message') or '',
+                     timeout=event.get('timeout') or run_max(cfg) * 1000)
+        live['activity'] = {'label': 'waiting', 'preview': '等待你回答问题'}
+        edit_status(cfg, live)
+    except Exception as e:
+        audit('pi_question_failed', method=method, error=type(e).__name__)
+        _pi_rpc_decline_ui(proc, event)
 
 
 def _pi_rpc_abort(proc):
@@ -2385,6 +2480,8 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
             state = _pi_rpc_wait_response(
                 events, PI_RPC_STATE_CMD, timeout=PI_RPC_SETUP_TIMEOUT,
                 keep=early_events, proc=proc,
+                ui_handler=lambda event: _pi_rpc_ui(cfg, proc, event, live, run_id),
+                ui_waiting=lambda: bool(cfg.get('_questions') and cfg['_questions'].has_owner(('pi', run_id))),
             )
         except RuntimeError as e:
             log(f"pi rpc get_state: {e}")
@@ -2402,7 +2499,9 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
         )
         accepted = _pi_rpc_wait_response(
             events, PI_RPC_PROMPT_CMD, timeout=PI_RPC_PROMPT_TIMEOUT,
-            keep=early_events, proc=proc
+            keep=early_events, proc=proc,
+            ui_handler=lambda event: _pi_rpc_ui(cfg, proc, event, live, run_id),
+            ui_waiting=lambda: bool(cfg.get('_questions') and cfg['_questions'].has_owner(('pi', run_id))),
         )
         handled = (accepted.get("disposition") or "") == "handled"
 
@@ -2414,6 +2513,8 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
             if cancelled:
                 _pi_rpc_abort(proc)
                 break
+            if cfg.get('_questions') and cfg['_questions'].has_owner(('pi', run_id)):
+                mark_run_progress()  # human decision wait, still bounded by run_max_s
             timeout_reason = run_expiry(cfg, clock_started)
             if timeout_reason:
                 signal_run_process(proc, signal.SIGKILL)
@@ -2433,7 +2534,7 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
             etype = event.get("type")
             publish_progress(cfg, live, pi_event(event))
             if etype == "extension_ui_request":
-                _pi_rpc_decline_ui(proc, event)
+                _pi_rpc_ui(cfg, proc, event, live, run_id)
             elif etype == "message_update":
                 update = event.get("assistantMessageEvent") or {}
                 utype = update.get("type")
@@ -2581,6 +2682,8 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
         return sid, "\n\n".join(segments) or None, detail
     finally:
         orphaned = []
+        if cfg.get('_questions') and run_id is not None:
+            cfg['_questions'].close_owner(('pi', run_id))
         with RUN_LOCK:
             if RUN_STATE.get("pi_run_id") == run_id:
                 RUN_STATE["pi_sid"] = None
@@ -2948,6 +3051,8 @@ def worker(cfg, state):
             )
             live = {
                 "chat_id": chat_id,
+                "requester_user_id": next((e.get('user_id') for e in inbox.pending(chat_id)
+                                           if e['id'] in input_ids), None) if inbox else None,
                 "status_id": (status.get("result") or {}).get("message_id")
                 if status
                 else None,
@@ -3225,6 +3330,14 @@ def handle_update(cfg, state, upd, *, state_path=STATE_PATH):
     ``state_path=None`` keeps pure/self-test calls from persisting fixture state
     into the live bridge store. Runtime callers use the real path by default.
     """
+    query = upd.get('callback_query')
+    if query:
+        message = query.get('message') or {}
+        chat = message.get('chat') or {}
+        user = (query.get('from') or {}).get('id')
+        if is_authorized(cfg, chat.get('id'), chat.get('type'), user) and cfg.get('_questions'):
+            cfg['_questions'].callback(query)
+        return
     msg = upd.get("message")
     if not msg:
         return
@@ -3293,6 +3406,10 @@ def handle_update(cfg, state, upd, *, state_path=STATE_PATH):
         return
 
     cmd, rest = botcmd(text)
+    if not cmd and not has_attachment and cfg.get('_questions'):
+        reply_id = (msg.get('reply_to_message') or {}).get('message_id')
+        if cfg['_questions'].answer_text(chat_id, user_id, text, reply_id):
+            return
     if cmd == "/help":
         send(
             cfg["bot_token"],
@@ -3742,6 +3859,8 @@ def run(cfg):
     inbox = cfg.get("_inbox")
     if inbox is None:
         inbox = cfg["_inbox"] = Inbox(os.path.join(CONFIG_DIR, "inputs.json"))
+    if cfg.get('_questions') is None:
+        cfg['_questions'] = question_broker(cfg)
     if not cfg.get("capture_group_context", True):
         state.pop("context", None)
         state.pop("hints", None)
@@ -3878,7 +3997,7 @@ def run(cfg):
             announce_all(cfg, "💀 bridge worker thread died — respawned")
             worker_t = threading.Thread(target=worker, args=(cfg, state), daemon=True)
             worker_t.start()
-        params = {"timeout": 50, "allowed_updates": json.dumps(["message"])}
+        params = {"timeout": 50, "allowed_updates": json.dumps(["message", "callback_query"])}
         if offset:
             params["offset"] = offset
         poll_error = {}
