@@ -53,16 +53,17 @@ class Crosscheck(unittest.TestCase):
             result = tgbridge.run_pi_rpc({'bot_token': 'fixture', 'workdir': fixture.tmp.name}, 's1', 'go', live)
         return result, live
 
-    def test_private_thinking_and_raw_tool_arguments_never_reach_status(self):
+    def test_public_command_is_visible_but_private_thinking_and_keys_are_redacted(self):
         events = [{'type': 'message_update', 'assistantMessageEvent': {'type': 'thinking_delta', 'delta': 'PRIVATE_SENTINEL'}},
-                  {'type': 'tool_execution_start', 'toolName': 'bash', 'args': {'command': 'PAYLOAD_SENTINEL'}}, end('public')]
+                  {'type': 'tool_execution_start', 'toolName': 'bash', 'args': {'command': 'API_KEY=SECRET_SENTINEL python3 build.py'}}, end('public')]
         _, live = self.run_events(events)
         # Exercise status again: its 8s throttle must not mask tool leakage.
         live['last_edit'] = 0
         tgbridge.edit_status({'bot_token': 'fixture'}, live)
         outbound = json.dumps(self.status) + json.dumps(self.sent)
         self.assertNotIn('PRIVATE_SENTINEL', outbound)
-        self.assertNotIn('PAYLOAD_SENTINEL', outbound)
+        self.assertNotIn('SECRET_SENTINEL', outbound)
+        self.assertIn('python3 build.py', outbound)
 
     def test_first_failed_segment_is_not_hidden_by_later_success(self):
         (_, answer, err), live = self.run_events([end('lost'), end('sent')], [False, True])
@@ -114,14 +115,16 @@ class Crosscheck(unittest.TestCase):
     def test_failed_segment_holds_later_segments_in_order(self):
         live = {'chat_id': 42, 'missing_segments': ['first']}
         with mock.patch.object(tgbridge, 'send_retry') as send:
-            self.assertFalse(tgbridge._pi_send_segment({'bot_token': 'fixture'}, live, 'second'))
+            tgbridge.publish_progress({'bot_token': 'fixture'}, live, {'kind': 'text', 'id': 'second', 'text': 'second'})
         send.assert_not_called()
+        self.assertEqual(live['missing_segments'], ['first', 'second'])
 
     def test_status_privacy_also_applies_to_fallback_transports(self):
-        live = {'chat_id': 42, 'status_id': 5, 'trail': ['🔧 bash: PAYLOAD_SENTINEL'],
+        live = {'chat_id': 42, 'status_id': 5, 'trail': ['🔧 bash: API_KEY=SECRET_SENTINEL python3 build.py'],
                 'thinking': 'PRIVATE_SENTINEL', 'start': time.time()}
         tgbridge.edit_status({'bot_token': 'fixture'}, live)
         self.assertNotIn('SENTINEL', json.dumps(self.status))
+        self.assertIn('python3 build.py', json.dumps(self.status))
 
     def test_utf8_and_unicode_line_separators_preserve_jsonl_records(self):
         import io

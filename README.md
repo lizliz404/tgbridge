@@ -14,7 +14,9 @@ long-poll in, local CLI agent out.
 - **Same-turn steering where supported** — Codex app-server uses `turn/steer`; OpenCode server mode uses `prompt_async`; Pi runs on its native RPC transport (`steer`, consumed after the current tool batch and before the next model request—not after the whole task). Live same-chat text bypasses idle burst debounce; injection is submitted before the Telegram acknowledgement, so a slow/rate-limited send cannot gate it. Inputs received during Pi/Codex startup wait for the live transport instead of being queued behind the whole run. Active tools are not cancelled
 - **Burst coalescing** — adjacent Telegram messages are held briefly and merged, so automatic 4096-character splits do not become many separate agent runs
 - **Inbound photos + documents** — downloaded privately and passed as local paths; an unaddressed group upload is retained for the next @mention/reply, so the file itself needs no tag
-- **Live progress** — one status message, edited in place: elapsed seconds, real-time tool-call trail, and answer tail, read from CLI stdout or the server's persisted transcript
+- **Durable action messages** — each Pi, Codex, or OpenCode tool action creates its own Telegram message showing commands, arguments, file changes and results. Completion updates that action's message; the final status never erases the action history. Long details split within Telegram's UTF-16 limit, with credentials redacted
+- **Segmented public replies** — completed assistant messages are delivered individually, including public progress commentary. One shared delivery journal handles CLI, Pi RPC, Codex app-server and OpenCode server snapshots, deduplicates repeated events, and avoids resending the joined answer at the end
+- **Live status** — a separate status message tracks elapsed time, recent tools and answer preview; durable actions and completed replies remain in the chat
 - **Segmented replies on Pi RPC** — because Pi's `--mode json` is one-shot and every `message_end` overwrites the previous segment, a long multi-step turn used to arrive as a single final block. With `runner_modes: {"pi": "server"}` each completed assistant segment is sent as its own Telegram message while tool calls stay in the status line, so the process is visible step by step instead of only at the end
 - **Voice notes** — auto-transcribed via any OpenAI-compatible `/audio/transcriptions` API (Groq Whisper, OpenAI, self-hosted) and fed to the agent as text; opt-in via config
 - **Scheduled prompts** — `/at 30m <prompt>` (also `s`/`h`); persisted in state and re-armed on restart
@@ -220,6 +222,7 @@ runner's historical transcript.
 Stable, independently testable boundaries live under `tgbridge_core/`:
 
 - `rendering.py` — Markdown-to-Telegram HTML and UTF-16-aware chunking
+- `progress.py` — native event normalization and the shared durable action/text delivery journal
 - `health.py` — redacted proxy inspection and network failure classification
 - `storage.py` — private directories and atomic JSON persistence
 - `runners.py` — capability registries and native Codex/OpenCode/Pi CLI adapters

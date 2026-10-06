@@ -246,7 +246,7 @@ def _balanced(html):
     return not stack
 
 
-def split_chunks(text, limit=3900):
+def split_chunks(text, limit=3900, *, preserve_whitespace=False):
     if utf16_len(text) <= limit:
         return [text]
     chunks, rest = [], text
@@ -275,7 +275,6 @@ def split_chunks(text, limit=3900):
                 cut = safe
         if cut < 1:
             cut = 1  # degenerate budget: always consume one codepoint
-        chunks.append(rest[:cut].rstrip())
-        rest = rest[cut:].lstrip()
+        chunks.append(rest[:cut] if preserve_whitespace else rest[:cut].rstrip())
+        rest = rest[cut:] if preserve_whitespace else rest[cut:].lstrip()
     return [c for c in chunks if c] or [""]
-

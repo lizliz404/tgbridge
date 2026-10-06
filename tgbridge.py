@@ -48,6 +48,7 @@ from tgbridge_core.health import (
     systemd_notify,
 )
 from tgbridge_core.storage import ensure_private_dir, load_json, save_json
+from tgbridge_core.progress import Journal, cli_event, codex_event, opencode_snapshot, pi_event, redact
 from tgbridge_core.runners import (
     AUTO_OPENCODE_GO_MODEL,
     RUNNERS,
@@ -270,6 +271,12 @@ def send_retry(cfg, chat_id, text, reply_to=None):
     limit = cfg.get("chunk") or CHUNK
     if send(cfg["bot_token"], chat_id, text, reply_to=reply_to, chunk_limit=limit):
         return True
+    preserve_unconfirmed(chat_id, text)
+    return False
+
+
+def preserve_unconfirmed(chat_id, text):
+    """Private recovery copy shared by assistant text and action messages."""
     audit("delivery_failed", chat_id=chat_id, chars=len(text or ""))
     log(f"chat={chat_id} DELIVERY UNCONFIRMED ({len(text or '')} chars)")
     try:
@@ -284,7 +291,47 @@ def send_retry(cfg, chat_id, text, reply_to=None):
         log("saved undelivered payload")
     except OSError:
         pass
-    return False
+
+
+def progress_journal(cfg, live):
+    if live is None or live.get("chat_id") is None:
+        return None
+    if "journal" not in live:
+        def send_text(text, first):
+            return send_retry(cfg, live["chat_id"], text,
+                              reply_to=live.get("reply_to") if first else None)
+
+        def send_action(text, message_id):
+            params = {"chat_id": live["chat_id"], "text": text}
+            method = "editMessageText" if message_id is not None else "sendMessage"
+            if message_id is not None:
+                params["message_id"] = message_id
+            else:
+                params["disable_notification"] = True
+                params["link_preview_options"] = json.dumps({"is_disabled": True})
+            error = {}
+            result = api(cfg["bot_token"], method, _error=error, **params)
+            if result and result.get("ok"):
+                return message_id if message_id is not None else (result.get("result") or {}).get("message_id")
+            if message_id is not None and "message is not modified" in str(error.get("description", "")).lower():
+                return message_id
+            preserve_unconfirmed(live["chat_id"], text)
+            return None
+
+        secrets = [cfg.get("bot_token"), cfg.get("transcribe_key")]
+        live["journal"] = Journal(live, send_text, send_action, secrets)
+    return live["journal"]
+
+
+def publish_progress(cfg, live, event):
+    journal = progress_journal(cfg, live)
+    if journal:
+        journal.emit(event)
+
+
+def publish_snapshot(cfg, live, messages, baseline, v2=False):
+    for event in opencode_snapshot(messages, baseline, v2):
+        publish_progress(cfg, live, event)
 
 
 def _post(url, data, timeout):
@@ -421,11 +468,8 @@ def edit_status(cfg, live, final=None):
             extra += f" · {live['tokens'] or 0} tok · ${live['cost']:.4f}"
         text = f"{final} · {elapsed}s · {len(live['trail'])} tool calls{extra}"
     else:
-        # Apply the same privacy boundary to CLI and fallback transports.
-        trail = "\n".join(
-            line.split(": ", 1)[0] if line.startswith("🔧 ") else line
-            for line in live["trail"][-5:]
-        )
+        trail = redact("\n".join(live["trail"][-5:]),
+                       [cfg.get("bot_token"), cfg.get("transcribe_key")])
         text = f"⚙️ working… {elapsed}s\n{trail}"
         notes = live.get("notes") or []
         if notes:
@@ -446,11 +490,12 @@ def edit_status(cfg, live, final=None):
 def deliverable_answer(live, answer):
     """Text the worker still owes the chat after a finished run.
 
-    A transport that delivered the assistant segments itself (Pi RPC) marks
-    `live["streamed"]`: re-sending the joined answer would duplicate the
-    conversation. Anything else — CLI runs, and server runs that fell back to
-    another runner — returns the answer unchanged.
+    Every native adapter uses the same journal to reconcile completed public
+    segments with the final answer. Synthetic/legacy callers without a journal
+    retain the existing streamed/missing-segment compatibility behavior.
     """
+    if (live or {}).get("journal"):
+        return live["journal"].remaining(answer)
     # Hermes gateway/run.py: suppress only content confirmed delivered, not
     # merely because some intermediate commentary reached the chat.
     if (live or {}).get("missing_segments"):
@@ -551,6 +596,7 @@ def run_agent(cfg, session_id, prompt, live=None):
                 continue
             mark_run_progress()
             trail = parse(ev, acc)
+            publish_progress(cfg, live, cli_event(rname, ev))
             sid = acc["sid"]
             if live is not None:
                 if trail:
@@ -563,6 +609,9 @@ def run_agent(cfg, session_id, prompt, live=None):
                     live["preview"] = acc["texts"][-1]
                     edit_status(cfg, live)
         proc.wait()
+        journal = (live or {}).get("journal")
+        if journal and journal.texts:
+            acc["texts"] = list(journal.texts)
     finally:
         stop_timeout.set()
         with RUN_LOCK:
@@ -571,7 +620,7 @@ def run_agent(cfg, session_id, prompt, live=None):
             cancelled = RUN_STATE.pop("cancel", False)
     if timed_out:
         reason = "idle" if timed_out[-1] == "idle" else "absolute maximum"
-        partial = "\n".join(acc["texts"]).strip()
+        partial = "\n\n".join(acc["texts"]).strip()
         if partial:
             return (
                 sid,
@@ -581,7 +630,7 @@ def run_agent(cfg, session_id, prompt, live=None):
             )
         return sid, None, "agent hit the %s timeout and was killed" % reason
     if cancelled and proc.returncode != 0:
-        partial = "\n".join(acc["texts"]).strip()
+        partial = "\n\n".join(acc["texts"]).strip()
         if partial:
             return sid, partial + "\n\n🛑 (cancelled by user — partial answer)", None
         return sid, None, CANCEL_MSG
@@ -596,7 +645,7 @@ def run_agent(cfg, session_id, prompt, live=None):
         return sid, None, str(acc["runner_error"])[-600:]
     if not acc["texts"]:
         return sid, None, "agent returned no text"
-    return sid, "\n".join(acc["texts"]).strip(), None
+    return sid, "\n\n".join(acc["texts"]).strip(), None
 
 
 def effective_run_config(cfg, state):
@@ -708,6 +757,7 @@ def run_with_fallbacks(cfg, session_id, prompt, live=None, result_meta=None):
         # dies must not make a fallback answer look already-delivered.
         live["streamed"] = False
         live["missing_segments"] = []
+        live.pop("journal", None)
     new_sid, answer, err = run_one(
         dict(cfg, runner=rname, model=model), session_id, prompt, live
     )
@@ -745,6 +795,7 @@ def run_with_fallbacks(cfg, session_id, prompt, live=None, result_meta=None):
         if live is not None:
             live["streamed"] = False
             live["missing_segments"] = []
+            live.pop("journal", None)
         try:
             fallback_timeout = int(cfg.get("fallback_run_timeout_s", 0))
         except (TypeError, ValueError):
@@ -1247,6 +1298,7 @@ def run_agent_server_v1(cfg, session_id, prompt, live=None):
                 last_snapshot = snapshot
                 mark_run_progress()
             trails, infos = server_messages(messages, baseline, acc, seen)
+            publish_snapshot(cfg, live, messages, baseline)
             if live is not None:
                 if trails:
                     live["trail"].extend(trails)
@@ -1302,6 +1354,7 @@ def run_agent_server_v1(cfg, session_id, prompt, live=None):
                         or []
                     )
                     trails, _ = server_messages(messages, baseline, acc, seen)
+                    publish_snapshot(cfg, live, messages, baseline)
                     if live is not None and trails:
                         live["trail"].extend(trails)
                     break
@@ -1320,6 +1373,7 @@ def run_agent_server_v1(cfg, session_id, prompt, live=None):
                 or []
             )
             server_messages(messages, baseline, acc, seen)
+            publish_snapshot(cfg, live, messages, baseline)
         except Exception as e:
             log(f"server final transcript: {e}")
 
@@ -1545,6 +1599,7 @@ def run_agent_server_v2(cfg, session_id, prompt, live=None):
                 last_snapshot = snapshot
                 mark_run_progress()
             trails, infos = server_messages_v2(messages, baseline, acc, seen)
+            publish_snapshot(cfg, live, messages, baseline, v2=True)
             if live is not None:
                 if trails:
                     live["trail"].extend(trails)
@@ -1590,6 +1645,7 @@ def run_agent_server_v2(cfg, session_id, prompt, live=None):
                         or {}
                     )
                     server_messages_v2(final_messages, baseline, acc, seen)
+                    publish_snapshot(cfg, live, final_messages, baseline, v2=True)
                     break
             time.sleep(poll_s)
         with RUN_LOCK:
@@ -1762,7 +1818,6 @@ def run_codex_app_server(cfg, session_id, prompt, live=None):
     events = queue.Queue()
     errbuf = []
     answer_final = []
-    answer_unknown = []
     seen_messages = set()
     previews = {}
     turn_error = None
@@ -1920,6 +1975,7 @@ def run_codex_app_server(cfg, session_id, prompt, live=None):
             if params.get("turnId") not in (None, turn_id):
                 continue
             item = params.get("item") or {}
+            publish_progress(cfg, live, codex_event(event))
             if method == "item/started":
                 trail = _codex_item_trail(item)
                 if trail and live is not None:
@@ -1940,10 +1996,8 @@ def run_codex_app_server(cfg, session_id, prompt, live=None):
                 if item_id:
                     seen_messages.add(item_id)
                 text = (item.get("text") or "").strip()
-                if text and item.get("phase") == "final_answer":
+                if text:
                     answer_final.append(text)
-                elif text and item.get("phase") is None:
-                    answer_unknown.append(text)
             elif method == "error":
                 if not params.get("willRetry"):
                     turn_error = json.dumps(
@@ -1976,7 +2030,7 @@ def run_codex_app_server(cfg, session_id, prompt, live=None):
         for meta in outstanding:
             _steer_fallback(cfg, meta, "app-server closed before steer acknowledgement")
 
-        answer = "\n\n".join(answer_final or answer_unknown).strip()
+        answer = "\n\n".join(answer_final).strip()
         if timed_out and answer:
             return (
                 sid,
@@ -2151,23 +2205,6 @@ def _pi_rpc_abort(proc):
         log(f"pi rpc abort: {e}")
 
 
-def _pi_send_segment(cfg, live, text, first=False):
-    """Deliver one completed assistant segment as its own chat message."""
-    chat_id = live.get("chat_id")
-    if chat_id is None:
-        return False
-    # If one segment failed, keep the following ones for the final delivery;
-    # otherwise recovering connectivity could show later text before the hole.
-    if live.get("missing_segments"):
-        return False
-    return send_retry(
-        cfg,
-        chat_id,
-        text,
-        reply_to=live.get("reply_to") if first else None,
-    )
-
-
 def _pi_send_trailer(cfg, live, text):
     """A one-line footer for a streamed run (partial / cancelled / error)."""
     chat_id = live.get("chat_id")
@@ -2253,8 +2290,8 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
     """Run Pi over `--mode rpc`.
 
     Turns one agent run into a chat-shaped stream: each completed assistant
-    segment is sent as its own message, tool calls stay in the editable status
-    line, and a same-chat human message is steered into the live turn instead
+    segment and each tool action use the shared durable progress journal,
+    and a same-chat human message is steered into the live turn instead
     of waiting for a possibly 30-minute run to finish.
     """
     sid = session_id
@@ -2271,7 +2308,6 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
     handled = False
     run_id = None
     queued_steers = 0
-    stream_broken = False
     if live is not None:
         live["missing_segments"] = []
         live["thinking"] = ""
@@ -2366,6 +2402,7 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
             if _pi_handle_steer_response(cfg, event, run_id):
                 continue
             etype = event.get("type")
+            publish_progress(cfg, live, pi_event(event))
             if etype == "extension_ui_request":
                 _pi_rpc_decline_ui(proc, event)
             elif etype == "message_update":
@@ -2414,14 +2451,6 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
                 segments.append(text)
                 if live is None:
                     continue
-                if _pi_send_segment(cfg, live, text, first=len(segments) == 1):
-                    live["streamed"] = not stream_broken
-                    live["preview"] = ""
-                else:
-                    # Sticky failure: later success cannot hide a missing segment.
-                    stream_broken = True
-                    live["missing_segments"].append(text)
-                    live["streamed"] = False
             elif etype == "queue_update":
                 pending = len(event.get("steering") or [])
                 if live is not None and pending != queued_steers:
