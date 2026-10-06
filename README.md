@@ -10,11 +10,13 @@ long-poll in, local CLI agent out.
 
 - **DM + group chats** — groups are mention-triggered (@bot or reply-to-bot), DMs always answer
 - **Per-chat sessions** — each chat maps to one native runner session (`/new` forgets the mapping, `/status` inspects it). Pi CLI/RPC sessions receive a native display name `Telegram · hostname · @bot · chat ID` on creation/resume; new OpenCode CLI sessions receive the same title. Storage locations and native IDs remain unchanged
-- **Agent failover + switching** — any failed CLI or server-mode run (quota, dead binary, broken network, timeout, empty answer) automatically walks `runner_fallbacks` with a fresh runner-native session and a one-line 🔀 header; only user cancel stops the chain. The same runner may appear repeatedly with different models, so a dead model/provider rotates without mixing Codex/OpenCode/Pi session IDs. `auto:opencode-go` discovers the current Go catalog and expands to the newest Muse Spark Contributor followed by the newest GLM, so model-version bumps do not require config edits. `/runners` shows the resolved chain and on-device availability probe; `/runner <name> [model]` switches the global primary without restarting (`/runner default` restores file config)
+- **Agent failover + switching** — a failed CLI or server-mode run (quota, dead binary, broken network, timeout, empty answer) automatically walks `runner_fallbacks` only before any observed tool action; a partially executed task stays interrupted rather than replaying unknown side effects. Eligible failures walk `runner_fallbacks` with a fresh runner-native session and a one-line 🔀 header; user cancel or uncertain tool execution stops the chain. The same runner may appear repeatedly with different models, so a dead model/provider rotates without mixing Codex/OpenCode/Pi session IDs. `auto:opencode-go` discovers the current Go catalog and expands to the newest Muse Spark Contributor followed by the newest GLM, so model-version bumps do not require config edits. `/runners` shows the resolved chain and on-device availability probe; `/runner <name> [model]` switches the global primary without restarting (`/runner default` restores file config)
 - **Same-turn steering where supported** — Codex app-server uses `turn/steer`; OpenCode server mode uses `prompt_async`; Pi runs on its native RPC transport (`steer`, consumed after the current tool batch and before the next model request—not after the whole task). Live same-chat text bypasses idle burst debounce; injection is submitted before the Telegram acknowledgement, so a slow/rate-limited send cannot gate it. Inputs received during Pi/Codex startup wait for the live transport instead of being queued behind the whole run. Active tools are not cancelled
 - **Burst coalescing** — adjacent Telegram messages are held briefly and merged, so automatic 4096-character splits do not become many separate agent runs
+- **Reply / quote context** — current input, replied-to full text and selected quote remain separate; source IDs/sender and downloaded source attachments stay associated. Missing source text/files and bounded truncation are explicit; quoted text is data, not new instructions
+- **Durable inputs** — accepted addressed prompts persist before Telegram offset advances. Restart restores only unexecuted inputs; executing/steering tasks become interrupted with `/pending` + explicit `/resume <id>`. Stored results are inspectable with `/result <id>`; uncertain sending never auto-replays tool execution. No guarantee yet for passive group burst tails, scheduled-to-queue transfer, or exact live segment receipts across crashes
 - **Inbound photos + documents** — downloaded privately and passed as local paths; an unaddressed group upload is retained for the next @mention/reply, so the file itself needs no tag
-- **Durable action messages** — each Pi, Codex, or OpenCode tool action creates its own Telegram message showing commands, arguments, file changes and results. Completion updates that action's message; the final status never erases the action history. Long details split within Telegram's UTF-16 limit, with credentials redacted
+- **Durable action messages** — each Pi, Codex, or OpenCode tool action creates its own Telegram message with a numbered human-readable summary and observed status; commands, arguments, file changes and results live inside a native expandable details block (`action_presentation: "verbose"` restores plain technical messages). Completion updates that action's message; the final status never erases the action history. Long details split within Telegram's UTF-16 limit, with credentials redacted
 - **Segmented public replies** — completed assistant messages are delivered individually, including public progress commentary. One shared delivery journal handles CLI, Pi RPC, Codex app-server and OpenCode server snapshots, deduplicates repeated events, and avoids resending the joined answer at the end
 - **Live status** — a separate status message tracks elapsed time, recent tools and answer preview; durable actions and completed replies remain in the chat
 - **Segmented replies on Pi RPC** — because Pi's `--mode json` is one-shot and every `message_end` overwrites the previous segment, a long multi-step turn used to arrive as a single final block. With `runner_modes: {"pi": "server"}` each completed assistant segment is sent as its own Telegram message while tool calls stay in the status line, so the process is visible step by step instead of only at the end
@@ -83,7 +85,7 @@ lockout, 300s main-loop watchdog, 20s stop deadline, and cgroup child cleanup.
 A progressing network-retry loop still feeds the watchdog; a wedged control
 loop does not. Installing the updated unit and restarting is required—updating
 Python alone does not enable the watchdog. Native sessions remain persistent,
-but in-memory queued inputs are not guaranteed to survive a bridge restart.
+and accepted addressed inputs are persisted separately in `inputs.json`. Never\nassume an interrupted task's side effects are safe to repeat: `/resume` requests\na history/results inspection first. Passive group burst tails and scheduled-job\ntransfer are not yet covered by the durable input journal.
 
 macOS (launchd):
 
@@ -105,8 +107,14 @@ python3 tgbridge.py --doctor
 The command exits nonzero when config/state, the effective selected runner,
 Telegram, or the running bridge is unavailable. It checks the service PID and
 requires a successful long poll within the last 180 seconds; a successful
-`getMe` alone cannot make a stopped or wedged service healthy. Its JSON output
-redacts proxy credentials and reports dead localhost proxy endpoints.
+`getMe` alone cannot make a stopped or wedged service healthy. It also compares
+the running process's startup code identity with the current checkout: a Git
+revision plus SHA-256 of the entry point and core Python sources. Source-only
+archives work without Git. Missing or different startup evidence fails the
+check; pulling new code on disk is not deployment. `health.json` records this
+as `loaded_code`, and the audit log records the startup PID and identity.
+Its JSON output redacts proxy credentials and reports dead localhost proxy
+endpoints.
 
 **4. Talk to it.** DM the bot, or add it to a group and @mention it.
 For groups you may want BotFather → `/setprivacy` → Disable, or make the bot
@@ -153,6 +161,7 @@ To post to Telegram yourself: python3 /path/to/tgbridge/tgbridge.py --send <chat
 | `allowed_chats` | Chat IDs the bridge listens in (DM + groups); also gates `--send` |
 | `allow_all_users_in_allowed_groups` | If `true`, trust members of allowlisted groups without listing every user ID; DMs remain user-allowlisted (default `false`) |
 | `capture_group_context` | Buffer the last 20 eligible human group messages for the next prompt (default `true`) |
+| `action_presentation` | `compact` (default): numbered summary + expandable technical details; `verbose`: plain technical action messages |
 | `input_debounce_s` | Merge adjacent Telegram messages for this many seconds before dispatch (default `1.5`, clamped to `0.2`–`5.0`) |
 | `workdir` | Working directory for the agent |
 | `runner` | `opencode` (default), `codex`, or `pi` |
@@ -186,7 +195,7 @@ still accepted as `runner_mode: "server"` for backward compatibility.
 
 Runtime files (never committed) live under `~/.config/tgbridge/` with private
 permissions: `state.json` (session index, Telegram offset, scheduled prompts),
-`health.json` (poll status and last success/error), `audit.jsonl`, downloaded
+`health.json` (poll status, startup code identity and last success/error),\n`inputs.json` (accepted prompts/results and recovery state), `bridge.lock`\n(single process ownership), `audit.jsonl`, downloaded
 attachments, and undelivered replies.
 
 ### Telegram is silent but the service says running
@@ -204,7 +213,7 @@ pointing to a localhost port whose proxy process stopped or moved.
   `NO_PROXY` entries for `api.telegram.org,127.0.0.1,localhost` to the service
   environment. If the network requires a proxy, repair its endpoint instead.
 
-After restarting, verify at least one complete 50-second long-poll interval.
+For an explicitly approved, idle Linux restart, the operator helper is:\n\n```sh\npython3 tests/restart_local.py --approved --chat <allowlisted-requester-chat>\n```\n\nIt refuses active bridge children, checks new owner PID + loaded source identity\n+ a full poll interval + preserved native session mappings, persists\n`maintenance/restart-result.json`, and attempts one requester success/failure\nnotice. Unconfirmed feedback remains visible in the receipt; it is not blindly\nresent. No automatic restart is scheduled by editing source. This helper is\nLinux-only; macOS recovery remains a separate unaccepted adapter.\n\nAfter restarting, verify at least one complete 50-second long-poll interval.
 Do not treat `running` or a one-off `getMe` response as end-to-end health.
 
 ### Session storage model

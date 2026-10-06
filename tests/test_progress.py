@@ -56,6 +56,12 @@ class JournalTests(unittest.TestCase):
         self.assertIsNone(self.journal.remaining('checking now\n\nfixed it'))
         self.assertEqual(self.journal.remaining('checking now\n\nfixed it\n\n⚠️ partial'), '⚠️ partial')
 
+    def test_native_whitespace_boundaries_do_not_repeat_final_answer(self):
+        for identity, content in [('a', 'checking now\n\n'), ('b', '\nfinished\n')]:
+            self.journal.emit({'kind': 'text', 'id': identity, 'text': content})
+        self.assertEqual(self.sent, ['checking now', 'finished'])
+        self.assertIsNone(self.journal.remaining('checking now\n\nfinished'))
+
     def test_failed_text_holds_later_text_and_recovers_only_the_missing_segments(self):
         outcomes = iter([True, False])
         calls = []

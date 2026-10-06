@@ -1,0 +1,37 @@
+{
+  "root": "/tmp/tgbridge-pi-acceptance-0lwvv243",
+  "session": "01a10fe8-61da-73f9-8100-dd8677044012",
+  "error": null,
+  "actions": [
+    {
+      "id": "call_S9p2C6sEzu4DgQeLCJtGPdkM",
+      "state": "running",
+      "label": "read"
+    },
+    {
+      "id": "call_S9p2C6sEzu4DgQeLCJtGPdkM",
+      "state": "completed",
+      "label": "read"
+    },
+    {
+      "id": "call_K9XZK9OKNsllbmYtWRhZxMHT",
+      "state": "running",
+      "label": "bash"
+    },
+    {
+      "id": "call_K9XZK9OKNsllbmYtWRhZxMHT",
+      "state": "completed",
+      "label": "bash"
+    }
+  ],
+  "public_segments": [
+    "I’ll read `fixture.txt` first.",
+    "I’ll run `sleep 5; pwd` now.",
+    "`fixture.txt` contains “read-only QA fixture”. The command returned `/tmp/tgbridge-pi-acceptance-0lwvv243`.\n\nSTEER_BEHAVIOR_QA_7264"
+  ],
+  "steer_submitted": true,
+  "steer_in_native_transcript": true,
+  "steer_changes_answer": true,
+  "final_not_repeated": true,
+  "action_message_count": 2
+}

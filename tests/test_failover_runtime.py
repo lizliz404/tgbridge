@@ -5,6 +5,17 @@ import tgbridge
 
 
 class ServerFailoverTests(unittest.TestCase):
+    def test_crash_after_tool_execution_does_not_replay_with_fallback(self):
+        live = {'trail': []}
+        cfg = {'runner': 'pi', 'runner_fallbacks': [{'runner': 'codex'}]}
+        def failed(cfg, session_id, prompt, live):
+            live['journal'] = mock.Mock(actions={'write-1': {'state': 'running'}})
+            return 's', None, 'Pi RPC exited before agent_settled'
+        with mock.patch.object(tgbridge, 'run_one', side_effect=failed) as run:
+            result = tgbridge.run_with_fallbacks(cfg, None, 'mutate production', live)
+        run.assert_called_once()
+        self.assertEqual(result[2], 'Pi RPC exited before agent_settled')
+
     def test_runner_modes_override_the_legacy_global_mode(self):
         cfg = {
             "runner_mode": "server",

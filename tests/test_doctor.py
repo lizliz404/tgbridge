@@ -26,11 +26,23 @@ class DoctorTests(unittest.TestCase):
                 self.assertEqual(recovered["last_poll_ok_at"], "new poll")
             self.assertEqual(state.read_bytes(), before)
 
-    def report(self, service_ok, state=None):
+    def test_health_writer_sets_actual_owner_pid_not_merged_stale_pid(self):
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(tgbridge, 'HEALTH_PATH', os.path.join(root, 'health.json')), \
+             mock.patch.object(tgbridge, 'HEALTH_OWNER_PID', os.getpid()):
+            result = tgbridge.update_health(status='starting', pid=999999)
+            self.assertEqual(result['pid'], os.getpid())
+            with mock.patch.object(tgbridge.os, 'getpid', return_value=999999):
+                with self.assertRaises(RuntimeError):
+                    tgbridge.update_health(status='healthy')
+
+    def report(self, service_ok, state=None, loaded_code=None):
         cfg = {"bot_token": "fixture", "runner": "codex", "workdir": "/fixture"}
         def load(path, default):
             return {tgbridge.CONFIG_PATH: cfg, tgbridge.STATE_PATH: state or {},
-                    tgbridge.HEALTH_PATH: {"status": "healthy"}}.get(path, default)
+                    tgbridge.HEALTH_PATH: {"status": "healthy", "loaded_code":
+                        tgbridge.source_identity(Path(tgbridge.__file__).parent)
+                        if loaded_code is None else loaded_code}}.get(path, default)
         runners = {name: mock.Mock(return_value=([], None)) for name in ("codex", "opencode")}
         with mock.patch.object(tgbridge, "load_json", side_effect=load), \
              mock.patch.object(tgbridge, "ensure_private_storage"), \
@@ -46,6 +58,14 @@ class DoctorTests(unittest.TestCase):
         self.assertTrue(report["telegram"]["ok"])
         self.assertTrue(report["runner"]["ok"])
         self.assertFalse(report["ok"])
+
+    def test_disk_update_or_missing_loaded_version_is_not_deployed(self):
+        for loaded in ({}, {"revision": "old", "source_sha256": "old"}):
+            with self.subTest(loaded=loaded):
+                report, _ = self.report(True, loaded_code=loaded)
+                self.assertTrue(report["service"]["ok"])
+                self.assertFalse(report["code"]["ok"])
+                self.assertFalse(report["ok"])
 
     def test_doctor_uses_persisted_runner_override(self):
         report, runners = self.report(True, {"runner_override": {"runner": "opencode", "model": "provider/model"}})

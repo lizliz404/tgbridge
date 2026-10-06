@@ -48,6 +48,10 @@ from tgbridge_core.health import (
     systemd_notify,
 )
 from tgbridge_core.storage import ensure_private_dir, load_json, save_json
+from tgbridge_core.runtime import LOADED_CODE, source_identity
+from tgbridge_core.context import reply_context
+from tgbridge_core.ownership import AlreadyRunning, ProcessLease
+from tgbridge_core.inbox import Inbox, InboxError
 from tgbridge_core.progress import Journal, cli_event, codex_event, opencode_snapshot, pi_event, redact
 from tgbridge_core.runners import (
     AUTO_OPENCODE_GO_MODEL,
@@ -70,6 +74,7 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 STATE_PATH = os.path.join(CONFIG_DIR, "state.json")
 AUDIT_PATH = os.path.join(CONFIG_DIR, "audit.jsonl")
 HEALTH_PATH = os.path.join(CONFIG_DIR, "health.json")
+HEALTH_OWNER_PID = None
 OPENCODE_SERVER = os.environ.get("OPENCODE_SERVER", "http://localhost:4096")
 RUN_TIMEOUT_S = 900
 RUN_MAX_S = 43200
@@ -150,6 +155,10 @@ def update_health(**fields):
     # the audit log, not alongside this process's current healthy status.
     health = {} if fields.get("status") == "starting" else load_json(HEALTH_PATH, {})
     health.update(fields)
+    if HEALTH_OWNER_PID is not None:
+        if os.getpid() != HEALTH_OWNER_PID:
+            raise RuntimeError("non-owner process cannot write service health")
+        health["pid"] = HEALTH_OWNER_PID
     health["updated_at"] = now_iso()
     save_json(HEALTH_PATH, health)
     return health
@@ -303,6 +312,8 @@ def progress_journal(cfg, live):
 
         def send_action(text, message_id):
             params = {"chat_id": live["chat_id"], "text": text}
+            if text.startswith("<b>"):
+                params["parse_mode"] = "HTML"
             method = "editMessageText" if message_id is not None else "sendMessage"
             if message_id is not None:
                 params["message_id"] = message_id
@@ -319,7 +330,8 @@ def progress_journal(cfg, live):
             return None
 
         secrets = [cfg.get("bot_token"), cfg.get("transcribe_key")]
-        live["journal"] = Journal(live, send_text, send_action, secrets)
+        live["journal"] = Journal(live, send_text, send_action, secrets,
+                                  compact=cfg.get("action_presentation", "compact") != "verbose")
     return live["journal"]
 
 
@@ -739,13 +751,11 @@ def run_one(cfg, session_id, prompt, live=None):
 
 
 def run_with_fallbacks(cfg, session_id, prompt, live=None, result_meta=None):
-    """Run the primary runner, failing over across runners on ANY failure.
+    """Fail over an unusable runner only before observed tool execution.
 
-    The bridge does not care how or why a runner broke — quota, dead
-    binary, broken network path, empty answer: if it is unusable, tag it
-    (audit kind=quota|unavailable|other) and try the next entry of
-    `runner_fallbacks`. Only a user cancel stops the chain; everything else
-    walks it. Fallback steps always start a fresh session — session/thread
+    Tag quota/dead binary/network/empty-answer failures and try the next
+    fallback when no tool action was observed. Cancel and uncertain executed
+    actions stop the chain; replaying them in a fresh runner is unsafe. Fallback steps always start a fresh session — session/thread
     IDs are runner-native and cannot resume across runners — and the
     delivered answer carries a one-line 🔀 header naming the runner that
     actually answered.
@@ -761,7 +771,10 @@ def run_with_fallbacks(cfg, session_id, prompt, live=None, result_meta=None):
     new_sid, answer, err = run_one(
         dict(cfg, runner=rname, model=model), session_id, prompt, live
     )
-    if answer is not None or (err or "") == CANCEL_MSG:
+    uncertain = bool(live and live.get("journal") and live["journal"].actions)
+    if answer is not None or (err or "") == CANCEL_MSG or uncertain:
+        # A tool already ran: retrying the original prompt in a fresh runner
+        # could repeat external side effects whose outcome we do not know.
         if result_meta is not None:
             result_meta.update(runner=rname, model=model)
         return new_sid, answer, err
@@ -805,7 +818,7 @@ def run_with_fallbacks(cfg, session_id, prompt, live=None, result_meta=None):
         new_sid, answer, err = run_one(step_cfg, None, prompt, live)
         rname = step_runner
         tried.append((step_runner, step_model))
-        if err == CANCEL_MSG:
+        if err == CANCEL_MSG or (err and live and live.get("journal") and live["journal"].actions):
             return new_sid, answer, err
         if answer is not None:
             if result_meta is not None:
@@ -1029,13 +1042,14 @@ def _steer_deliver(sid, run_id, directory, base_url, text):
                 )
 
 
-def _steer_deliver_v2(cfg, sid, run_id, base_url, text, chat_id, message_id):
+def _steer_deliver_v2(cfg, sid, run_id, base_url, text, chat_id, message_id, input_ids=()):
     """Admit a durable native OpenCode v2 steer at the next safe boundary."""
     meta = {
         "sid": sid,
         "text": text,
         "chat_id": chat_id,
         "message_id": message_id,
+        "input_ids": input_ids,
     }
     err = None
     try:
@@ -1059,6 +1073,8 @@ def _steer_deliver_v2(cfg, sid, run_id, base_url, text, chat_id, message_id):
             timeout=5,
             base_url=base_url,
         )
+        if cfg.get("_inbox"):
+            cfg["_inbox"].transition(input_ids, "executing")
         audit(
             "steer_delivered",
             session=sid,
@@ -1107,7 +1123,13 @@ def _steer_fallback(cfg, meta, err):
     text = meta.get("text") or ""
     if chat_id is None:
         return
-    PROMPT_Q.put((chat_id, meta.get("message_id"), text))
+    input_ids = meta.get("input_ids") or []
+    if input_ids and cfg.get("_inbox"):
+        cfg["_inbox"].transition(input_ids, "queued")
+        PROMPT_Q.put({"chat_id": chat_id, "message_id": meta.get("message_id"),
+                      "prompt": text, "input_ids": input_ids})
+    else:
+        PROMPT_Q.put((chat_id, meta.get("message_id"), text))
     audit(
         "steer_fallback_queued",
         chat_id=chat_id,
@@ -1123,7 +1145,7 @@ def _steer_fallback(cfg, meta, err):
 
 
 def _codex_steer_deliver(
-    cfg, sid, turn_id, run_id, text, chat_id=None, message_id=None
+    cfg, sid, turn_id, run_id, text, chat_id=None, message_id=None, input_ids=()
 ):
     """Send true same-turn steering to Codex app-server's `turn/steer`."""
     meta = {
@@ -1131,6 +1153,7 @@ def _codex_steer_deliver(
         "text": text,
         "chat_id": chat_id,
         "message_id": message_id,
+        "input_ids": input_ids,
     }
     request_id = None
     try:
@@ -1799,6 +1822,8 @@ def _codex_handle_steer_response(cfg, event, run_id):
         )
         _steer_fallback(cfg, meta, detail)
     else:
+        if cfg.get("_inbox"):
+            cfg["_inbox"].transition(meta.get("input_ids") or [], "executing")
         audit(
             "steer_delivered",
             session=meta["sid"],
@@ -2212,13 +2237,14 @@ def _pi_send_trailer(cfg, live, text):
         send_retry(cfg, chat_id, text)
 
 
-def _pi_steer_deliver(cfg, sid, run_id, text, chat_id=None, message_id=None):
+def _pi_steer_deliver(cfg, sid, run_id, text, chat_id=None, message_id=None, input_ids=()):
     """Send true same-turn steering to the live Pi RPC child."""
     meta = {
         "sid": sid,
         "text": text,
         "chat_id": chat_id,
         "message_id": message_id,
+        "input_ids": input_ids,
     }
     request_id = None
     try:
@@ -2277,6 +2303,9 @@ def _pi_handle_steer_response(cfg, event, run_id):
         audit("steer_error", session=meta["sid"], transport="pi_rpc_steer", err=detail)
         _steer_fallback(cfg, meta, detail)
     else:
+        if cfg.get("_inbox") and (meta.get("consumed") or
+                (event.get("data") or {}).get("disposition") == "handled"):
+            cfg["_inbox"].transition(meta.get("input_ids") or [], "executing")
         audit(
             "steer_delivered",
             session=meta["sid"],
@@ -2429,6 +2458,8 @@ def run_pi_rpc(cfg, session_id, prompt, live=None):
                                 meta["consumed"] = True
                                 if meta.get("acknowledged"):
                                     RUN_STATE["pi_steers"].pop(request_id, None)
+                                if cfg.get("_inbox"):
+                                    cfg["_inbox"].transition(meta.get("input_ids") or [], "executing")
                                 break
                     continue
                 if message.get("role") != "assistant":
@@ -2733,6 +2764,13 @@ def _flush_prompt_batch(cfg, chat_id, batch):
             )
         else:
             raise RuntimeError(f"unknown steer transport {steer_target['transport']}")
+        input_ids = batch.get("input_ids") or []
+        if input_ids and cfg.get("_inbox"):
+            cfg["_inbox"].transition(input_ids, "steering")
+            args += (input_ids,)
+        # Keep recovery keys associated with the active task until it settles.
+        with RUN_LOCK:
+            RUN_STATE.setdefault("active_input_ids", []).extend(input_ids)
         # Hermes injects first and acknowledges afterward. Telegram latency,
         # rate limiting or a dead reply target must never gate the RPC write.
         def inject_then_ack():
@@ -2740,12 +2778,15 @@ def _flush_prompt_batch(cfg, chat_id, batch):
             send(
                 cfg["bot_token"],
                 chat_id,
-                "🧭 received — steering this run at its next model/tool boundary",
+                "🧭 已收到补充输入，正在交给当前任务；"
+                "若当前任务已结束，会明确保留为下一轮。",
             )
 
         threading.Thread(target=inject_then_ack, daemon=True).start()
         return
 
+    if cfg.get("_inbox"):
+        cfg["_inbox"].transition(batch.get("input_ids") or [], "queued")
     PROMPT_Q.put(batch)
     with RUN_LOCK:
         busy = bool(RUN_STATE.get("busy"))
@@ -2757,13 +2798,14 @@ def _flush_prompt_batch(cfg, chat_id, batch):
         )
 
 
-def defer_prompt(cfg, chat_id, message_id, text):
+def defer_prompt(cfg, chat_id, message_id, text, input_ids=()):
     """Merge adjacent messages, including Telegram's automatic text splits."""
     live_steer = should_steer(chat_id)
     with INGRESS_LOCK:
         batch = PENDING_PROMPTS.get(chat_id)
         if batch:
             batch.setdefault("parts", []).append(text)
+            batch.setdefault("input_ids", []).extend(input_ids)
             audit(
                 "input_merged",
                 chat_id=chat_id,
@@ -2781,6 +2823,7 @@ def defer_prompt(cfg, chat_id, message_id, text):
                 "chat_id": chat_id,
                 "message_id": message_id,
                 "parts": [text],
+                "input_ids": list(input_ids),
                 "queued": False,
                 "timer": None,
             }
@@ -2848,8 +2891,16 @@ def worker(cfg, state):
     while True:
         entry = PROMPT_Q.get()
         chat_id = message_id = prompt = None
+        input_ids = []
+        inbox = cfg.get("_inbox")
+        completed = False
+        execution_finished = False
+        delivery_confirmed = True
         try:
             chat_id, message_id, prompt = unpack_entry(entry)
+            input_ids = (entry.get("input_ids") or []) if isinstance(entry, dict) else []
+            if inbox:
+                inbox.transition(input_ids, "executing")
             with STATE_LOCK:
                 run_cfg = effective_run_config(cfg, state)
             run_cfg["session_name"] = telegram_session_name(chat_id, state.get("bot_username"))
@@ -2857,6 +2908,8 @@ def worker(cfg, state):
             mode = resolve_runner_mode(run_cfg, rname)
             with RUN_LOCK:
                 RUN_STATE["busy"] = True
+                RUN_STATE["active_input_ids"] = []
+                RUN_STATE["cancel"] = False
                 RUN_STATE["current"] = {
                     "chat": chat_id,
                     "since": time.time(),
@@ -2931,15 +2984,16 @@ def worker(cfg, state):
                 new_sid, answer = session_id, None
             finally:
                 stop_typing.set()
-                with RUN_LOCK:
-                    RUN_STATE["busy"] = False
-                    RUN_STATE["current"] = None
+                # Keep task ownership during final reconciliation. Otherwise
+                # a near-end input can be mistaken for an idle/new task before
+                # the current result and recovery state are settled.
             if (
                 err
                 and session_id
                 and "failed rc=" in err
                 and not err.startswith("all runners exhausted")
                 and err != CANCEL_MSG
+                and not (live.get("journal") and live["journal"].actions)
             ):
                 live["trail"].append("♻️ stale session — retrying fresh")
                 result_meta.clear()
@@ -2953,17 +3007,20 @@ def worker(cfg, state):
                 if new_sid:
                     store_runner_session(state, chat_id, used_runner, new_sid)
                 save_json(STATE_PATH, state)
+            if inbox:
+                inbox.stage_result(input_ids, answer or err or "")
+            execution_finished = True
             # An error is new content, not proof earlier segments were delivered.
             if err and live.get("missing_segments"):
                 for segment in live["missing_segments"]:
-                    send_retry(cfg, chat_id, segment, reply_to=message_id)
+                    delivery_confirmed = bool(send_retry(cfg, chat_id, segment, reply_to=message_id)) and delivery_confirmed
             if err == CANCEL_MSG:
                 audit("run_cancelled", chat_id=chat_id)
-                send_retry(cfg, chat_id, CANCEL_MSG)
+                delivery_confirmed = bool(send_retry(cfg, chat_id, CANCEL_MSG)) and delivery_confirmed
                 log(f"chat={chat_id} cancelled")
             elif err:
                 react(cfg, chat_id, message_id, "👎")
-                send_retry(cfg, chat_id, f"⚠️ {err}")
+                delivery_confirmed = bool(send_retry(cfg, chat_id, f"⚠️ {err}")) and delivery_confirmed
                 audit("run_error", chat_id=chat_id, err=err[:200])
                 log(f"chat={chat_id} error: {err[:120]}")
             else:
@@ -2972,9 +3029,9 @@ def worker(cfg, state):
                 payload = deliverable_answer(live, answer)
                 if live.get("missing_segments"):
                     for segment in live["missing_segments"]:
-                        send_retry(cfg, chat_id, segment, reply_to=message_id)
+                        delivery_confirmed = bool(send_retry(cfg, chat_id, segment, reply_to=message_id)) and delivery_confirmed
                 elif payload:
-                    send_retry(cfg, chat_id, payload, reply_to=message_id)
+                    delivery_confirmed = bool(send_retry(cfg, chat_id, payload, reply_to=message_id)) and delivery_confirmed
                 audit(
                     "run_done",
                     chat_id=chat_id,
@@ -2988,12 +3045,23 @@ def worker(cfg, state):
                     f"runner={used_runner}, session={new_sid}"
                     f"{', streamed' if streamed else ''})"
                 )
+            completed = True
+            if inbox:
+                with RUN_LOCK:
+                    additional = list(RUN_STATE.get("active_input_ids") or [])
+                # Rejected steers queued by fallback stay replayable.
+                accepted = [e['id'] for e in inbox.pending(chat_id)
+                            if e['id'] in additional and e['status'] == 'executing']
+                inbox.settle(list(input_ids) + accepted, "cancelled" if err == CANCEL_MSG else
+                             "interrupted" if err else "completed", answer or err or "", delivery_confirmed)
         except Exception as e:
             log(f"worker item error: {e}")
             audit("worker_error", err=str(e)[:200])
             if chat_id:
                 send(cfg["bot_token"], chat_id, f"⚠️ bridge error: {e}")
         finally:
+            if inbox and not completed:
+                inbox.transition(input_ids, "result_unconfirmed" if execution_finished else "interrupted")
             # Early errors (status/reaction/setup) must not leave a phantom
             # busy run which keeps subsequent input waiting for live steering.
             with RUN_LOCK:
@@ -3068,7 +3136,7 @@ def save_attachment(cfg, msg):
         urllib.request.urlretrieve(url, dest)
         os.chmod(dest, 0o600)
     except Exception as e:
-        log(f"download {name}: {e}")
+        log(f"download {name}: {type(e).__name__}")
         try:
             os.unlink(dest)
         except OSError:
@@ -3231,8 +3299,30 @@ def handle_update(cfg, state, upd, *, state_path=STATE_PATH):
             chat_id,
             "commands: /new reset session · /status state · /runners list agents · "
             "/runner <name> [model] switch agent · /at 30m <prompt> "
-            "schedule · /cancel abort current run · anything else goes to the agent",
+            "schedule · /cancel abort current run · /pending interrupted inputs · "
+            "/resume <id> inspect and continue · /result <id> preserved result · "
+            "anything else goes to the agent",
         )
+        return
+    if cmd in ("/pending", "/resume", "/result"):
+        inbox = cfg.get("_inbox")
+        if not inbox:
+            send(cfg["bot_token"], chat_id, "durable input recovery unavailable")
+            return
+        if cmd == "/pending":
+            rows = inbox.pending(chat_id)
+            body = "\n".join(f"{e['id']} · {e['status']} · {e['prompt'][-80:]}" for e in rows[-20:])
+            send(cfg["bot_token"], chat_id, body or "没有待恢复输入。")
+        elif cmd == "/result":
+            result = inbox.result(rest.strip(), chat_id)
+            send(cfg["bot_token"], chat_id, result or "没有本聊天可查看的结果。")
+        else:
+            entry = inbox.continuation(rest.strip(), chat_id)
+            if entry:
+                PROMPT_Q.put(entry)
+                send(cfg["bot_token"], chat_id, "已保留为继续任务：先核查已有结果，不盲目重放。")
+            else:
+                send(cfg["bot_token"], chat_id, "未找到本聊天可继续的中断任务；用 /pending 查看。")
         return
     if cmd == "/new":
         with STATE_LOCK:
@@ -3480,7 +3570,13 @@ def handle_update(cfg, state, upd, *, state_path=STATE_PATH):
         return
 
     audit("enqueue", chat_id=chat_id, user_id=user_id, chars=len(text.strip()))
-    prompt_text = text.strip()
+    source_attachment = None
+    reply = msg.get("reply_to_message") or {}
+    if reply.get("document") or reply.get("photo"):
+        # Only addressed, authorized agent input downloads source attachments;
+        # passive group traffic and slash commands cannot trigger this work.
+        _, source_attachment = save_attachment(cfg, reply)
+    prompt_text = reply_context(msg, source_attachment) + text.strip()
     if chat_type != "private" and cfg.get("capture_group_context", True):
         with STATE_LOCK:
             buf = (state.get("context") or {}).pop(str(chat_id), None) or []
@@ -3491,7 +3587,15 @@ def handle_update(cfg, state, upd, *, state_path=STATE_PATH):
                 "nobody asked you anything yet:\n" + digest + "\n]\n\n" + prompt_text
             )
     prompt_text = apply_sender_instructions(cfg, user_id, prompt_text)
-    defer_prompt(cfg, chat_id, message_id, prompt_text)
+    inbox = cfg.get("_inbox")
+    if inbox:
+        identity = f"tg:{chat_id}:{message_id}"
+        # Persist before defer/timer/RPC and before run() commits Telegram offset.
+        if not inbox.receive(identity, chat_id, message_id, prompt_text, user_id, chat_type):
+            return
+        defer_prompt(cfg, chat_id, message_id, prompt_text, input_ids=[identity])
+    else:
+        defer_prompt(cfg, chat_id, message_id, prompt_text)
 
 
 def cli_send(args):
@@ -3527,6 +3631,14 @@ def doctor_report():
         "health": load_json(HEALTH_PATH, {}),
     }
     report["service"] = polling_health(report["health"])
+    expected_code = source_identity(os.path.dirname(os.path.abspath(__file__)))
+    loaded_code = report["health"].get("loaded_code") or {}
+    report["code"] = {
+        "expected": expected_code,
+        "loaded": loaded_code,
+        "ok": bool(expected_code.get("source_sha256")
+                   and expected_code == loaded_code),
+    }
     if not cfg:
         report["config"] = {"ok": False, "error": "missing or invalid config"}
         return report
@@ -3597,7 +3709,8 @@ def doctor_report():
         "error": telegram_error or None,
     }
     report["ok"] = bool(
-        state_writable and runner_check["ok"] and telegram_ok and report["service"]["ok"]
+        state_writable and runner_check["ok"] and telegram_ok
+        and report["service"]["ok"] and report["code"]["ok"]
     )
     return report
 
@@ -3608,7 +3721,7 @@ def cli_doctor():
     return 0 if report.get("ok") else 1
 
 
-class BridgeStop(Exception):
+class BridgeStop(BaseException):
     """Raised by the SIGTERM/SIGINT handler — a graceful stop, not a crash."""
 
 
@@ -3622,9 +3735,13 @@ def run(cfg):
         status="starting",
         pid=os.getpid(),
         started_at=now_iso(),
+        loaded_code=dict(LOADED_CODE),
         consecutive_poll_failures=0,
     )
     state = load_json(STATE_PATH, {})
+    inbox = cfg.get("_inbox")
+    if inbox is None:
+        inbox = cfg["_inbox"] = Inbox(os.path.join(CONFIG_DIR, "inputs.json"))
     if not cfg.get("capture_group_context", True):
         state.pop("context", None)
         state.pop("hints", None)
@@ -3675,11 +3792,15 @@ def run(cfg):
                 },
                 {"command": "at", "description": "Schedule a prompt: /at 30m <text>"},
                 {"command": "cancel", "description": "Abort the current run"},
+                {"command": "pending", "description": "Show durable inputs and interrupted tasks"},
+                {"command": "resume", "description": "Inspect and continue an interrupted task"},
+                {"command": "result", "description": "Inspect a preserved task result"},
                 {"command": "help", "description": "List commands"},
             ]
         ),
     )
     log(f"tgbridge up as @{state['bot_username']}, chats={cfg['allowed_chats']}")
+    audit("startup", pid=os.getpid(), loaded_code=LOADED_CODE)
     update_health(status="polling", bot_username=state["bot_username"])
     if cfg.get("runner") == "codex" and cfg.get("codex_yolo"):
         log("WARNING codex_yolo=true: Telegram prompts have unsandboxed OS access")
@@ -3726,6 +3847,15 @@ def run(cfg):
     if warn and hc:
         send(cfg["bot_token"], hc, warn)
 
+    ready, interrupted = inbox.recover()
+    for entry in ready:
+        if is_authorized(cfg, entry["chat_id"], entry.get("chat_type"), entry.get("user_id")):
+            PROMPT_Q.put(entry)
+    for entry in interrupted:
+        if is_authorized(cfg, entry["chat_id"], entry.get("chat_type"), entry.get("user_id")):
+            send_retry(cfg, entry["chat_id"],
+                       f"⚠️ 上次任务中断，执行结果可能不完整，未自动重放。"
+                       f"\n使用 /resume {entry['id']} 先核查后继续；/pending 查看记录。")
     worker_t = threading.Thread(target=worker, args=(cfg, state), daemon=True)
     worker_t.start()
     rearm_at(cfg, state)
@@ -3783,6 +3913,9 @@ def run(cfg):
             offset = upd["update_id"] + 1
             try:
                 handle_update(cfg, state, upd)
+            except (BridgeStop, InboxError):
+                # Do not advance offset when durable acceptance failed.
+                raise
             except Exception as e:
                 log(f"update {upd.get('update_id')} handler error: {e}")
                 m = upd.get("message") or {}
@@ -3795,6 +3928,7 @@ def run(cfg):
 
 
 def main():
+    global HEALTH_OWNER_PID
     if "--doctor" in sys.argv:
         sys.exit(cli_doctor())
     if "--selftest" in sys.argv:
@@ -3806,6 +3940,13 @@ def main():
     cfg = load_json(CONFIG_PATH, None)
     if not cfg:
         sys.exit(f"missing config {CONFIG_PATH}")
+    lease = ProcessLease(CONFIG_DIR)
+    try:
+        lease.acquire()
+    except AlreadyRunning as e:
+        # Never announce, poll or overwrite the active owner's health/state.
+        sys.exit(str(e))
+    HEALTH_OWNER_PID = os.getpid()
     signal.signal(signal.SIGTERM, on_stop)
     signal.signal(signal.SIGINT, on_stop)
     try:
@@ -3850,6 +3991,9 @@ def main():
         audit("crash", err=str(e)[:300])
         announce_all(cfg, f"💀 bridge crashed: {e} — restarting")
         sys.exit(1)
+    finally:
+        HEALTH_OWNER_PID = None
+        lease.close()
 
 
 if __name__ == "__main__":

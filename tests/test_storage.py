@@ -2,6 +2,7 @@ import os
 import stat
 import tempfile
 import unittest
+from unittest import mock
 
 from tgbridge_core.storage import ensure_private_dir, load_json, save_json
 
@@ -17,6 +18,11 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(os.stat(directory).st_mode), 0o700)
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
             self.assertFalse(os.path.exists(path + ".tmp"))
+
+    def test_durable_acceptance_syncs_file_and_parent_directory(self):
+        with tempfile.TemporaryDirectory() as root, mock.patch('tgbridge_core.storage.os.fsync') as fsync:
+            save_json(os.path.join(root, 'inputs.json'), {'input': 'accepted'}, durable=True)
+            self.assertEqual(fsync.call_count, 2)
 
     def test_invalid_json_uses_default(self):
         with tempfile.TemporaryDirectory() as root:

@@ -3,6 +3,7 @@
 Adapters normalize native records here. Private reasoning never becomes a
 public event; Telegram delivery and deduplication have one owner, Journal.
 """
+import html
 import json
 import re
 
@@ -63,6 +64,8 @@ def codex_event(event):
         inputs = {"command": item.get("command"), "cwd": item.get("cwd")}
         if completed and item.get("exitCode", item.get("exit_code")) is not None:
             inputs["exit code"] = item.get("exitCode", item.get("exit_code"))
+            if inputs["exit code"] != 0:
+                state = "failed"
         return action(item.get("id"), "bash", inputs, state,
                       item.get("aggregatedOutput", item.get("aggregated_output")))
     if kind in ("fileChange", "file_change"):
@@ -157,6 +160,42 @@ def action_body(event, secrets=()):
     return redact("\n\n".join(lines), secrets)
 
 
+def compact_action(event, number, secrets=()):
+    """Human-first chrome + Telegram's native expandable details, no LLM guesses.
+
+    Tool names describe observed operations; exit state describes only the tool,
+    not project success. Commands/diffs/results stay inspectable and redacted.
+    """
+    label = event.get('label') or 'tool'
+    tool = label.rsplit('/', 1)[-1].lower()
+    title = {
+        'read': '读取文件', 'edit': '修改文件', 'write': '写入文件',
+        'file change': '修改文件', 'bash': '执行命令', 'grep': '搜索内容',
+        'find': '查找文件', 'ls': '查看目录', 'codemode': '执行工具脚本',
+        'websearch': '搜索网页', 'web_search': '搜索网页',
+    }.get(tool, '调用工具：' + label)
+    state = event.get('state')
+    status = {'running': '进行中', 'completed': '已完成', 'failed': '失败',
+              'cancelled': '已取消', 'unknown': '状态待确认'}.get(state, '状态待确认')
+    icon = {'completed': '✅', 'failed': '⚠️', 'cancelled': '🛑'}.get(state, '🔧')
+    heading = html.escape(redact(f'{icon} 动作 {number} · {title[:100]} · {status}', secrets))
+    details = action_body(event, secrets)
+    # Escaping can expand < and & sixfold. Budget the actual HTML payload,
+    # without splitting entities or surrogate pairs, not the unescaped input.
+    pieces, buf, size = [], [], 0
+    for char in details:
+        escaped = html.escape(char)
+        cost = len(escaped.encode('utf-16-le')) // 2
+        if size + cost > 2800:
+            pieces.append(''.join(buf))
+            buf, size = [], 0
+        buf.append(escaped)
+        size += cost
+    if buf:
+        pieces.append(''.join(buf))
+    return [f'<b>{heading}</b>\n<blockquote expandable>{piece}</blockquote>' for piece in pieces]
+
+
 class Journal:
     """One delivery ledger for every runner/transport, scoped to one attempt.
 
@@ -165,11 +204,12 @@ class Journal:
     UTF-16 limit rather than dropping detail. Text segments use the bridge's
     existing confirmed-delivery/recovery path.
     """
-    def __init__(self, live, send_text, send_action, secrets=()):
+    def __init__(self, live, send_text, send_action, secrets=(), compact=False):
         self.live = live
         self.send_text = send_text
         self.send_action = send_action
         self.secrets = secrets
+        self.compact = compact
         self.actions = {}
         self.text_ids = set()
         self.texts = []
@@ -178,7 +218,9 @@ class Journal:
         if not event:
             return
         if event["kind"] == "text":
-            content = event.get("text") or ""
+            # Native transports trim message boundaries when building their
+            # final answer. Match that normalization before delivery/reconcile.
+            content = (event.get("text") or "").strip()
             identity = event.get("id")
             if not content.strip() or (identity and identity in self.text_ids):
                 return
@@ -197,7 +239,8 @@ class Journal:
         combined = {**entry["event"], **event}
         combined["inputs"] = {**entry["event"].get("inputs", {}), **(event.get("inputs") or {})}
         entry["event"] = combined
-        chunks = split_chunks(action_body(combined, self.secrets), 3900, preserve_whitespace=True)
+        chunks = (compact_action(combined, list(self.actions).index(identity) + 1, self.secrets)
+                  if self.compact else split_chunks(action_body(combined, self.secrets), 3900, preserve_whitespace=True))
         for index, chunk in enumerate(chunks):
             if index < len(entry["chunks"]):
                 message_id, previous = entry["chunks"][index]

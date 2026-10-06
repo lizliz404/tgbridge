@@ -1,5 +1,8 @@
 """No production bot calls: prove control-loop recovery and watchdog behavior."""
+import io
 import queue
+import signal
+import urllib.error
 import unittest
 from unittest import mock
 
@@ -11,6 +14,26 @@ class StopFixture(BaseException):
 
 
 class ResilienceTests(unittest.TestCase):
+    def test_stop_is_control_flow_not_a_recoverable_operation_error(self):
+        self.assertFalse(issubclass(tgbridge.BridgeStop, Exception))
+        with self.assertRaises(tgbridge.BridgeStop):
+            try:
+                tgbridge.on_stop(signal.SIGTERM, None)
+            except Exception:
+                self.fail('generic operation handler swallowed stop')
+
+    def test_stop_propagates_from_network_and_rate_limit_backoff(self):
+        for response in (
+            tgbridge.BridgeStop(signal.SIGTERM),
+            urllib.error.HTTPError('https://fixture', 429, 'limited', {}, io.BytesIO(b'{"parameters":{"retry_after":3}}')),
+            urllib.error.HTTPError('https://fixture', 409, 'conflict', {}, io.BytesIO(b'conflict')),
+        ):
+            with self.subTest(response=type(response).__name__), \
+                 mock.patch.object(tgbridge.urllib.request, 'urlopen', side_effect=response), \
+                 mock.patch.object(tgbridge.time, 'sleep', side_effect=tgbridge.BridgeStop(signal.SIGTERM)):
+                with self.assertRaises(tgbridge.BridgeStop):
+                    tgbridge.api('fixture', 'getUpdates')
+
     def test_poll_failures_then_success_keep_control_loop_watchdog_progress(self):
         health = []
         calls = []

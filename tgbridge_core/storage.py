@@ -17,15 +17,24 @@ def load_json(path, default):
         return default
 
 
-def save_json(path, data):
+def save_json(path, data, *, durable=False):
     ensure_private_dir(os.path.dirname(path) or ".")
     tmp = path + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(data, f, ensure_ascii=False, indent=1)
+            if durable:
+                f.flush()
+                os.fsync(f.fileno())
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
+        if durable:
+            directory = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
     except BaseException:
         try:
             os.unlink(tmp)
