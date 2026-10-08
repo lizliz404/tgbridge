@@ -136,7 +136,7 @@ def _pi_rpc_ui(app, cfg, proc, event, live, run_id):
     try:
         broker.offer(live['chat_id'], live.get('requester_user_id'), event.get('title') or 'Your input?',
                      ['Yes', 'No'] if method == 'confirm' else event.get('options', []), respond,
-                     owner=('pi', run_id), method=method, message=event.get('message') or '',
+                     owner=app.question_owner('pi', run_id), method=method, message=event.get('message') or '',
                      timeout=event.get('timeout') or app.run_max(cfg) * 1000)
         live['activity'] = {'label': 'waiting', 'preview': 'Your call.'}
         app.edit_status(cfg, live)
@@ -310,7 +310,7 @@ def run_pi_rpc(app, cfg, session_id, prompt, live=None):
                 events, app.PI_RPC_STATE_CMD, timeout=app.PI_RPC_SETUP_TIMEOUT,
                 keep=early_events, proc=proc,
                 ui_handler=lambda event: app._pi_rpc_ui(cfg, proc, event, live, run_id),
-                ui_waiting=lambda: bool(cfg.get('_questions') and cfg['_questions'].has_owner(('pi', run_id))),
+                ui_waiting=lambda: bool(cfg.get('_questions') and cfg['_questions'].has_owner(app.question_owner('pi', run_id))),
             )
         except RuntimeError as e:
             app.log(f"pi rpc get_state: {e}")
@@ -330,7 +330,7 @@ def run_pi_rpc(app, cfg, session_id, prompt, live=None):
             events, app.PI_RPC_PROMPT_CMD, timeout=app.PI_RPC_PROMPT_TIMEOUT,
             keep=early_events, proc=proc,
             ui_handler=lambda event: app._pi_rpc_ui(cfg, proc, event, live, run_id),
-            ui_waiting=lambda: bool(cfg.get('_questions') and cfg['_questions'].has_owner(('pi', run_id))),
+            ui_waiting=lambda: bool(cfg.get('_questions') and cfg['_questions'].has_owner(app.question_owner('pi', run_id))),
         )
         handled = (accepted.get("disposition") or "") == "handled"
 
@@ -342,7 +342,7 @@ def run_pi_rpc(app, cfg, session_id, prompt, live=None):
             if cancelled:
                 app._pi_rpc_abort(proc)
                 break
-            if cfg.get('_questions') and cfg['_questions'].has_owner(('pi', run_id)):
+            if cfg.get('_questions') and cfg['_questions'].has_owner(app.question_owner('pi', run_id)):
                 app.mark_run_progress()  # human decision wait, still bounded by run_max_s
             timeout_reason = app.run_expiry(cfg, clock_started)
             if timeout_reason:
@@ -512,7 +512,7 @@ def run_pi_rpc(app, cfg, session_id, prompt, live=None):
     finally:
         orphaned = []
         if cfg.get('_questions') and run_id is not None:
-            cfg['_questions'].close_owner(('pi', run_id))
+            cfg['_questions'].close_owner(app.question_owner('pi', run_id))
         with app.RUN_LOCK:
             if app.RUN_STATE.get("pi_run_id") == run_id:
                 app.RUN_STATE["pi_sid"] = None

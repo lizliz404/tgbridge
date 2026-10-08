@@ -5,7 +5,7 @@ Bot API long-poll -> gate (chat allowlist + sender policy + group trigger)
 -> agent run (per-chat session) -> reply to source chat.
 
 Architecture: the poll loop never blocks. Slash commands are answered inline;
-prompts are enqueued and consumed serially by a worker thread. Agent stdout
+prompts are consumed serially per chat, with independent chats in parallel. Agent stdout
 is streamed live via Popen, so the status message shows a real-time tool
 trail and answer preview (claudegram/xhyu/OpenClaw pattern).
 
@@ -50,6 +50,7 @@ from tgbridge_core.health import (
     systemd_notify,
 )
 from tgbridge_core.storage import ensure_private_dir, load_json, save_json
+from tgbridge_core.chat_runtime import ChatDispatcher
 from tgbridge_core.runtime import LOADED_CODE, source_identity
 from tgbridge_core.context import reply_context
 from tgbridge_core import telegram_io, execution, opencode_transport, codex_transport, pi_transport, ingress
@@ -97,6 +98,7 @@ INGRESS_LOCK = threading.Lock()
 CODEX_WRITE_LOCK = threading.Lock()
 PI_RPC_WRITE_LOCK = threading.Lock()
 PENDING_PROMPTS: dict = {}
+CHAT_DISPATCHER = None
 RUN_STATE: dict = {
     "busy": False,
     "current": None,
@@ -191,6 +193,7 @@ def _bind(function):
     @wraps(function)
     def call(*args, **kwargs):
         return function(sys.modules[__name__], *args, **kwargs)
+    call._runtime_impl = function
     return call
 
 
@@ -231,6 +234,7 @@ effective_run_config = _bind(execution.effective_run_config)
 runner_session = _bind(execution.runner_session)
 store_runner_session = _bind(execution.store_runner_session)
 clear_runner_sessions = _bind(execution.clear_runner_sessions)
+question_owner = _bind(execution.question_owner)
 run_one = _bind(execution.run_one)
 run_with_fallbacks = _bind(execution.run_with_fallbacks)
 runner_mode = _bind(execution.runner_mode)
@@ -448,6 +452,7 @@ def on_stop(signum, frame):
 
 
 def run(cfg):
+    global CHAT_DISPATCHER
     systemd_notify("WATCHDOG=1")
     update_health(
         status="starting",
@@ -560,7 +565,8 @@ def run(cfg):
         if is_authorized(cfg, entry["chat_id"], entry.get("chat_type"), entry.get("user_id")):
             send_retry(cfg, entry["chat_id"],
                        f"⚠️ Task interrupted. Review and continue: /resume {entry['id']}")
-    worker_t = threading.Thread(target=worker, args=(cfg, state), daemon=True)
+    CHAT_DISPATCHER = cfg['_chat_dispatcher'] = ChatDispatcher(sys.modules[__name__], cfg, state)
+    worker_t = threading.Thread(target=CHAT_DISPATCHER.consume, daemon=True)
     worker_t.start()
     rearm_at(cfg, state)
 
@@ -580,8 +586,9 @@ def run(cfg):
             log("worker thread died — respawning")
             audit("worker_respawn")
             announce_all(cfg, "💀 bridge worker thread died — respawned")
-            worker_t = threading.Thread(target=worker, args=(cfg, state), daemon=True)
+            worker_t = threading.Thread(target=CHAT_DISPATCHER.consume, daemon=True)
             worker_t.start()
+        CHAT_DISPATCHER.supervise()
         params = {"timeout": 50, "allowed_updates": json.dumps(["message", "callback_query"])}
         if offset:
             params["offset"] = offset
@@ -658,30 +665,9 @@ def main():
     except BridgeStop:
         systemd_notify("STOPPING=1")
         update_health(status="stopped", stopped_at=now_iso())
-        with RUN_LOCK:
-            p = RUN_STATE.get("proc")
-            server_sid = RUN_STATE.get("server_sid")
-            server_directory = RUN_STATE.get("server_directory")
-            active_server_url = RUN_STATE.get("server_url")
-            active_server_api = RUN_STATE.get("server_api")
-        if p is not None and p.poll() is None:
-            signal_run_process(p, signal.SIGTERM)  # don't orphan a burning agent run
-            kill_after(p, 2)
-        if server_sid:
-            try:
-                _server_call(
-                    "POST",
-                    (
-                        f"/api/session/{server_sid}/interrupt"
-                        if active_server_api == "v2"
-                        else f"/session/{server_sid}/abort"
-                    ),
-                    timeout=5,
-                    directory=server_directory if active_server_api != "v2" else None,
-                    base_url=active_server_url,
-                )
-            except Exception:
-                pass
+        owners = CHAT_DISPATCHER.close() if CHAT_DISPATCHER else [sys.modules[__name__]]
+        for owner in owners:
+            execution.stop_runtime(owner)
         audit("stop", reason="signal")
         announce_all(cfg, "💀 bridge stopping")
         log("bridge stopped by signal")

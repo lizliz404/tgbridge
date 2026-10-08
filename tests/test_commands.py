@@ -30,7 +30,7 @@ class CommandTests(unittest.TestCase):
         for row in menu:
             self.assertIn(row['description'], body)
             self.assertLessEqual(len(row['description']), 256)
-        self.assertIn('bot-wide', body)
+        self.assertIn('only to this chat', body)
         self.assertIn('not old sessions', body)
         tree = ast.parse(Path(ingress.__file__).read_text())
         handler = next(node for node in tree.body if isinstance(node, ast.FunctionDef)

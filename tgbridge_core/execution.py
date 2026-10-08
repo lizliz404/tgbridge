@@ -266,15 +266,16 @@ def run_agent(app, cfg, session_id, prompt, live=None):
 
 
 def effective_run_config(app, cfg, state):
-    """Copy of cfg honoring a Telegram-set global runner override.
+    """Honor the chat's runner selection; old global selection is a baseline.
 
-    state["runner_override"] = {"runner": ..., "model": ...} (model may be
-    ""), written by /runner and cleared by `/runner default`. Absent/invalid
-    override → cfg unchanged, so file config stays the source of truth.
+    Empty chat override means file defaults, not a peer's model selection.
+    Unscoped CLI/doctor callers can still inspect legacy configuration.
     """
     override = {}
     try:
-        override = (state or {}).get("runner_override") or {}
+        chat_id = getattr(app, 'chat_id', None)
+        overrides = (state or {}).get('chat_runner_overrides') or {}
+        override = overrides.get(str(chat_id), (state or {}).get('runner_override') or {})
     except AttributeError:
         override = {}
     rname = override.get("runner")
@@ -535,12 +536,40 @@ def _steer_fallback(app, cfg, meta, err):
     )
 
 
+def question_owner(app, transport, run_id):
+    """Question broker is shared; run counters alone are only chat-local."""
+    return (transport, getattr(app, 'chat_id', None), run_id)
+
+
+def stop_runtime(app):
+    """Stop this execution owner's process/server, never another chat's run."""
+    with app.RUN_LOCK:
+        app.RUN_STATE['cancel'] = True
+        proc = app.RUN_STATE.get('proc')
+        sid = app.RUN_STATE.get('server_sid')
+        directory = app.RUN_STATE.get('server_directory')
+        base_url = app.RUN_STATE.get('server_url')
+        v2 = app.RUN_STATE.get('server_api') == 'v2'
+    if proc is not None and proc.poll() is None:
+        app.signal_run_process(proc, signal.SIGTERM)
+        app.kill_after(proc, 2)
+    if sid:
+        try:
+            app._server_call('POST', f'/api/session/{sid}/interrupt' if v2 else f'/session/{sid}/abort',
+                             timeout=5, directory=None if v2 else directory, base_url=base_url)
+        except Exception:
+            pass
+
+
 def worker(app, cfg, state):
-    """Serial agent-run consumer; poll loop stays live for commands.
+    """Serial per-owner consumer; independent chats have separate owners.
 
     One item = one try/except: a bad item must never kill the thread."""
-    while True:
+    while not getattr(app, 'STOPPING', False):
         entry = app.PROMPT_Q.get()
+        if getattr(app, 'STOPPING', False):
+            app.PROMPT_Q.task_done()
+            return
         chat_id = message_id = prompt = None
         input_ids = []
         inbox = cfg.get("_inbox")
@@ -569,6 +598,7 @@ def worker(app, cfg, state):
                     "mode": mode,
                 }
             with app.STATE_LOCK:
+                session_epoch = getattr(app, 'SESSION_EPOCH', 0)
                 session_id = app.runner_session(
                     state,
                     chat_id,
@@ -576,6 +606,7 @@ def worker(app, cfg, state):
                     legacy_runner=cfg.get("runner", "opencode"),
                 )
             outbox = app.outbox_dir(cfg)
+            app.ensure_private_dir(outbox)
             prompt = prompt + (
                 f"\n\n(To give files to the user, write them into {outbox}/ "
                 "— they are delivered automatically after this run.)"
@@ -657,7 +688,7 @@ def worker(app, cfg, state):
                 app.edit_status(cfg, live, final="✅ done" if not err else "🔴 failed")
             with app.STATE_LOCK:
                 used_runner = result_meta.get("runner", rname)
-                if new_sid:
+                if new_sid and session_epoch == getattr(app, 'SESSION_EPOCH', 0):
                     app.store_runner_session(state, chat_id, used_runner, new_sid)
                 app.save_json(app.STATE_PATH, state)
             if inbox:

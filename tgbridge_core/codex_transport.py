@@ -205,7 +205,7 @@ def _codex_user_question(app, cfg, proc, event, live, run_id):
             else:
                 offer(index + 1)
         broker.offer(live['chat_id'], live.get('requester_user_id'), question['question'],
-                     [option['label'] for option in options], selected, owner=('codex', run_id),
+                     [option['label'] for option in options], selected, owner=app.question_owner('codex', run_id),
                      message='\n'.join(option['label'] + '：' + option.get('description', '') for option in options),
                      timeout=app.run_max(cfg) * 1000, echo_answer=not question.get('isSecret'))
     if not broker or not live or live.get('chat_id') is None:
@@ -362,7 +362,7 @@ def run_codex_app_server(app, cfg, session_id, prompt, live=None):
                 app.signal_run_process(proc, signal.SIGTERM)
                 app.kill_after(proc, 3)
                 break
-            if cfg.get('_questions') and cfg['_questions'].has_owner(('codex', run_id)):
+            if cfg.get('_questions') and cfg['_questions'].has_owner(app.question_owner('codex', run_id)):
                 app.mark_run_progress()
             timeout_reason = app.run_expiry(cfg, clock_started)
             if timeout_reason:
@@ -474,7 +474,7 @@ def run_codex_app_server(app, cfg, session_id, prompt, live=None):
         return sid, None, detail
     finally:
         if cfg.get('_questions') and run_id is not None:
-            cfg['_questions'].close_owner(('codex', run_id))
+            cfg['_questions'].close_owner(app.question_owner('codex', run_id))
         with app.RUN_LOCK:
             if app.RUN_STATE.get("codex_run_id") == run_id:
                 app.RUN_STATE["codex_thread_id"] = None

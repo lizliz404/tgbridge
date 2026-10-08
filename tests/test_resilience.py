@@ -83,6 +83,7 @@ class ResilienceTests(unittest.TestCase):
                 pass
         with mock.patch.object(tgbridge, 'PROMPT_Q', Queue()), \
              mock.patch.object(tgbridge, 'audit'), \
+             mock.patch.object(tgbridge, 'ensure_private_dir'), \
              mock.patch.object(tgbridge, 'react', side_effect=RuntimeError('early fixture failure')), \
              mock.patch.object(tgbridge, 'send'), \
              mock.patch.object(tgbridge.os, 'listdir', side_effect=FileNotFoundError):

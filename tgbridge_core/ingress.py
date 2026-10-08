@@ -265,6 +265,9 @@ def handle_update(app, cfg, state, upd, *, state_path=_DEFAULT_STATE_PATH):
     message_id = msg.get("message_id")
     if not app.is_authorized(cfg, chat_id, chat_type, user_id):
         return
+    dispatcher = cfg.get('_chat_dispatcher')
+    if dispatcher is not None:
+        app = dispatcher.runtime(chat_id)
     bot_username = state.get("bot_username", "")
     raw_cmd, _ = app.botcmd(text)
     if raw_cmd and "@" in text.split(maxsplit=1)[0]:
@@ -363,6 +366,8 @@ def handle_update(app, cfg, state, upd, *, state_path=_DEFAULT_STATE_PATH):
         return
     if cmd == "/new":
         with app.STATE_LOCK:
+            if hasattr(app, 'SESSION_EPOCH'):
+                app.SESSION_EPOCH += 1
             app.clear_runner_sessions(state, chat_id)
             if state_path is not None:
                 app.save_json(state_path, state)
@@ -472,7 +477,9 @@ def handle_update(app, cfg, state, upd, *, state_path=_DEFAULT_STATE_PATH):
             else " -> ".join(f"{r}/{m or 'runner default'}" for r, m in chain)
         )
         override_note = ""
-        if (state.get("runner_override") or {}).get("runner"):
+        selected = (state.get('chat_runner_overrides') or {}).get(
+            str(chat_id), state.get('runner_override') or {})
+        if selected.get('runner'):
             override_note = f" (override, file says {cfg.get('runner', 'opencode')})"
         app.send(
             cfg["bot_token"],
@@ -502,7 +509,8 @@ def handle_update(app, cfg, state, upd, *, state_path=_DEFAULT_STATE_PATH):
                 else " -> ".join(f"{r}/{m or 'runner default'}" for r, m in chain)
             )
         )
-        ov = (state.get("runner_override") or {}).get("runner")
+        ov = (state.get('chat_runner_overrides') or {}).get(
+            str(chat_id), state.get('runner_override') or {}).get('runner')
         lines.append(
             f"primary: {eff.get('runner', 'opencode')}"
             + (
@@ -527,7 +535,10 @@ def handle_update(app, cfg, state, upd, *, state_path=_DEFAULT_STATE_PATH):
             return
         if args[0] == "default":
             with app.STATE_LOCK:
-                state.pop("runner_override", None)
+                if hasattr(app, 'chat_id'):
+                    state.setdefault('chat_runner_overrides', {})[str(chat_id)] = {}
+                else:
+                    state.pop('runner_override', None)
                 if state_path is not None:
                     app.save_json(state_path, state)
             app.audit("runner_override_cleared", chat_id=chat_id)
@@ -546,7 +557,11 @@ def handle_update(app, cfg, state, upd, *, state_path=_DEFAULT_STATE_PATH):
             )
             return
         with app.STATE_LOCK:
-            state["runner_override"] = {"runner": name, "model": model}
+            selection = {'runner': name, 'model': model}
+            if hasattr(app, 'chat_id'):
+                state.setdefault('chat_runner_overrides', {})[str(chat_id)] = selection
+            else:
+                state['runner_override'] = selection
             if state_path is not None:
                 app.save_json(state_path, state)
         app.audit("runner_override_set", chat_id=chat_id, runner=name, model=model)

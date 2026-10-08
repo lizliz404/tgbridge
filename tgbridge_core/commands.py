@@ -34,7 +34,7 @@ def command_help(bot_username='', group=False):
         f'{usage} — {description}' for _, description, usage in COMMANDS
     )
     body += ('\n\nNote: /new does not stop a run; /cancel does not undo actions.'
-             '\nResume interrupted tasks, not old sessions. Runner switches are bot-wide.'
+             '\nResume interrupted tasks, not old sessions. Runner switches apply only to this chat.'
              '\nUse plain text for tasks and skills.')
     if group:
         body += f'\nGroup: /status@{bot_username}, or reply to the bot.'
