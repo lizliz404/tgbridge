@@ -52,7 +52,7 @@ def codex_event(event):
     if method.startswith("item/reasoning/"):
         return {"kind": "activity", "label": "thinking"}
     if method == "turn/plan/updated":
-        return {"kind": "activity", "label": "todo", "preview": "更新任务计划"}
+        return {"kind": "activity", "label": "todo", "preview": "Updating plan"}
     if method not in ("item/started", "item/completed", "item.started", "item.completed"):
         return None
     item = (event.get("params") or {}).get("item") or event.get("item") or {}
@@ -181,7 +181,7 @@ def activity_body(event, secrets=()):
     else:
         heading = "🔧 " + label
         if event.get("state") == "failed":
-            heading += " · 失败"
+            heading += " · failed"
         inputs = event.get("inputs") or {}
         preview = event.get("preview") or ""
         if isinstance(inputs, dict):

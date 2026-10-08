@@ -3,8 +3,12 @@
 A minimal Telegram bridge for a local OpenCode, Codex, or Pi agent.
 
 A small **zero-dependency** Python package (stdlib only) with `tgbridge.py` kept
-as the stable CLI entry point. No webhooks, public ports, or databases: Bot API
-long-poll in, local CLI agent out.
+as the stable CLI entry point and runtime composition root. Telegram I/O,
+ingress, run lifecycle and each native transport live in separate
+`tgbridge_core` modules with an explicit runtime dependency, not copied globals
+or imports back into the entry point. Source files are capped at 1,500 lines
+by the offline regression suite. No webhooks, public ports, or databases: Bot
+API long-poll in, local CLI agent out.
 
 ## Features
 
@@ -27,7 +31,7 @@ long-poll in, local CLI agent out.
 - **Audit log** — every enqueue/run/send/schedule event appended to `~/.config/tgbridge/audit.jsonl`
 - **Never dies silently** — any fatal crash or SIGTERM announces `💀 …` to every allowed chat (best-effort, 3s each) before systemd restarts it; a dead worker thread is detected and respawned; a failed answer delivery retries once, then is audited and saved to `~/.config/tgbridge/undelivered/` instead of vanishing; a missing runner binary warns at startup instead of crashing
 - **Ambient group context** — hears recent human conversation but only runs when explicitly @mentioned or replied to
-- **Slash-command menu** — `/new`, `/status`, `/runners`, `/runner`, `/at`, `/cancel`, `/help` registered via `setMyCommands`
+- **Flat slash-command menu** — `/status`, `/cancel`, `/new`, `/pending`, `/resume`, `/result`, `/at`, `/runners`, `/runner`, `/help` all appear directly in the command menu with minimal English descriptions. The menu and `/help` share one catalog; no basic/advanced nesting or persistent reply keyboard. Plain replies remove inherited keyboards; inline question cards remain available. `/new` starts fresh on the next message, not an abort; `/resume <id>` recovers interrupted inputs, not historical sessions; `/runner` changes the bot-wide primary for all chats. Unrecognized slash commands (including former bridge controls and skill names) are rejected before reaching the agent; use plain text for tasks and skills. Unix paths are not parsed as commands. Bridge-owned notices and question controls use concise English; agent answers and question content retain their own language
 - **Chat + sender policy** — double allowlist by default; optionally trust all members of specifically allowlisted groups while keeping DMs user-allowlisted
 - **Private runtime state** — config, session index, audit log, attachments, and undelivered replies are kept under `~/.config/tgbridge` with private permissions
 - **Regression + startup gates** — `python3 tgbridge.py --selftest` runs the exhaustive suite on demand/CI; every service start runs only a fast, side-effect-free smoke gate
@@ -118,6 +122,16 @@ Its JSON output redacts proxy credentials and reports dead localhost proxy
 endpoints.
 
 **4. Talk to it.** DM the bot, or add it to a group and @mention it.
+In groups, target commands with `/help@your_bot` (or reply to the bot's message).
+
+Reused bot tokens can retain command lists from a former bridge. Telegram's
+chat-specific, private/group-wide, and language-specific lists take precedence
+over the default list that tgbridge registers. Updating the default does not
+remove these overrides. Before cleaning them, inspect and privately snapshot
+known scopes with `getMyCommands`; use `deleteMyCommands` only for confirmed
+obsolete lists. A stale persistent keyboard is separate: it disappears when
+the bot sends a plain reply with `ReplyKeyboardRemove`. Group removal is
+selective and only attached to replies, not unthreaded announcements.
 For groups you may want BotFather → `/setprivacy` → Disable, or make the bot
 a group admin, so it can see plain messages.
 

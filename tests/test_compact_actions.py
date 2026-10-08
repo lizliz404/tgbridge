@@ -82,4 +82,4 @@ class QuietProgressTests(unittest.TestCase):
         event = codex_event({'method': 'item/completed', 'params': {'item': {
             'id': 'a', 'type': 'commandExecution', 'status': 'completed', 'exitCode': 2}}})
         self.assertEqual(event['state'], 'failed')
-        self.assertIn('失败', activity_body(event))
+        self.assertIn('failed', activity_body(event))

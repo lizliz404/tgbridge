@@ -107,9 +107,9 @@ def restart(directory, source_root, unit, chat, timeout=120):
             raise RuntimeError('new owner/version/full poll interval not verified before deadline')
     except Exception as error:
         persist(status='failed', error=type(error).__name__ + ': ' + str(error)[:250], finished_at=now_iso())
-    message = ('✅ TGBridge 已加载目标源码并通过完整轮询检查，会话索引保留。'
+    message = ('✅ TGBridge updated. Sessions preserved.'
                if receipt['status'] == 'succeeded' else
-               '⚠️ TGBridge 重启未通过验收：' + receipt.get('error', 'unknown'))
+               '⚠️ Restart check failed: ' + receipt.get('error', 'unknown'))
     try:
         confirmed = notify_requester(cfg, chat, message)
         persist(feedback='confirmed' if confirmed else 'unconfirmed')

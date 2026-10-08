@@ -50,12 +50,12 @@ class QuestionTests(unittest.TestCase):
     def test_numeric_answer_and_confirm_require_explicit_selection(self):
         self.broker.answer_text(42, 7, '2', 12)
         self.assertEqual(self.answers, ['B'])
-        self.broker.offer(42, 7, 'Proceed?', ['是', '否'], self.answers.append,
+        self.broker.offer(42, 7, 'Proceed?', ['Yes', 'No'], self.answers.append,
                           owner=('pi', 1), method='confirm')
         self.broker.answer_text(42, 7, 'maybe', 12)
         self.assertEqual(self.answers, ['B'])
-        self.broker.answer_text(42, 7, '否', 12)
-        self.assertEqual(self.answers, ['B', '否'])
+        self.broker.answer_text(42, 7, 'No', 12)
+        self.assertEqual(self.answers, ['B', 'No'])
 
     def test_cancel_expire_and_interrupt_never_choose_default(self):
         self.broker.callback(self.query('cancel'))

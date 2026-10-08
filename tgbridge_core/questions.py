@@ -26,7 +26,7 @@ class Questions:
             body += '\n' + message
         if choices:
             body += '\n\n' + '\n'.join(f'{i + 1}. {choice}' for i, choice in enumerate(choices))
-        body += '\n\n可点选，也可直接回复文字；不会自动替你选择。'
+        body += '\n\nChoose or reply.'
         # Reserve room for a 128-character answer receipt, including emoji.
         if len(body.encode('utf-16-le')) // 2 > 3800 or len(choices) > 30:
             raise ValueError('question exceeds Telegram limits; split it before asking')
@@ -34,8 +34,8 @@ class Questions:
         rows = [[{'text': choice[:64], 'callback_data': f'q:{key}:{i}'}]
                 for i, choice in enumerate(choices)]
         if choices:
-            rows.append([{'text': '其他／文字回答', 'callback_data': f'q:{key}:text'}])
-        rows.append([{'text': '取消', 'callback_data': f'q:{key}:cancel'}])
+            rows.append([{'text': 'Type an answer', 'callback_data': f'q:{key}:text'}])
+        rows.append([{'text': 'Cancel', 'callback_data': f'q:{key}:cancel'}])
         entry = {'chat': chat, 'user': user, 'title': title, 'body': body, 'choices': choices,
                  'owner': owner, 'method': method, 'respond': respond, 'message_id': None, 'echo_answer': echo_answer,
                  'deadline': time.monotonic() + timeout / 1000 if timeout else None}
@@ -77,13 +77,13 @@ class Questions:
             entry['respond'](value)
         except Exception:
             self.record('question_response_failed', question_id=key, chat_id=entry['chat'])
-            self.edit(entry['chat'], entry['message_id'], '⚠️ 这次回答未确认送达，原任务可能已结束。', [])
+            self.edit(entry['chat'], entry['message_id'], '⚠️ Answer delivery unconfirmed.', [])
             return True
         self.record('question_answered', question_id=key, chat_id=entry['chat'],
                     cancelled=value is None)
-        result = '\n\n已取消。' if value is None else '\n\n已回答。'
+        result = '\n\nCancelled.' if value is None else '\n\nAnswered.'
         if value is not None and entry['echo_answer']:
-            result = '\n\n已回答：' + (str(value)[:127] + '…' if len(str(value)) > 128 else str(value))
+            result = '\n\nSelected: ' + (str(value)[:127] + '…' if len(str(value)) > 128 else str(value))
         try:
             self.edit(entry['chat'], entry['message_id'], entry['body'] + result, [])
         except Exception:
@@ -101,22 +101,22 @@ class Questions:
         with self.lock:
             entry = self.pending.get(parts[1]) if len(parts) == 3 else None
             if not entry or not self._live(entry, chat, user, message.get('message_id')):
-                self.acknowledge(query['id'], '问题已结束或不属于你。')
+                self.acknowledge(query['id'], 'Closed or not yours.')
                 return True
             key, selection = parts[1:]
             if selection == 'text':
-                self.acknowledge(query['id'], '请回复这条问题，输入你的答案。')
-                self.edit(chat, entry['message_id'], entry['body'] + '\n\n请回复本条问题输入答案。',
-                          [[{'text': '取消', 'callback_data': f'q:{key}:cancel'}]])
+                self.acknowledge(query['id'], 'Reply with your answer.')
+                self.edit(chat, entry['message_id'], entry['body'] + '\n\nReply with your answer.',
+                          [[{'text': 'Cancel', 'callback_data': f'q:{key}:cancel'}]])
                 return True
             if selection == 'cancel':
                 value = None
             elif selection.isdigit() and int(selection) < len(entry['choices']):
                 value = entry['choices'][int(selection)]
             else:
-                self.acknowledge(query['id'], '选项无效。')
+                self.acknowledge(query['id'], 'Invalid choice.')
                 return True
-        self.acknowledge(query['id'], '已收到。')
+        self.acknowledge(query['id'], 'Got it.')
         return self._finish(key, value)
 
     def answer_text(self, chat, user, text, reply_to=None):
@@ -132,8 +132,8 @@ class Questions:
             return False
         if value.isdigit() and 1 <= int(value) <= len(entry['choices']):
             value = entry['choices'][int(value) - 1]
-        if entry['method'] == 'confirm' and value not in ('是', '否'):
-            self.edit(chat, entry['message_id'], entry['body'] + '\n\n请选择是或否。',
+        if entry['method'] == 'confirm' and value not in ('Yes', 'No'):
+            self.edit(chat, entry['message_id'], entry['body'] + '\n\nChoose Yes or No.',
                       [[{'text': choice, 'callback_data': f'q:{key}:{i}'}]
                        for i, choice in enumerate(entry['choices'])])
             return True
@@ -147,4 +147,4 @@ class Questions:
                 entry = self.pending.pop(key, None)
             if entry:
                 self.record('question_interrupted', question_id=key, chat_id=entry['chat'])
-                self.edit(entry['chat'], entry['message_id'], '⚠️ 提问所属任务已结束，旧选项已失效。', [])
+                self.edit(entry['chat'], entry['message_id'], 'Question closed.', [])
