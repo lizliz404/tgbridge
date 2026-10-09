@@ -781,6 +781,10 @@ def worker(app, cfg, state):
 
 def fire_at(app, cfg, state, due):
     with app.STATE_LOCK:
+        dispatcher = cfg.get("_chat_dispatcher")
+        if getattr(app, "STOPPING", False) or (dispatcher and dispatcher.stopped):
+            # Leave the durable schedule available for rearm_at after restart.
+            return
         entry = state.get("at", {}).pop(str(due), None)
         if entry:
             app.save_json(app.STATE_PATH, state)

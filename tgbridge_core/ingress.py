@@ -29,7 +29,8 @@ def unpack_entry(app, entry):
 def _flush_prompt_batch(app, cfg, chat_id, batch):
     """Commit one settled Telegram burst to steering or the serial queue."""
     with app.INGRESS_LOCK:
-        if app.PENDING_PROMPTS.get(chat_id) is not batch or batch.get("queued"):
+        if (getattr(app, "STOPPING", False)
+                or app.PENDING_PROMPTS.get(chat_id) is not batch or batch.get("queued")):
             return
         text = "\n\n".join(batch.get("parts") or []).strip()
         batch["timer"] = None

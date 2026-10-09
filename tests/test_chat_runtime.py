@@ -375,7 +375,27 @@ class ChatRuntimeTests(unittest.TestCase):
             callback(*args)
         create.assert_not_called()
         self.assertTrue(old.STOPPING)
-        self.assertEqual(old.PROMPT_Q.qsize(), 1)
+        self.assertEqual(old.PROMPT_Q.qsize(), 0)
+        self.assertIn(str(args[2]), self.state["at"])
+
+    def test_stopped_burst_callback_cannot_steer_or_enqueue(self):
+        old = self.dispatcher.runtime(42)
+        batch = {"parts": ["durable input"], "queued": False}
+        old.PENDING_PROMPTS[42] = batch
+        self.dispatcher.close()
+        with mock.patch.object(old, "_begin_steer") as steer:
+            old._flush_prompt_batch(self.cfg, 42, batch)
+        steer.assert_not_called()
+        self.assertEqual(old.PROMPT_Q.qsize(), 0)
+        self.assertIs(old.PENDING_PROMPTS[42], batch)
+
+    def test_rearmed_schedule_survives_dispatcher_shutdown(self):
+        self.state["at"] = {"123": {"chat_id": 42, "message_id": 5, "prompt": "later"}}
+        self.dispatcher.close()
+        with mock.patch.object(tgbridge, "save_json") as save:
+            tgbridge.fire_at(self.cfg, self.state, 123)
+        save.assert_not_called()
+        self.assertIn("123", self.state["at"])
 
     def test_old_question_does_not_consume_new_session_input(self):
         from tgbridge_core.questions import Questions
