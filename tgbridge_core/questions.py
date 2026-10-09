@@ -119,10 +119,13 @@ class Questions:
         self.acknowledge(query['id'], 'Got it.')
         return self._finish(key, value)
 
-    def answer_text(self, chat, user, text, reply_to=None):
+    def answer_text(self, chat, user, text, reply_to=None, *, execution_id=None):
         with self.lock:
             matches = [(key, e) for key, e in self.pending.items()
-                       if self._live(e, chat, user, reply_to)]
+                       if self._live(e, chat, user, reply_to)
+                       and (reply_to is not None or execution_id is None
+                            or (isinstance(e['owner'], tuple) and len(e['owner']) == 4
+                                and e['owner'][2] == execution_id))]
         # Multiple concurrent questions require an explicit reply to one card.
         if len(matches) != 1:
             return False

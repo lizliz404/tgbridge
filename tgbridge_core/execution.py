@@ -5,6 +5,7 @@ No copied globals, entry-point import or hidden module-level runtime.
 """
 import json
 import os
+import queue
 import signal
 import socket
 import subprocess
@@ -538,7 +539,8 @@ def _steer_fallback(app, cfg, meta, err):
 
 def question_owner(app, transport, run_id):
     """Question broker is shared; run counters alone are only chat-local."""
-    return (transport, getattr(app, 'chat_id', None), run_id)
+    return (transport, getattr(app, 'chat_id', None),
+            getattr(app, 'execution_id', None), run_id)
 
 
 def stop_runtime(app):
@@ -566,7 +568,15 @@ def worker(app, cfg, state):
 
     One item = one try/except: a bad item must never kill the thread."""
     while not getattr(app, 'STOPPING', False):
-        entry = app.PROMPT_Q.get()
+        if getattr(app, 'execution_id', None):
+            try:
+                entry = app.PROMPT_Q.get(timeout=0.1)
+            except queue.Empty:
+                if cfg['_chat_dispatcher'].release_retired_worker(app):
+                    return
+                continue
+        else:
+            entry = app.PROMPT_Q.get()
         if getattr(app, 'STOPPING', False):
             app.PROMPT_Q.task_done()
             return
@@ -689,7 +699,10 @@ def worker(app, cfg, state):
             with app.STATE_LOCK:
                 used_runner = result_meta.get("runner", rname)
                 if new_sid and session_epoch == getattr(app, 'SESSION_EPOCH', 0):
-                    app.store_runner_session(state, chat_id, used_runner, new_sid)
+                    app.store_runner_session(
+                        app.session_state if getattr(app, 'RETIRED', False) else state,
+                        chat_id, used_runner, new_sid,
+                    )
                 app.save_json(app.STATE_PATH, state)
             if inbox:
                 inbox.stage_result(input_ids, answer or err or "")

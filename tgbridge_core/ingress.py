@@ -123,14 +123,21 @@ def _flush_prompt_batch(app, cfg, chat_id, batch):
 
     if cfg.get("_inbox"):
         cfg["_inbox"].transition(batch.get("input_ids") or [], "queued")
-    app.PROMPT_Q.put(batch)
     with app.RUN_LOCK:
-        busy = bool(app.RUN_STATE.get("busy"))
-    if busy:
+        # Snapshot this owner's backlog before the new task can start. A
+        # post-put busy check can mistake this task for a blocking predecessor.
+        with app.PROMPT_Q.mutex:
+            depth = len(app.PROMPT_Q.queue) + 1
+            # get() removes an item before worker setup marks it busy;
+            # unfinished_tasks retains ownership through setup and delivery.
+            outstanding = app.PROMPT_Q.unfinished_tasks
+        waiting = bool(app.RUN_STATE.get("busy")) or outstanding > 0
+        app.PROMPT_Q.put(batch)
+    if waiting:
         app.send(
             cfg["bot_token"],
             chat_id,
-            f"{notice('queued')} · {app.PROMPT_Q.qsize()}",
+            f"{notice('queued')} · {depth}",
         )
 
 
@@ -332,7 +339,9 @@ def handle_update(app, cfg, state, upd, *, state_path=_DEFAULT_STATE_PATH):
     cmd, rest = app.botcmd(text)
     if not cmd and not has_attachment and cfg.get('_questions'):
         reply_id = (msg.get('reply_to_message') or {}).get('message_id')
-        if cfg['_questions'].answer_text(chat_id, user_id, text, reply_id):
+        owner_args = ({'execution_id': app.execution_id}
+                      if getattr(app, 'execution_id', None) else {})
+        if cfg['_questions'].answer_text(chat_id, user_id, text, reply_id, **owner_args):
             return
     if cmd == "/help":
         app.send(
@@ -365,10 +374,13 @@ def handle_update(app, cfg, state, upd, *, state_path=_DEFAULT_STATE_PATH):
                 app.send(cfg["bot_token"], chat_id, "Task not found. See /pending.")
         return
     if cmd == "/new":
+        if dispatcher is not None:
+            app = dispatcher.new_session(chat_id)
         with app.STATE_LOCK:
-            if hasattr(app, 'SESSION_EPOCH'):
-                app.SESSION_EPOCH += 1
-            app.clear_runner_sessions(state, chat_id)
+            if dispatcher is None:
+                if hasattr(app, 'SESSION_EPOCH'):
+                    app.SESSION_EPOCH += 1
+                app.clear_runner_sessions(state, chat_id)
             if state_path is not None:
                 app.save_json(state_path, state)
         app.send(cfg["bot_token"], chat_id, "New session on your next message.", reply_to=message_id)

@@ -13,7 +13,7 @@ API long-poll in, local CLI agent out.
 ## Features
 
 - **DM + group chats** — groups are mention-triggered (@bot or reply-to-bot), DMs always answer
-- **Parallel chats** — one Telegram poller routes each allowlisted chat to its own execution owner. DMs and groups can run concurrently; turns inside one chat remain serial or use native live steering. `/status` and `/cancel` target only the current chat; `/runner` selects the runner/model only for this chat. `/new` also prevents the old in-flight session from restoring its forgotten mapping. File delivery uses `<outbox_dir>/<chat_id>/`, as specified in each task prompt; unattributed legacy root files are not auto-delivered
+- **Parallel chats and sessions** — one Telegram poller routes each allowlisted chat to an independent execution lane. Only turns in the same chat and session serialize or use native live steering. `/new` immediately opens a new lane while old work finishes independently; old bursts, native session IDs, questions and files remain owned by the old lane. `/status` and `/cancel` target the current lane; `/runner` selects the runner/model for this chat. Use the exact outbox folder in each task prompt: initial lanes use `<outbox_dir>/<chat_id>/`, new lanes add a private execution-ID subfolder. Unattributed legacy root files are not auto-delivered
 - **Per-chat sessions** — each chat maps to one native runner session (`/new` forgets the mapping, `/status` inspects it). Pi CLI/RPC sessions receive a native display name `Telegram · hostname · @bot · chat ID` on creation/resume; new OpenCode CLI sessions receive the same title. Storage locations and native IDs remain unchanged
 - **Agent failover + switching** — a failed CLI or server-mode run (quota, dead binary, broken network, timeout, empty answer) automatically walks `runner_fallbacks` only before any observed tool action; a partially executed task stays interrupted rather than replaying unknown side effects. Eligible failures walk `runner_fallbacks` with a fresh runner-native session and a one-line 🔀 header; user cancel or uncertain tool execution stops the chain. The same runner may appear repeatedly with different models, so a dead model/provider rotates without mixing Codex/OpenCode/Pi session IDs. `auto:opencode-go` discovers the current Go catalog and expands to the newest Muse Spark Contributor followed by the newest GLM, so model-version bumps do not require config edits. `/runners` shows the resolved chain and on-device availability probe; `/runner <name> [model]` switches this chat's primary without restarting (`/runner default` restores file config)
 - **Same-turn steering where supported** — Codex app-server uses `turn/steer`; OpenCode server mode uses `prompt_async`; Pi runs on its native RPC transport (`steer`, consumed after the current tool batch and before the next model request—not after the whole task). Live same-chat text bypasses idle burst debounce; injection is submitted before the Telegram acknowledgement, so a slow/rate-limited send cannot gate it. Inputs received during Pi/Codex startup wait for the live transport instead of being queued behind the whole run. Active tools are not cancelled
@@ -237,9 +237,10 @@ Do not treat `running` or a one-off `getMe` response as end-to-end health.
 The bridge treats its session map as a disposable index, not as the source of
 truth. `state.json` stores `chat_id -> runner session ID`; the runner owns the
 actual transcript in its native storage. A group has one shared session, while
-each DM or other group gets a different one. `/new` only forgets the mapping so
-the next prompt creates a fresh session; it deliberately does not delete the
-runner's historical transcript.
+each DM or other group gets a different one. `/new` forgets the current mapping
+and opens an independent execution lane: the next prompt does not wait for old
+work. The old lane drains its accepted inputs without restoring the current
+mapping or deleting the runner's historical transcript.
 
 ### Code layout
 
@@ -350,7 +351,7 @@ and Anthropic's official [claude-plugins-official telegram plugin](https://githu
 
 ## Limitations
 
-- One execution owner per allowlisted chat, no cross-chat concurrency cap beyond the allowlist; concurrent tasks share the configured workdir and provider quota, so conflicting edits still need coordination. Forum topics inside a chat are not separate sessions
+- One current execution lane per allowlisted chat; `/new` can leave earlier lanes draining concurrently. There is no bridge-wide concurrency cap. Tasks share the configured workdir and provider quota, so conflicting edits still need coordination. Forum topics inside a chat are not separate sessions
 - Bots cannot receive other bots' messages; peer-agent reports need an external shared event channel
 - Photos/documents are passed as private local paths; the runner must support reading the file type
 - Progress-aware timeout: `run_timeout_s` is idle time, while `run_max_s` is the absolute cap
