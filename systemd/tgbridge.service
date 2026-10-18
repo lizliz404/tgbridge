@@ -9,7 +9,7 @@ StartLimitIntervalSec=0
 # immediately and follow main-loop progress, including failed network attempts.
 Type=simple
 NotifyAccess=main
-WatchdogSec=300
+WatchdogSec=600
 WatchdogSignal=SIGKILL
 TimeoutStopSec=20
 KillMode=control-group

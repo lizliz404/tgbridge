@@ -557,14 +557,10 @@ def run(cfg):
     if warn and hc:
         send(cfg["bot_token"], hc, warn)
 
-    ready, interrupted = inbox.recover()
+    ready, _ = inbox.recover()
     for entry in ready:
         if is_authorized(cfg, entry["chat_id"], entry.get("chat_type"), entry.get("user_id")):
             PROMPT_Q.put(entry)
-    for entry in interrupted:
-        if is_authorized(cfg, entry["chat_id"], entry.get("chat_type"), entry.get("user_id")):
-            send_retry(cfg, entry["chat_id"],
-                       f"⚠️ Task interrupted. Review and continue: /resume {entry['id']}")
     CHAT_DISPATCHER = cfg['_chat_dispatcher'] = ChatDispatcher(sys.modules[__name__], cfg, state)
     worker_t = threading.Thread(target=CHAT_DISPATCHER.consume, daemon=True)
     worker_t.start()
@@ -589,6 +585,7 @@ def run(cfg):
             worker_t = threading.Thread(target=CHAT_DISPATCHER.consume, daemon=True)
             worker_t.start()
         CHAT_DISPATCHER.supervise()
+        telegram_io.notify_interrupted(sys.modules[__name__], cfg, inbox)
         params = {"timeout": 50, "allowed_updates": json.dumps(["message", "callback_query"])}
         if offset:
             params["offset"] = offset

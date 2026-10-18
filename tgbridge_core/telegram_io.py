@@ -140,6 +140,25 @@ def send_retry(app, cfg, chat_id, text, reply_to=None):
     return False
 
 
+def notify_interrupted(app, cfg, inbox):
+    """Delay and batch recovery notices; never block service startup on them."""
+    try:
+        grace = max(600, int(cfg.get('interruption_notice_delay_s', 600)))
+    except (TypeError, ValueError):
+        grace = 600
+    chats = {}
+    for entry in inbox.claim_interruption_notices(grace):
+        if app.is_authorized(cfg, entry['chat_id'], entry.get('chat_type'), entry.get('user_id')):
+            chats.setdefault(entry['chat_id'], []).append(entry['id'])
+    for chat, identities in chats.items():
+        shown = identities[:10]
+        text = '⚠️ Tasks interrupted for at least 10 minutes. Review before continuing:\n'
+        text += '\n'.join(f'/resume {identity}' for identity in shown)
+        if len(identities) > len(shown):
+            text += f'\n+{len(identities) - len(shown)} more — /pending'
+        app.send_retry(cfg, chat, text)
+
+
 def preserve_unconfirmed(app, chat_id, text):
     """Private recovery copy shared by assistant text and action messages."""
     app.audit("delivery_failed", chat_id=chat_id, chars=len(text or ""))

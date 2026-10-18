@@ -30,6 +30,64 @@ class InboxTests(unittest.TestCase):
         self.assertEqual(self.inbox.path, self.path)
         self.assertEqual(Path(self.path).stat().st_mode & 0o777, 0o600)
 
+    def test_interruption_notice_waits_ten_minutes_and_survives_restarts(self):
+        self.receive()
+        self.inbox.transition(['tg:42:5'], 'executing')
+        with mock.patch('tgbridge_core.inbox.time.time', return_value=1000):
+            self.inbox.recover()
+        for now in (1001, 1599):
+            with mock.patch('tgbridge_core.inbox.time.time', return_value=now):
+                restarted = Inbox(self.path)
+                restarted.recover()
+                self.assertEqual(restarted.claim_interruption_notices(), [])
+        with mock.patch('tgbridge_core.inbox.time.time', return_value=1600):
+            self.assertEqual([e['id'] for e in Inbox(self.path).claim_interruption_notices()], ['tg:42:5'])
+        with mock.patch('tgbridge_core.inbox.time.time', return_value=9999):
+            restarted = Inbox(self.path)
+            restarted.recover()
+            self.assertEqual(restarted.claim_interruption_notices(), [])
+            self.assertEqual(restarted.pending(42)[0]['status'], 'interrupted')
+            self.assertIsNotNone(restarted.continuation('tg:42:5', 42))
+            restarted.transition(['tg:42:5'], 'executing')
+            restarted.settle(['tg:42:5'], 'interrupted', 'new failure', True)
+        with mock.patch('tgbridge_core.inbox.time.time', return_value=10599):
+            self.assertEqual(len(Inbox(self.path).claim_interruption_notices()), 1)
+
+    def test_legacy_interruption_gets_grace_not_an_immediate_notice(self):
+        self.receive()
+        self.inbox.data['tg:42:5'].update(status='interrupted', updated_at=1)
+        with mock.patch('tgbridge_core.inbox.time.time', return_value=1000):
+            self.inbox.recover()
+            self.assertEqual(self.inbox.claim_interruption_notices(), [])
+            self.assertEqual(self.inbox.data['tg:42:5']['interrupted_at'], 1000)
+
+    def test_failed_notice_reservation_does_not_suppress_later_attempt(self):
+        self.receive()
+        self.inbox.transition(['tg:42:5'], 'interrupted')
+        with mock.patch('tgbridge_core.inbox.time.time', return_value=10**12):
+            with mock.patch('tgbridge_core.inbox.save_json', side_effect=OSError('disk full')):
+                with self.assertRaises(InboxError):
+                    self.inbox.claim_interruption_notices()
+            self.assertNotIn('interruption_notice_attempted_at', self.inbox.data['tg:42:5'])
+            self.assertEqual(len(self.inbox.claim_interruption_notices()), 1)
+
+    def test_notices_batch_and_ambiguous_delivery_does_not_repeat(self):
+        for n in range(12):
+            self.receive(f'tg:42:{n}')
+        with mock.patch('tgbridge_core.inbox.time.time', return_value=1000):
+            self.inbox.transition(list(self.inbox.data), 'interrupted')
+        cfg = {'allowed_chats': [42], 'allowed_user_ids': [7], 'interruption_notice_delay_s': 1}
+        with mock.patch.object(tgbridge, 'send_retry', return_value=False) as send:
+            with mock.patch('tgbridge_core.inbox.time.time', return_value=1599):
+                tgbridge.telegram_io.notify_interrupted(tgbridge, cfg, self.inbox)
+                send.assert_not_called()
+            with mock.patch('tgbridge_core.inbox.time.time', return_value=1600):
+                tgbridge.telegram_io.notify_interrupted(tgbridge, cfg, self.inbox)
+                tgbridge.telegram_io.notify_interrupted(tgbridge, cfg, Inbox(self.path))
+            send.assert_called_once()
+            self.assertIn('+2 more', send.call_args.args[2])
+            self.assertEqual(send.call_args.args[2].count('/resume'), 10)
+
     def test_repeated_telegram_update_is_not_dispatched_twice(self):
         cfg = {'bot_token': 'fixture', 'allowed_chats': [42], 'allowed_user_ids': [7], '_inbox': self.inbox}
         msg = {'chat': {'id': 42, 'type': 'private'}, 'message_id': 5, 'from': {'id': 7}, 'text': 'change it'}

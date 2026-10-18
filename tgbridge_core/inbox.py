@@ -53,13 +53,20 @@ class Inbox:
             return True
         return self._change(mutate)
 
+    @staticmethod
+    def _status(entry, status):
+        if status == 'interrupted' and entry['status'] != 'interrupted':
+            entry['interrupted_at'] = time.time()
+            entry.pop('interruption_notice_attempted_at', None)
+        entry.update(status=status, updated_at=time.time())
+
     def transition(self, identities, status):
         if not identities:
             return
         def mutate():
             for identity in identities:
                 if identity in self.data:
-                    self.data[identity].update(status=status, updated_at=time.time())
+                    self._status(self.data[identity], status)
         self._change(mutate)
 
     def stage_result(self, identities, result):
@@ -76,9 +83,9 @@ class Inbox:
         def mutate():
             for identity in identities:
                 if identity in self.data:
-                    self.data[identity].update(status=status if delivery_confirmed else 'result_unconfirmed',
-                                              result=result, delivery_confirmed=delivery_confirmed,
-                                              updated_at=time.time())
+                    entry = self.data[identity]
+                    self._status(entry, status if delivery_confirmed else 'result_unconfirmed')
+                    entry.update(result=result, delivery_confirmed=delivery_confirmed)
         self._change(mutate)
 
     def result(self, identity, chat):
@@ -95,12 +102,37 @@ class Inbox:
                     ready.append({'input_ids': [identity], **entry})
                     entry['status'] = 'queued'
                 elif entry['status'] in ('executing', 'steering'):
-                    entry['status'] = 'interrupted'
+                    self._status(entry, 'interrupted')
                     interrupted.append({'id': identity, **entry})
                 elif entry['status'] == 'interrupted':
+                    # Legacy records get a full grace period on first upgrade.
+                    entry.setdefault('interrupted_at', time.time())
                     interrupted.append({'id': identity, **entry})
             return ready, interrupted
         return self._change(mutate)
+
+    def claim_interruption_notices(self, grace_s=600):
+        """One durable send attempt per interruption, even across restarts.
+
+        Reserve BEFORE Telegram I/O: an ambiguous send must not cause spam.
+        The task remains available through /pending and /resume regardless.
+        """
+        with self.lock:
+            now = time.time()
+            due = [identity for identity, entry in self.data.items()
+                   if entry['status'] == 'interrupted'
+                   and 'interruption_notice_attempted_at' not in entry
+                   and now - entry.get('interrupted_at', now) >= grace_s]
+            if not due:
+                return []
+            def mutate():
+                notices = []
+                for identity in due:
+                    entry = self.data[identity]
+                    entry['interruption_notice_attempted_at'] = now
+                    notices.append({'id': identity, **copy.deepcopy(entry)})
+                return notices
+            return self._change(mutate)
 
     def pending(self, chat):
         with self.lock:

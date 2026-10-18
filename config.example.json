@@ -22,6 +22,7 @@
   "run_timeout_s": 1800,
   "run_max_s": 43200,
   "poll_failure_exit_threshold": 20,
+  "interruption_notice_delay_s": 600,
   "chunk": 3900,
   "reactions": true,
   "model": "",
