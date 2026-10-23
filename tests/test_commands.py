@@ -27,9 +27,14 @@ class CommandTests(unittest.TestCase):
                   'resume', 'result', 'at', 'runners', 'runner', 'help'}
         agent = {'goal-list', 'goal-status', 'goal-focus', 'goal-resume',
                  'goal-pause', 'goal-clear', 'goal-direct'}
-        self.assertEqual(set(names), bridge | agent)
+        # Telegram rejects a command name containing a dash, and one invalid
+        # entry fails the whole setMyCommands call, so dashes stay out of the
+        # menu and live in /help only.
+        self.assertEqual(set(names), bridge)
+        for name in names:
+            self.assertRegex(name, r'^[a-z0-9_]{1,32}$')
         body = tgbridge.command_help()
-        self.assertEqual(len([line for line in body.split('\n\n')[0].splitlines() if line.startswith('/')]), len(menu))
+        self.assertEqual(len([line for line in body.split('\n\n')[0].splitlines() if line.startswith('/')]), len(bridge) + len(agent))
         for row in menu:
             self.assertIn(row['description'], body)
             self.assertLessEqual(len(row['description']), 256)

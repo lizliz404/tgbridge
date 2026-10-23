@@ -52,9 +52,21 @@ def botcmd(text):
     return parts[0].split('@')[0].lower(), (parts[1] if len(parts) > 1 else '').strip()
 
 
+def telegram_command_name(name):
+    """Telegram accepts only a-z, 0-9 and underscore in a bot command name.
+
+    The goal commands contain dashes, so they cannot appear in Telegram's own
+    command menu. They stay listed in /help and keep working when typed; an
+    invalid name here would make the whole setMyCommands call fail and take
+    every command button with it.
+    """
+    return bool(re.fullmatch(r'[a-z0-9_]{1,32}', name))
+
+
 def command_menu():
     return [{'command': name, 'description': description}
-            for name, description, _, _ in COMMANDS]
+            for name, description, _, _ in COMMANDS
+            if telegram_command_name(name)]
 
 
 def command_help(bot_username='', group=False):
