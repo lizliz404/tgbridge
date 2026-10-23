@@ -351,7 +351,7 @@ def handle_update(app, cfg, state, upd, *, state_path=_DEFAULT_STATE_PATH):
             reply_to=message_id,
         )
         return
-    if cmd and cmd not in app.COMMAND_NAMES:
+    if cmd and cmd not in app.COMMAND_NAMES and not app.is_agent_command(cmd):
         app.send(cfg["bot_token"], chat_id, app.unsupported_command(cmd), reply_to=message_id)
         return
     if cmd in ("/pending", "/resume", "/result"):
@@ -642,16 +642,22 @@ def handle_update(app, cfg, state, upd, *, state_path=_DEFAULT_STATE_PATH):
         # passive group traffic and slash commands cannot trigger this work.
         _, source_attachment = app.save_attachment(cfg, reply)
     prompt_text = app.reply_context(msg, source_attachment) + text.strip()
-    if chat_type != "private" and cfg.get("capture_group_context", True):
-        with app.STATE_LOCK:
-            buf = (state.get("context") or {}).pop(str(chat_id), None) or []
-        if buf:
-            digest = "\n".join(f"- {e['who']} {e['t']}: {e['text']}" for e in buf[-20:])
-            prompt_text = (
-                "[group messages since your last turn — passive context, "
-                "nobody asked you anything yet:\n" + digest + "\n]\n\n" + prompt_text
-            )
-    prompt_text = app.apply_sender_instructions(cfg, user_id, prompt_text)
+    if cmd and app.is_agent_command(cmd):
+        # The runtime dispatches an extension command only when the message is
+        # the command itself. Context prefixes or the outbox note turn
+        # `/goal-list` into ordinary prose the model has to guess about.
+        prompt_text = text.strip()
+    else:
+        if chat_type != "private" and cfg.get("capture_group_context", True):
+            with app.STATE_LOCK:
+                buf = (state.get("context") or {}).pop(str(chat_id), None) or []
+            if buf:
+                digest = "\n".join(f"- {e['who']} {e['t']}: {e['text']}" for e in buf[-20:])
+                prompt_text = (
+                    "[group messages since your last turn — passive context, "
+                    "nobody asked you anything yet:\n" + digest + "\n]\n\n" + prompt_text
+                )
+        prompt_text = app.apply_sender_instructions(cfg, user_id, prompt_text)
     inbox = cfg.get("_inbox")
     if inbox:
         identity = f"tg:{chat_id}:{message_id}"

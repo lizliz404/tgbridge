@@ -23,8 +23,11 @@ class CommandTests(unittest.TestCase):
         menu = tgbridge.command_menu()
         names = [row['command'] for row in menu]
         self.assertEqual(len(names), len(set(names)))
-        self.assertEqual(set(names), {'status', 'cancel', 'new', 'pending',
-            'resume', 'result', 'at', 'runners', 'runner', 'help'})
+        bridge = {'status', 'cancel', 'new', 'pending',
+                  'resume', 'result', 'at', 'runners', 'runner', 'help'}
+        agent = {'goal-list', 'goal-status', 'goal-focus', 'goal-resume',
+                 'goal-pause', 'goal-clear', 'goal-direct'}
+        self.assertEqual(set(names), bridge | agent)
         body = tgbridge.command_help()
         self.assertEqual(len([line for line in body.split('\n\n')[0].splitlines() if line.startswith('/')]), len(menu))
         for row in menu:
@@ -40,7 +43,39 @@ class CommandTests(unittest.TestCase):
             if isinstance(node, ast.Compare) and isinstance(node.left, ast.Name) and node.left.id == 'cmd':
                 handled.update(n.value.lstrip('/') for n in ast.walk(node)
                     if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.startswith('/'))
-        self.assertEqual(handled, set(names))
+        self.assertEqual(handled, bridge)
+
+    def test_goal_commands_are_forwarded_verbatim_to_the_agent(self):
+        """The runtime dispatches `/goal-*`; the bridge must not alter the text."""
+        for cmd in ('/goal', '/goal-list', '/goal-status verbose', '/goal-resume',
+                    '/goal-focus', '/sisyphus-direct 1) do it'):
+            with self.subTest(cmd=cmd), mock.patch.object(tgbridge, 'defer_prompt') as defer, \
+                 mock.patch.object(tgbridge, 'send') as send, \
+                 mock.patch.object(tgbridge, 'audit'):
+                tgbridge.handle_update(self.cfg, {}, self.message(cmd), state_path=None)
+                self.assertEqual(defer.call_args.args[3], cmd)
+                send.assert_not_called()
+
+    def test_group_context_and_sender_rules_never_wrap_a_goal_command(self):
+        cfg = dict(self.cfg, sender_instructions={'7': 'always be terse'})
+        with mock.patch.object(tgbridge, 'defer_prompt') as defer, \
+             mock.patch.object(tgbridge, 'audit'):
+            state = {'bot_username': 'fixture_bot',
+                     'context': {'-42': [{'who': 'A', 't': '10:00', 'text': 'chatter'}]}}
+            tgbridge.handle_update(cfg, state, self.message('/goal-list@fixture_bot', group=True),
+                                   state_path=None)
+        self.assertEqual(defer.call_args.args[3], '/goal-list')
+        # Buffered chatter is preserved for the next real turn, not consumed
+        # and not prepended to a command.
+        self.assertEqual(state['context']['-42'][0]['text'], 'chatter')
+
+    def test_unlisted_slash_commands_are_still_rejected(self):
+        for cmd in ('/memory-pin', '/goalish', '/review'):
+            with self.subTest(cmd=cmd), mock.patch.object(tgbridge, 'send') as send, \
+                 mock.patch.object(tgbridge, 'defer_prompt') as defer:
+                tgbridge.handle_update(self.cfg, {}, self.message(cmd), state_path=None)
+                self.assertIn('Unknown command', send.call_args.args[2])
+                defer.assert_not_called()
 
     def test_help_with_bot_suffix_is_handled_inline_and_threaded(self):
         with mock.patch.object(tgbridge, 'send') as send, \

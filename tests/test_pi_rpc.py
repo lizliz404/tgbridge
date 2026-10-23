@@ -58,6 +58,16 @@ def handle(command):
     if kind == "get_state":
         respond(command["id"], "get_state", {"sessionId": "sid-fixture", "isStreaming": False})
     elif kind == "prompt":
+        message = command.get("message") or ""
+        if message.lstrip().startswith("/"):
+            # Extension command: real Pi answers through ctx.ui.notify and
+            # reports disposition "handled" instead of starting a run.
+            emit({"type": "extension_ui_request", "id": "ui-notify",
+                  "method": "notify", "message": "Open goals: 1\n  * mvkie94k — paused"})
+            emit({"type": "extension_ui_request", "id": "ui-status",
+                  "method": "setStatus", "statusKey": "goal"})
+            respond(command["id"], "prompt", {"disposition": "handled"})
+            return
         respond(command["id"], "prompt", {"disposition": "started"})
         emit({"type": "agent_start"}, delay=True)
         emit({"type": "message_update", "assistantMessageEvent": {
@@ -233,6 +243,24 @@ class PiRpcTransportTests(unittest.TestCase):
         # Thinking is private: neither replies nor status lines may expose it.
         self.assertEqual(live["thinking"], "")
         self.assertNotIn("weighing options", " ".join(m["text"] for m in self.sent))
+
+    def test_extension_command_output_reaches_the_chat(self):
+        """A handled command answers through UI notices, not an assistant turn."""
+        with FakePiFixture(self) as fixture:
+            cfg = {"bot_token": "token", "workdir": fixture.tmp.name}
+            live = self._live()
+            sid, answer, err = tgbridge.run_pi_rpc(cfg, None, "/goal-list", live)
+            commands = fixture.commands()
+
+        self.assertIsNone(err)
+        self.assertEqual(sid, "sid-fixture")
+        self.assertEqual(answer, "Open goals: 1\n  * mvkie94k — paused")
+        # No run started, so no segment was streamed as its own chat message.
+        self.assertEqual(self.sent, [])
+        self.assertFalse(live["streamed"])
+        # The command has to arrive exactly as typed.
+        self.assertEqual([c["message"] for c in commands if c["type"] == "prompt"],
+                         ["/goal-list"])
 
     def test_without_a_live_sink_the_joined_answer_is_returned(self):
         with FakePiFixture(self) as fixture:

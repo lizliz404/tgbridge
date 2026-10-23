@@ -114,6 +114,10 @@ def _pi_rpc_ui(app, cfg, proc, event, live, run_id):
     if method not in ('select', 'confirm', 'input', 'editor'):
         if live is not None and method in ('notify', 'setStatus', 'setWidget'):
             summary = event.get('message') or event.get('statusText') or '\n'.join(event.get('widgetLines') or [])
+            if method == 'notify' and summary:
+                # An extension command answers through ctx.ui.notify, not an
+                # assistant message; keep the text so the chat can see it.
+                live.setdefault('notices', []).append(str(summary).strip())
             live['activity'] = {'label': 'status', 'preview': summary}
             app.edit_status(cfg, live)
         return
@@ -264,6 +268,7 @@ def run_pi_rpc(app, cfg, session_id, prompt, live=None):
     if live is not None:
         live["missing_segments"] = []
         live["thinking"] = ""
+        live["notices"] = []
     try:
         command = [app.pi_binary(), "--mode", "rpc"]
         if cfg.get("session_name"):
@@ -484,7 +489,20 @@ def run_pi_rpc(app, cfg, session_id, prompt, live=None):
                 return sid, answer + "\n\n🛑 (cancelled — partial answer)", None
             return sid, None, app.CANCEL_MSG
         if handled:
-            return sid, "", None
+            # Command output arrived as UI notices while the response was
+            # acknowledged; drain a short window, then relay what it said.
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                try:
+                    event = early_events.pop(0) if early_events else events.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if event is None:
+                    break
+                if event.get("type") == "extension_ui_request":
+                    app._pi_rpc_ui(cfg, proc, event, live, run_id)
+            notices = [row for row in ((live or {}).get("notices") or []) if row]
+            return sid, "\n\n".join(notices), None
         if not settled and not timeout_reason and not cancelled:
             # Never replay a partially executed task automatically after a crash.
             return sid, answer or None, "Pi RPC exited before agent_settled"

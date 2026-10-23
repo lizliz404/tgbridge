@@ -54,7 +54,7 @@ from tgbridge_core.chat_runtime import ChatDispatcher
 from tgbridge_core.runtime import LOADED_CODE, source_identity
 from tgbridge_core.context import reply_context
 from tgbridge_core import telegram_io, execution, opencode_transport, codex_transport, pi_transport, ingress
-from tgbridge_core.commands import COMMAND_NAMES, botcmd, command_menu, command_help, unsupported_command
+from tgbridge_core.commands import COMMAND_NAMES, botcmd, command_menu, command_help, is_agent_command, unsupported_command
 from tgbridge_core.ownership import AlreadyRunning, ProcessLease
 from tgbridge_core.inbox import Inbox, InboxError
 from tgbridge_core.questions import Questions

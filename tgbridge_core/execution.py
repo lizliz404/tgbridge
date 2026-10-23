@@ -375,6 +375,7 @@ def run_with_fallbacks(app, cfg, session_id, prompt, live=None, result_meta=None
         live["streamed"] = False
         live["missing_segments"] = []
         live.pop("journal", None)
+        live.pop("notices", None)
     new_sid, answer, err = app.run_one(
         dict(cfg, runner=rname, model=model), session_id, prompt, live
     )
@@ -416,6 +417,7 @@ def run_with_fallbacks(app, cfg, session_id, prompt, live=None, result_meta=None
             live["streamed"] = False
             live["missing_segments"] = []
             live.pop("journal", None)
+            live.pop("notices", None)
         try:
             fallback_timeout = int(cfg.get("fallback_run_timeout_s", 0))
         except (TypeError, ValueError):
@@ -617,10 +619,13 @@ def worker(app, cfg, state):
                 )
             outbox = app.outbox_dir(cfg)
             app.ensure_private_dir(outbox)
-            prompt = prompt + (
-                f"\n\n(To give files to the user, write them into {outbox}/ "
-                "— they are delivered automatically after this run.)"
-            )
+            if not prompt.lstrip().startswith('/'):
+                # A slash command must arrive as the message itself, or the
+                # runner treats the suffix as prose instead of dispatching it.
+                prompt = prompt + (
+                    f"\n\n(To give files to the user, write them into {outbox}/ "
+                    "— they are delivered automatically after this run.)"
+                )
             app.audit(
                 "run_start",
                 chat_id=chat_id,
