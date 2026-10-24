@@ -11,17 +11,59 @@ import threading
 import time
 
 def pi_rpc_ok(app, _cfg=None):
-    """Installed Pi must expose the RPC transport used for streaming/steering."""
+    """Pi RPC must actually answer a get_state handshake, not just list the
+    flag in --help. A wedged/blank RPC child used to pass the probe and then
+    time out on the first real run.
+    """
+    import queue, threading, json as _json
     try:
-        result = subprocess.run(
-            [app.pi_binary(), "--help"],
-            text=True,
-            capture_output=True,
-            timeout=10,
+        proc = subprocess.Popen(
+            [app.pi_binary(), "--mode", "rpc"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, bufsize=1, encoding="utf-8",
         )
     except Exception:
         return False
-    return result.returncode == 0 and "rpc" in (result.stdout or "")
+    events: queue.Queue = queue.Queue()
+    def _read():
+        for raw in proc.stdout:
+            raw = raw.strip()
+            if raw:
+                try: events.put(_json.loads(raw))
+                except Exception: pass
+        events.put(None)
+    threading.Thread(target=_read, daemon=True).start()
+    try:
+        proc.stdin.write(_json.dumps({"id": "probe-state", "type": "get_state"}) + "\n")
+        proc.stdin.flush()
+    except Exception:
+        proc.kill(); return False
+    deadline = time.monotonic() + 20
+    ok = False
+    while time.monotonic() < deadline:
+        try:
+            e = events.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        if e is None:
+            break
+        if e.get("type") == "response" and e.get("id") == "probe-state":
+            ok = bool(e.get("success"))
+            break
+    try:
+        proc.stdin.close()
+    except Exception:
+        pass
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=3)
+    except Exception:
+        try: proc.kill()
+        except Exception: pass
+    return ok
 
 
 def _pi_rpc_write(app, proc, payload):
@@ -319,7 +361,12 @@ def run_pi_rpc(app, cfg, session_id, prompt, live=None):
             )
         except RuntimeError as e:
             app.log(f"pi rpc get_state: {e}")
-            state = {}
+            # A get_state timeout means the RPC child never came up; continuing
+            # would send the prompt into a dead process and stall the user for
+            # PI_RPC_PROMPT_TIMEOUT before reporting all runners exhausted.
+            tail = (errbuf[0] if errbuf else "").strip().splitlines()
+            detail = f"{e}" + (f" | stderr: {tail[-1][:300]}" if tail else "")
+            raise RuntimeError(detail)
         sid = state.get("sessionId") or sid
         if sid:
             with app.RUN_LOCK:

@@ -471,14 +471,18 @@ def run(cfg):
         state.pop("context", None)
         state.pop("hints", None)
     me = None
-    for attempt in range(1, 6):
+    # Network blips must not kill the bridge: wait for Telegram indefinitely
+    # with capped backoff instead of exiting after 5 tries. systemd restart
+    # loops used to burn hundreds of restarts on each transient outage.
+    # Only a real 401 (bad token) exits, since that never heals by retrying.
+    getme_backoff = 3
+    getme_attempt = 0
+    while True:
+        getme_attempt += 1
         systemd_notify("WATCHDOG=1")
         me = api(cfg["bot_token"], "getMe")
         if me and me.get("ok"):
             break
-        # api() returns None for both a dead token and a transient network
-        # fault — a single attempt must not misreport a blip as "bad token".
-        # Probe the raw HTTP status: only 401 means the token is wrong.
         try:
             probe = urllib.request.Request(
                 f"https://api.telegram.org/bot{cfg['bot_token']}/getMe",
@@ -486,21 +490,25 @@ def run(cfg):
             )
             with urllib.request.urlopen(probe, timeout=15) as r:
                 json.load(r)
-            log(f"getMe attempt {attempt}/5: no ok payload, retrying")
+            if getme_attempt <= 5 or getme_attempt % 20 == 0:
+                log(f"getMe attempt {getme_attempt}: no ok payload, retrying")
         except urllib.error.HTTPError as e:
             if e.code == 401:
                 sys.exit("getMe failed: bad token (401 Unauthorized)")
-            log(f"getMe attempt {attempt}/5 transient http {e.code}, retrying")
+            if getme_attempt <= 5 or getme_attempt % 20 == 0:
+                log(f"getMe attempt {getme_attempt} transient http {e.code}, retrying")
         except BridgeStop:
             raise
         except Exception as e:
-            log(f"getMe attempt {attempt}/5 transient {type(e).__name__}")
+            if getme_attempt <= 5 or getme_attempt % 20 == 0:
+                log(f"getMe attempt {getme_attempt} transient {type(e).__name__}")
         me = None
-        time.sleep(3)
-    if not me or not me.get("ok"):
-        sys.exit(
-            "getMe failed after 5 retries: Telegram unreachable (token not verified)"
+        update_health(
+            status="waiting_for_network",
+            last_poll_error={"kind": "getme_retry", "attempt": getme_attempt},
         )
+        time.sleep(getme_backoff)
+        getme_backoff = min(getme_backoff * 2, 300)
     state["bot_username"] = me["result"]["username"]
     save_json(STATE_PATH, state)
     menu = api(
