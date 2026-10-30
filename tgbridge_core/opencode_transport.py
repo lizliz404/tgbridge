@@ -261,7 +261,9 @@ def run_agent_server_v1(app, cfg, session_id, prompt, live=None):
             if (message.get("info") or {}).get("id")
         }
         body: dict = {"parts": [{"type": "text", "text": prompt}]}
-        model = app.resolve_model(cfg, cfg.get("runner", "opencode"))
+        model = app.resolve_model(
+            cfg, cfg.get("runner", "opencode"), explicit=cfg.get("model") or None
+        )
         if model and "/" in model:
             prov, _, mid = model.partition("/")
             body["model"] = {"providerID": prov, "modelID": mid}
@@ -480,7 +482,12 @@ def opencode_v2_supported(app, cfg):
 
 
 def _opencode_model(app, cfg, v2=False):
-    model = str(app.resolve_model(cfg, cfg.get("runner", "opencode")) or "").strip()
+    model = str(
+        app.resolve_model(
+            cfg, cfg.get("runner", "opencode"), explicit=cfg.get("model") or None
+        )
+        or ""
+    ).strip()
     if "/" not in model:
         return None
     provider, _, model_id = model.partition("/")

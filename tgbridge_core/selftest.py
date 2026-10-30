@@ -461,7 +461,7 @@ def run_selftest(app):
         )
     finally:
         _set_app_global(app, "run_agent", orig_run_agent)
-    if "all runners exhausted (codex -> opencode)" not in (dead_err or ""):
+    if "all runners exhausted (codex -> opencode/c/d)" not in (dead_err or ""):
         fails.append("any-failure fails over")
     if [c[:2] for c in fb_calls] != [("codex", ""), ("opencode", "c/d")]:
         fails.append("failover walks the whole chain")

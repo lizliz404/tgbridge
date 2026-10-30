@@ -21,7 +21,7 @@
   "workdir": "/home/you/your-project",
   "run_timeout_s": 1800,
   "run_max_s": 43200,
-  "poll_failure_exit_threshold": 20,
+  "poll_failure_exit_threshold": 0,
   "interruption_notice_delay_s": 600,
   "chunk": 3900,
   "reactions": true,
@@ -30,8 +30,10 @@
     "opencode": "auto:opencode-go"
   },
   "runner_fallbacks": [
+    {"runner": "pi", "model": "auto:pi"},
     {"runner": "opencode", "model": "auto:opencode-go"}
   ],
+  "max_fallback_steps": 12,
   "model_discovery_cache_s": 300,
   "model_discovery_timeout_s": 15,
   "fallback_run_timeout_s": 300,

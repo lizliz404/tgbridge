@@ -106,6 +106,92 @@ class ServerFailoverTests(unittest.TestCase):
         self.assertIn("glm answer", answer or "")
         self.assertIsNone(error)
 
+    def test_same_runner_model_failover_resumes_the_chat_session(self):
+        calls = []
+
+        def run_one(cfg, session_id, prompt, live=None):
+            calls.append((cfg["runner"], cfg.get("model"), session_id))
+            if cfg.get("model") == "magpie/auto/gpt-6-luna":
+                return "pi-session", "answer via fallback model", None
+            return session_id, None, "Pi error: 503: upstream unavailable"
+
+        cfg = {
+            "runner": "pi",
+            "runner_fallbacks": [{"runner": "pi", "model": "magpie/auto/gpt-6-luna"}],
+        }
+        with mock.patch.object(tgbridge, "run_one", side_effect=run_one):
+            sid, answer, error = tgbridge.run_with_fallbacks(
+                cfg, "pi-session", "prompt"
+            )
+
+        # A dead model must not cost the chat its session context.
+        self.assertEqual(
+            calls,
+            [
+                ("pi", "", "pi-session"),
+                ("pi", "magpie/auto/gpt-6-luna", "pi-session"),
+            ],
+        )
+        self.assertEqual(sid, "pi-session")
+        self.assertIn("answer via fallback model", answer or "")
+        self.assertIn("answered via pi/magpie/auto/gpt-6-luna", answer or "")
+        self.assertIsNone(error)
+
+    def test_cross_runner_steps_still_start_fresh_sessions(self):
+        calls = []
+
+        def run_one(cfg, session_id, prompt, live=None):
+            calls.append((cfg["runner"], session_id))
+            return ("new-pi" if cfg["runner"] == "pi" else session_id), None, "down"
+
+        cfg = {
+            "runner": "pi",
+            "runner_fallbacks": [
+                {"runner": "codex"},
+                {"runner": "pi", "model": "m/b"},
+            ],
+        }
+        with mock.patch.object(tgbridge, "run_one", side_effect=run_one):
+            tgbridge.run_with_fallbacks(cfg, "pi-session", "prompt")
+
+        # codex never sees pi's session; the second pi step resumes the
+        # session the first pi attempt actually created.
+        self.assertEqual(
+            calls,
+            [("pi", "pi-session"), ("codex", None), ("pi", "new-pi")],
+        )
+
+    def test_cli_tool_trail_blocks_replay_on_failover(self):
+        live = {"trail": []}
+
+        def run_one(cfg, session_id, prompt, live=None):
+            live["trail"].append("🔧 bash: rm -rf staging")
+            return session_id, None, "opencode failed rc=1"
+
+        cfg = {"runner": "opencode", "runner_fallbacks": [{"runner": "codex"}]}
+        with mock.patch.object(tgbridge, "run_one", side_effect=run_one) as run:
+            _, _, err = tgbridge.run_with_fallbacks(cfg, None, "mutate", live)
+
+        run.assert_called_once()
+        self.assertEqual(err, "opencode failed rc=1")
+
+    def test_exhausted_message_names_each_runner_and_model(self):
+        def run_one(cfg, session_id, prompt, live=None):
+            return session_id, None, f"{cfg.get('model') or 'default'} is down"
+
+        cfg = {
+            "runner": "pi",
+            "runner_fallbacks": [
+                {"runner": "pi", "model": "m/a"},
+                {"runner": "codex"},
+            ],
+        }
+        with mock.patch.object(tgbridge, "run_one", side_effect=run_one):
+            _, _, err = tgbridge.run_with_fallbacks(cfg, "s", "prompt")
+
+        self.assertIn("all runners exhausted (pi -> pi/m/a -> codex)", err)
+        self.assertIn("default is down", err)
+
     def test_provider_auth_failure_fails_over_instead_of_stopping(self):
         calls = []
 

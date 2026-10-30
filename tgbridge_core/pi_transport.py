@@ -317,7 +317,7 @@ def run_pi_rpc(app, cfg, session_id, prompt, live=None):
             command += ["--name", cfg["session_name"]]
         if sid:
             command += ["--session-id", sid]
-        model = app.resolve_model(cfg, "pi")
+        model = app.resolve_model(cfg, "pi", explicit=cfg.get("model") or None)
         if model:
             command += ["--model", model]
         proc = subprocess.Popen(

@@ -13,6 +13,7 @@ OPENCODE = os.environ.get(
 PI = os.environ.get("PI_BIN", os.path.expanduser("~/.local/share/mise/shims/pi"))
 CODEX_YOLO_FLAG = "--dangerously-bypass-approvals-and-sandbox"
 AUTO_OPENCODE_GO_MODEL = "auto:opencode-go"
+AUTO_PI_PREFIX = "auto:pi"
 _MODEL_DISCOVERY_CACHE = {}
 _MODEL_DISCOVERY_LOCK = threading.Lock()
 
@@ -397,6 +398,86 @@ def discover_opencode_go_models(cfg=None):
     return selected
 
 
+def select_pi_models(rows):
+    """Interleave one model per upstream group, in first-seen group order.
+
+    ``rows`` are (provider, model_id) pairs from ``pi --list-models``. The
+    first id segment names the upstream inside a gateway provider (e.g.
+    magpie's hanzilla/commandcode/devin routing namespaces, or its managed
+    auto/ and group/ aliases); a single-segment id keys on the provider
+    itself. Taking one model per group per round means one dead upstream
+    costs a single attempt instead of blocking the rest of the chain.
+    """
+    groups = {}
+    order = []
+    for provider, model_id in rows:
+        key = model_id.split("/", 1)[0] if "/" in model_id else provider
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(f"{provider}/{model_id}")
+    out = []
+    depth = 0
+    while True:
+        added = False
+        for key in order:
+            if depth < len(groups[key]):
+                out.append(groups[key][depth])
+                added = True
+        if not added:
+            return out
+        depth += 1
+
+
+def discover_pi_models(cfg=None, search=None):
+    """Ask the installed Pi CLI for its model catalog, with a short TTL.
+
+    ``search`` is passed to ``pi --list-models <search>`` (Pi's own fuzzy
+    match), so ``auto:pi:hanzilla`` scopes the failover set without config
+    churn when the catalog changes. Offline mode keeps discovery free of
+    network stalls; the local catalog is what Pi would use anyway.
+    """
+    cfg = cfg or {}
+    try:
+        cache_s = max(0, int(cfg.get("model_discovery_cache_s", 300)))
+        timeout_s = max(1, int(cfg.get("model_discovery_timeout_s", 15)))
+    except (TypeError, ValueError):
+        cache_s, timeout_s = 300, 15
+    key = ("pi", search or "")
+    now = time.monotonic()
+    with _MODEL_DISCOVERY_LOCK:
+        cached = _MODEL_DISCOVERY_CACHE.get(key)
+        if cached and now - cached[0] < cache_s:
+            return list(cached[1])
+    cmd = [pi_binary(), "--offline", "--list-models"]
+    if search:
+        cmd.append(search)
+    try:
+        result = subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            timeout=timeout_s,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RunnerError(f"Pi model discovery failed: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown error").strip()[-300:]
+        raise RunnerError(f"Pi model discovery failed: {detail}")
+    rows = []
+    for line in result.stdout.splitlines():
+        fields = re.sub(r"\x1b\[[0-9;]*m", "", line).split()
+        # Real table rows carry provider, model, context, max-out, ...
+        if len(fields) >= 4 and fields[0] != "provider":
+            rows.append((fields[0], fields[1]))
+    selected = select_pi_models(rows)
+    if not selected:
+        raise RunnerError("Pi reported no models")
+    with _MODEL_DISCOVERY_LOCK:
+        _MODEL_DISCOVERY_CACHE[key] = (now, tuple(selected))
+    return selected
+
+
 def _model_spec(cfg, runner_name, explicit=None):
     if explicit:
         return explicit
@@ -406,16 +487,50 @@ def _model_spec(cfg, runner_name, explicit=None):
     return cfg.get("model") or ""
 
 
-def model_candidates(cfg, model_spec):
-    """Expand an auto selector into ordered concrete model names."""
-    if model_spec != AUTO_OPENCODE_GO_MODEL:
-        return [model_spec]
-    try:
+def _auto_candidates(cfg, spec):
+    """Discovery-backed candidates for a known auto:* selector, else None."""
+    if spec == AUTO_OPENCODE_GO_MODEL:
         return discover_opencode_go_models(cfg)
-    except RunnerError:
-        # Keep a loud placeholder in the chain. run_one resolves it strictly
-        # and reports the discovery error instead of silently using Zen/default.
-        return [AUTO_OPENCODE_GO_MODEL]
+    if spec == AUTO_PI_PREFIX or (
+        isinstance(spec, str) and spec.startswith(AUTO_PI_PREFIX + ":")
+    ):
+        return discover_pi_models(
+            cfg, spec[len(AUTO_PI_PREFIX):].lstrip(":") or None
+        )
+    return None
+
+
+def model_candidates(cfg, model_spec):
+    """Expand a spec (or list of specs) into ordered concrete model names.
+
+    A list spec is flattened, so runner_models and runner_fallbacks entries
+    may each name several models. A failed discovery keeps a loud
+    placeholder in the chain: run_one resolves it strictly and reports the
+    discovery error instead of silently using a runner default.
+    """
+    if isinstance(model_spec, (list, tuple)):
+        out = []
+        for spec in model_spec:
+            out.extend(model_candidates(cfg, spec))
+        return out
+    if isinstance(model_spec, str) and model_spec.startswith("auto:"):
+        try:
+            discovered = _auto_candidates(cfg, model_spec)
+        except RunnerError:
+            discovered = None
+        if discovered is not None:
+            return discovered
+    return [model_spec]
+
+
+def resolve_auto_model(cfg, spec):
+    """Strict auto:* resolution for direct run_one callers; errors are loud."""
+    candidates = _auto_candidates(cfg, spec)
+    if candidates is None:
+        raise RunnerError(f"unknown model selector {spec!r}")
+    if not candidates:
+        raise RunnerError(f"model selector {spec!r} resolved no models")
+    return candidates[0]
 
 
 def resolve_model(cfg, runner_name, explicit=None):
@@ -436,12 +551,12 @@ def fallback_chain(cfg):
     name a runner. Unknown runners are kept (fail loud at attempt time with
     a clear message) but exact duplicates of the primary are dropped.
     """
-    primary = (
-        cfg.get("runner", "opencode"),
-        resolve_model(cfg, cfg.get("runner", "opencode")),
+    primary_runner = cfg.get("runner", "opencode")
+    primary_models = (
+        model_candidates(cfg, _model_spec(cfg, primary_runner)) or [""]
     )
     chain = []
-    seen = {primary}
+    seen = {(primary_runner, model) for model in primary_models}
     raw = cfg.get("runner_fallbacks") or []
     if not isinstance(raw, list):
         return chain
@@ -457,3 +572,28 @@ def fallback_chain(cfg):
             seen.add(step)
             chain.append(step)
     return chain
+
+
+def run_plan(cfg):
+    """Ordered [(runner, model)] attempts for one run.
+
+    The primary's own spec expands to all of its candidates, so an auto
+    selector or a model list on the primary already rotates same-runner
+    models before runner_fallbacks are even reached. Everything is deduped
+    and max_fallback_steps bounds the failover breadth (0 = unlimited).
+    """
+    runner_name = cfg.get("runner", "opencode")
+    candidates = model_candidates(cfg, _model_spec(cfg, runner_name)) or [""]
+    steps = [(runner_name, model) for model in candidates]
+    seen = set(steps)
+    for step in fallback_chain(cfg):
+        if step not in seen:
+            seen.add(step)
+            steps.append(step)
+    try:
+        cap = int(cfg.get("max_fallback_steps", 12))
+    except (TypeError, ValueError):
+        cap = 12
+    if cap > 0:
+        steps = steps[: 1 + cap]
+    return steps

@@ -329,9 +329,13 @@ def clear_runner_sessions(app, state, chat_id):
 def run_one(app, cfg, session_id, prompt, live=None):
     """Run one configured runner through its declared CLI/server transport."""
     rname = cfg.get("runner", "opencode")
-    if cfg.get("model") == app.AUTO_OPENCODE_GO_MODEL:
+    model = cfg.get("model")
+    if isinstance(model, str) and model.startswith("auto:"):
+        # A selector reaches run_one only when plan expansion could not
+        # resolve it; report the real discovery error, never pass the
+        # selector text to the runner as a literal model name.
         try:
-            cfg = dict(cfg, model=app.discover_opencode_go_models(cfg)[0])
+            cfg = dict(cfg, model=app.resolve_auto_model(cfg, model))
         except app.RunnerError as exc:
             return session_id, None, str(exc)
     mode = app.resolve_runner_mode(cfg, rname)
@@ -357,87 +361,117 @@ def run_one(app, cfg, session_id, prompt, live=None):
     return adapter["run"](cfg, session_id, prompt, live)
 
 
-def run_with_fallbacks(app, cfg, session_id, prompt, live=None, result_meta=None):
-    """Fail over an unusable runner only before observed tool execution.
-
-    Tag quota/dead binary/network/empty-answer failures and try the next
-    fallback when no tool action was observed. Cancel and uncertain executed
-    actions stop the chain; replaying them in a fresh runner is unsafe. Fallback steps always start a fresh session — session/thread
-    IDs are runner-native and cannot resume across runners — and the
-    delivered answer carries a one-line 🔀 header naming the runner that
-    actually answered.
-    """
-    rname = cfg.get("runner", "opencode")
-    model = app.resolve_model(cfg, rname)
-    if live is not None:
-        # Each attempt owns its own delivery state: a streamed Pi run that
-        # dies must not make a fallback answer look already-delivered.
-        live["streamed"] = False
-        live["missing_segments"] = []
-        live.pop("journal", None)
-        live.pop("notices", None)
-    new_sid, answer, err = app.run_one(
-        dict(cfg, runner=rname, model=model), session_id, prompt, live
+def _trail_tool_count(app, live):
+    """Tool executions observed by any transport (CLI leaves 🔧 lines)."""
+    return sum(
+        1 for line in (live.get("trail") or []) if str(line).startswith("🔧")
     )
-    uncertain = bool(live and live.get("journal") and live["journal"].actions)
-    if answer is not None or (err or "") == app.CANCEL_MSG or uncertain:
-        # A tool already ran: retrying the original prompt in a fresh runner
-        # could repeat external side effects whose outcome we do not know.
-        if result_meta is not None:
-            result_meta.update(runner=rname, model=model)
-        return new_sid, answer, err
-    kind = app.classify_run_error(err, cfg.get("quota_markers"))
-    reason = "hit a limit" if kind == "quota" else "is unusable"
-    tried = [(rname, model)]
-    with app.RUN_LOCK:
-        if app.RUN_STATE.get("current"):
-            app.RUN_STATE["current"]["runner"] = rname
-    for step_runner, step_model in app.fallback_chain(cfg):
-        note = f"🔀 {rname} {reason} — failing over to {step_runner}"
-        app.log(
-            f"run failover ({kind}): {rname} -> {step_runner} ({step_model or 'runner default'})"
-        )
-        app.audit(
-            "run_fallback",
-            kind=kind,
-            from_runner=rname,
-            to_runner=step_runner,
-            to_model=step_model,
-            err=(err or "")[:200],
-        )
+
+
+def _reset_attempt_live(app, live):
+    # Each attempt owns its own delivery state: a streamed run that dies
+    # must not make a fallback answer look already-delivered.
+    live["streamed"] = False
+    live["missing_segments"] = []
+    live.pop("journal", None)
+    live.pop("notices", None)
+
+
+def _step_label(app, step):
+    runner_name, model = step
+    return f"{runner_name}/{model}" if model else runner_name
+
+
+def run_with_fallbacks(app, cfg, session_id, prompt, live=None, result_meta=None):
+    """Fail over an unusable runner/model only before observed tool execution.
+
+    The attempt order is run_plan(cfg): the primary's own model candidates
+    first (an auto selector or a model list already rotates same-runner
+    models), then runner_fallbacks. Same-runner steps resume the chat's
+    session — model switching mid-session is runner-native — while
+    cross-runner steps start fresh because session IDs are not portable.
+    Tag quota/dead binary/network/empty-answer failures and try the next
+    step when no tool action was observed; cancel and uncertain executed
+    actions stop the chain. The delivered answer carries a one-line 🔀
+    header naming the runner/model that actually answered.
+    """
+    primary_runner = cfg.get("runner", "opencode")
+    steps = app.run_plan(cfg)
+    session_ids = {}
+    if session_id:
+        session_ids[primary_runner] = session_id
+    # Replay guard baseline: tool lines already in the trail belong to an
+    # earlier invocation (e.g. the worker's stale-session retry), which is
+    # allowed to replay deliberately.
+    trail_baseline = _trail_tool_count(app, live) if live is not None else 0
+    tried = []
+    last_err = None
+    first_reason = None
+    for index, (step_runner, step_model) in enumerate(steps):
+        step = (step_runner, step_model)
         if live is not None:
-            live["trail"].append(note)
-            app.edit_status(cfg, live)
-        with app.RUN_LOCK:
-            if app.RUN_STATE.get("current"):
-                app.RUN_STATE["current"]["runner"] = step_runner
-                app.RUN_STATE["current"]["mode"] = app.resolve_runner_mode(cfg, step_runner)
+            _reset_attempt_live(app, live)
         step_cfg = dict(cfg, runner=step_runner, model=step_model)
-        if live is not None:
-            live["streamed"] = False
-            live["missing_segments"] = []
-            live.pop("journal", None)
-            live.pop("notices", None)
-        try:
-            fallback_timeout = int(cfg.get("fallback_run_timeout_s", 0))
-        except (TypeError, ValueError):
-            fallback_timeout = 0
-        if fallback_timeout > 0:
-            step_cfg["run_timeout_s"] = min(app.run_timeout(cfg), fallback_timeout)
-        new_sid, answer, err = app.run_one(step_cfg, None, prompt, live)
-        rname = step_runner
-        tried.append((step_runner, step_model))
-        if err == app.CANCEL_MSG or (err and live and live.get("journal") and live["journal"].actions):
+        if index:
+            kind = app.classify_run_error(last_err, cfg.get("quota_markers"))
+            reason = "hit a limit" if kind == "quota" else "is unusable"
+            prev = _step_label(app, tried[-1])
+            app.log(f"run failover ({kind}): {prev} -> {_step_label(app, step)}")
+            app.audit(
+                "run_fallback",
+                kind=kind,
+                from_runner=tried[-1][0],
+                from_model=tried[-1][1],
+                to_runner=step_runner,
+                to_model=step_model,
+                err=(last_err or "")[:200],
+            )
+            if live is not None:
+                live["trail"].append(f"🔀 {prev} {reason} — failing over to {_step_label(app, step)}")
+                app.edit_status(cfg, live)
+            with app.RUN_LOCK:
+                if app.RUN_STATE.get("current"):
+                    app.RUN_STATE["current"]["runner"] = step_runner
+                    app.RUN_STATE["current"]["mode"] = app.resolve_runner_mode(cfg, step_runner)
+            try:
+                fallback_timeout = int(cfg.get("fallback_run_timeout_s", 0))
+            except (TypeError, ValueError):
+                fallback_timeout = 0
+            if fallback_timeout > 0:
+                step_cfg["run_timeout_s"] = min(app.run_timeout(cfg), fallback_timeout)
+        new_sid, answer, err = app.run_one(
+            step_cfg, session_ids.get(step_runner), prompt, live
+        )
+        if new_sid:
+            session_ids[step_runner] = new_sid
+        tried.append(step)
+        last_err = err
+        # A tool already ran: retrying the original prompt in a fresh
+        # runner could repeat external side effects we do not know.
+        uncertain = bool(
+            live
+            and (
+                (live.get("journal") and live["journal"].actions)
+                or _trail_tool_count(app, live) > trail_baseline
+            )
+        )
+        if err == app.CANCEL_MSG or uncertain:
             return new_sid, answer, err
         if answer is not None:
             if result_meta is not None:
                 result_meta.update(runner=step_runner, model=step_model)
-            header = f"🔀 {tried[0][0]} {reason} — answered via {step_runner}"
-            if step_model:
-                header += f" ({step_model})"
+            if not index:
+                return new_sid, answer, err
+            header = (
+                f"🔀 {_step_label(app, tried[0])} {first_reason} — "
+                f"answered via {_step_label(app, step)}"
+            )
             return new_sid, header + "\n\n" + answer, err
-    chain = " -> ".join(r for r, _ in tried)
-    return session_id, None, f"all runners exhausted ({chain}): {err}"
+        if first_reason is None:
+            kind = app.classify_run_error(err, cfg.get("quota_markers"))
+            first_reason = "hit a limit" if kind == "quota" else "is unusable"
+    chain = " -> ".join(_step_label(app, step) for step in tried)
+    return session_id, None, f"all runners exhausted ({chain}): {last_err}"
 
 
 def runner_mode(app, cfg):

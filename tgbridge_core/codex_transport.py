@@ -290,8 +290,11 @@ def run_codex_app_server(app, cfg, session_id, prompt, live=None):
                 "danger-full-access" if cfg.get("codex_yolo", False) else "read-only"
             ),
         }
-        if app.resolve_model(cfg, "codex"):
-            access["model"] = app.resolve_model(cfg, "codex")
+        codex_model = app.resolve_model(
+            cfg, "codex", explicit=cfg.get("model") or None
+        )
+        if codex_model:
+            access["model"] = codex_model
         setup_id = 2
         if session_id:
             params = {**access, "threadId": session_id}

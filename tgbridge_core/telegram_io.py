@@ -18,7 +18,7 @@ def api(app, token, method, _error=None, **params):
     )
     for attempt in (1, 2):
         try:
-            with urllib.request.urlopen(req, timeout=70) as r:
+            with urllib.request.urlopen(req, timeout=10 if method == "getMe" else 70) as r:
                 return json.load(r)
         except app.BridgeStop:
             raise

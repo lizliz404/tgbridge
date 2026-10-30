@@ -483,7 +483,7 @@ def handle_update(app, cfg, state, upd, *, state_path=_DEFAULT_STATE_PATH):
             )
             mode_label += f", {policy}"
         model_label = app.resolve_model(status_cfg, runner_name) or "runner default"
-        chain = app.fallback_chain(status_cfg)
+        chain = app.run_plan(status_cfg)[1:]
         chain_label = (
             "none"
             if not chain
@@ -513,7 +513,7 @@ def handle_update(app, cfg, state, upd, *, state_path=_DEFAULT_STATE_PATH):
             + ("" if p["available"] else f" — {p['detail']}")
             for name, p in probe.items()
         ]
-        chain = app.fallback_chain(eff)
+        chain = app.run_plan(eff)[1:]
         lines.append(
             "fallbacks: "
             + (

@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly drift check for tgbridge (read-only default; no auto restart)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/liz/dev/tgbridge/systemd/hourly-check.sh check
+TimeoutStartSec=180
+UMask=0077

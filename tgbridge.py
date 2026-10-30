@@ -71,7 +71,9 @@ from tgbridge_core.runners import (
     fallback_chain,
     pi_binary,
     probe_runners,
+    resolve_auto_model,
     resolve_model,
+    run_plan,
     trail_line,
 )
 
@@ -392,7 +394,7 @@ def doctor_report():
         runner_check["error"] = str(e)[:200]
     report["runner"] = runner_check
     fallback_checks = []
-    for step_runner, step_model in fallback_chain(cfg):
+    for step_runner, step_model in run_plan(cfg)[1:]:
         step_mode = resolve_runner_mode(cfg, step_runner)
         check = {
             "runner": step_runner,
@@ -480,35 +482,21 @@ def run(cfg):
     while True:
         getme_attempt += 1
         systemd_notify("WATCHDOG=1")
-        me = api(cfg["bot_token"], "getMe")
+        getme_error = {}
+        me = api(cfg["bot_token"], "getMe", _error=getme_error)
+        if getme_error.get("code") == 401 or (me or {}).get("error_code") == 401:
+            sys.exit("getMe failed: bad token (401 Unauthorized)")
         if me and me.get("ok"):
             break
-        try:
-            probe = urllib.request.Request(
-                f"https://api.telegram.org/bot{cfg['bot_token']}/getMe",
-                data=b"",
-            )
-            with urllib.request.urlopen(probe, timeout=15) as r:
-                json.load(r)
-            if getme_attempt <= 5 or getme_attempt % 20 == 0:
-                log(f"getMe attempt {getme_attempt}: no ok payload, retrying")
-        except urllib.error.HTTPError as e:
-            if e.code == 401:
-                sys.exit("getMe failed: bad token (401 Unauthorized)")
-            if getme_attempt <= 5 or getme_attempt % 20 == 0:
-                log(f"getMe attempt {getme_attempt} transient http {e.code}, retrying")
-        except BridgeStop:
-            raise
-        except Exception as e:
-            if getme_attempt <= 5 or getme_attempt % 20 == 0:
-                log(f"getMe attempt {getme_attempt} transient {type(e).__name__}")
+        if getme_attempt <= 5 or getme_attempt % 20 == 0:
+            log(f"getMe attempt {getme_attempt}: no ok payload, retrying")
         me = None
         update_health(
             status="waiting_for_network",
             last_poll_error={"kind": "getme_retry", "attempt": getme_attempt},
         )
         time.sleep(getme_backoff)
-        getme_backoff = min(getme_backoff * 2, 300)
+        getme_backoff = min(getme_backoff * 2, 15)
     state["bot_username"] = me["result"]["username"]
     save_json(STATE_PATH, state)
     menu = api(
@@ -578,9 +566,9 @@ def run(cfg):
     backoff = 3
     poll_failures = 0
     try:
-        failure_exit_threshold = max(0, int(cfg.get("poll_failure_exit_threshold", 20)))
+        failure_exit_threshold = max(0, int(cfg.get("poll_failure_exit_threshold", 0)))
     except (TypeError, ValueError):
-        failure_exit_threshold = 20
+        failure_exit_threshold = 0
     systemd_notify("READY=1\nSTATUS=Telegram bridge polling")
     while True:
         # Feed only from this control loop, never an independent timer which
