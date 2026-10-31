@@ -61,13 +61,16 @@ from tgbridge_core.questions import Questions
 from tgbridge_core.progress import Journal, activity_body, short_preview, cli_event, codex_event, opencode_snapshot, pi_event, redact
 from tgbridge_core.runners import (
     AUTO_OPENCODE_GO_MODEL,
+    DEVIN_DEFAULT_MODEL,
     RUNNERS,
     SERVER_RUNNERS,
     RunnerError,
     _bin,
     apply_runner_policy,
     classify_run_error,
+    discover_devin_models,
     discover_opencode_go_models,
+    discover_pi_model_catalog,
     fallback_chain,
     pi_binary,
     probe_runners,
@@ -311,7 +314,7 @@ def startup_smoke():
         raise RuntimeError("render smoke failed")
     if split_chunks("a" * 25, limit=10) != ["a" * 10, "a" * 10, "a" * 5]:
         raise RuntimeError("chunk smoke failed")
-    if runner_mode({}) != "cli" or set(RUNNERS) != {"opencode", "codex", "pi"}:
+    if runner_mode({}) != "cli" or set(RUNNERS) != {"opencode", "codex", "pi", "devin"}:
         raise RuntimeError("runner registry smoke failed")
 
 

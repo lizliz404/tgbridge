@@ -1,5 +1,6 @@
 """Runner capability registries and portable CLI adapters."""
 
+import json
 import os
 import re
 import shutil
@@ -12,8 +13,10 @@ OPENCODE = os.environ.get(
 )
 PI = os.environ.get("PI_BIN", os.path.expanduser("~/.local/share/mise/shims/pi"))
 CODEX_YOLO_FLAG = "--dangerously-bypass-approvals-and-sandbox"
+DEVIN_PERMISSION_FLAG = "--permission-mode"
 AUTO_OPENCODE_GO_MODEL = "auto:opencode-go"
 AUTO_PI_PREFIX = "auto:pi"
+DEVIN_DEFAULT_MODEL = "swe-2"
 _MODEL_DISCOVERY_CACHE = {}
 _MODEL_DISCOVERY_LOCK = threading.Lock()
 
@@ -57,10 +60,9 @@ def pi_binary():
 RUNNERS = {}
 SERVER_RUNNERS = {}
 
-# Supported runner catalog, in probe/display order. A new agent CLI joins
-# this list only together with a verified adapter above — never as a bare
-# name. Probing never executes anything; it only proves the binary exists.
-RUNNER_CATALOG = ("opencode", "codex", "pi")
+# Supported runner catalog, in user priority order. Probing never executes
+# anything; it only proves the binary and adapter are available.
+RUNNER_CATALOG = ("pi", "devin", "codex", "opencode")
 
 
 def probe_runners():
@@ -207,6 +209,24 @@ def _pi(session_id, prompt, model=None):
     return cmd, parse
 
 
+@runner("devin")
+def _devin(session_id, prompt, model=None):
+    """Devin CLI non-interactive mode; ATIF export supplies the native session id."""
+    cmd = [_bin("DEVIN_BIN", "devin")]
+    if session_id:
+        cmd += ["--resume", session_id]
+    cmd += [
+        "--model", model or DEVIN_DEFAULT_MODEL,
+        "--respect-workspace-trust", "false",
+        "--print", "--", prompt,
+    ]
+
+    def parse(_event, _acc):
+        return None  # Devin --print writes plain response text, not JSONL events.
+
+    return cmd, parse
+
+
 @runner("codex")
 def _codex(session_id, prompt, model=None):
     """codex exec --json (resume via `codex exec resume <id>`). Best-effort."""
@@ -236,9 +256,14 @@ def _codex(session_id, prompt, model=None):
 
 
 def apply_runner_policy(runner_name, cmd, cfg):
-    """Apply explicit bridge-owned runner policy after command construction."""
-    if runner_name == "codex" and cfg.get("codex_yolo", False):
-        return cmd[:2] + [CODEX_YOLO_FLAG] + cmd[2:]
+    """Apply bridge-owned permission policy after native command construction."""
+    if runner_name == "codex" and cfg.get("codex_yolo", True):
+        if CODEX_YOLO_FLAG not in cmd:
+            return cmd[:2] + [CODEX_YOLO_FLAG] + cmd[2:]
+    if runner_name == "devin" and DEVIN_PERMISSION_FLAG not in cmd:
+        permission = cfg.get("devin_permission_mode", "dangerous")
+        if permission:
+            return cmd[:1] + [DEVIN_PERMISSION_FLAG, str(permission)] + cmd[1:]
     return cmd
 
 
@@ -429,15 +454,55 @@ def select_pi_models(rows):
         depth += 1
 
 
+def discover_pi_model_catalog(cfg=None, refresh=False):
+    """Return Pi's current provider/model rows as printed by `--list-models`."""
+    cfg = cfg or {}
+    try:
+        cache_s = max(0, int(cfg.get("model_discovery_cache_s", 300)))
+        timeout_s = max(1, int(cfg.get("model_discovery_timeout_s", 15)))
+    except (TypeError, ValueError):
+        cache_s, timeout_s = 300, 15
+    key = ("pi-catalog", "")
+    now = time.monotonic()
+    with _MODEL_DISCOVERY_LOCK:
+        cached = _MODEL_DISCOVERY_CACHE.get(key)
+        if not refresh and cached and now - cached[0] < cache_s:
+            return list(cached[1])
+    try:
+        result = subprocess.run(
+            [pi_binary(), "--list-models"],
+            text=True,
+            capture_output=True,
+            timeout=timeout_s,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RunnerError(f"Pi model discovery failed: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown error").strip()[-300:]
+        raise RunnerError(f"Pi model discovery failed: {detail}")
+    rows = []
+    for line in result.stdout.splitlines():
+        fields = re.sub(r"\x1b\[[0-9;]*m", "", line).split()
+        if len(fields) >= 4 and fields[0] != "provider":
+            rows.append((fields[0], fields[1]))
+    if not rows:
+        raise RunnerError("Pi reported no models")
+    with _MODEL_DISCOVERY_LOCK:
+        _MODEL_DISCOVERY_CACHE[key] = (now, tuple(rows))
+    return rows
+
+
 def discover_pi_models(cfg=None, search=None):
     """Ask the installed Pi CLI for its model catalog, with a short TTL.
 
     ``search`` is passed to ``pi --list-models <search>`` (Pi's own fuzzy
     match), so ``auto:pi:hanzilla`` scopes the failover set without config
-    churn when the catalog changes. Offline mode keeps discovery free of
-    network stalls; the local catalog is what Pi would use anyway.
+    churn when the catalog changes. Discovery reads the live catalog so a
+    provider reload never requires a bridge restart.
     """
     cfg = cfg or {}
+    if not search:
+        return select_pi_models(discover_pi_model_catalog(cfg))
     try:
         cache_s = max(0, int(cfg.get("model_discovery_cache_s", 300)))
         timeout_s = max(1, int(cfg.get("model_discovery_timeout_s", 15)))
@@ -449,7 +514,7 @@ def discover_pi_models(cfg=None, search=None):
         cached = _MODEL_DISCOVERY_CACHE.get(key)
         if cached and now - cached[0] < cache_s:
             return list(cached[1])
-    cmd = [pi_binary(), "--offline", "--list-models"]
+    cmd = [pi_binary(), "--list-models"]
     if search:
         cmd.append(search)
     try:
@@ -476,6 +541,44 @@ def discover_pi_models(cfg=None, search=None):
     with _MODEL_DISCOVERY_LOCK:
         _MODEL_DISCOVERY_CACHE[key] = (now, tuple(selected))
     return selected
+
+
+def discover_devin_models(cfg=None, refresh=False):
+    """Return Devin CLI's live family/variant catalog in machine-readable form."""
+    cfg = cfg or {}
+    try:
+        cache_s = max(0, int(cfg.get("model_discovery_cache_s", 300)))
+        timeout_s = max(1, int(cfg.get("model_discovery_timeout_s", 15)))
+    except (TypeError, ValueError):
+        cache_s, timeout_s = 300, 15
+    key = ("devin", "models")
+    now = time.monotonic()
+    with _MODEL_DISCOVERY_LOCK:
+        cached = _MODEL_DISCOVERY_CACHE.get(key)
+        if not refresh and cached and now - cached[0] < cache_s:
+            return cached[1]
+    try:
+        result = subprocess.run(
+            [_bin("DEVIN_BIN", "devin"), "models", "list", "--format", "json"],
+            text=True,
+            capture_output=True,
+            timeout=timeout_s,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RunnerError(f"Devin model discovery failed: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown error").strip()[-300:]
+        raise RunnerError(f"Devin model discovery failed: {detail}")
+    try:
+        catalog = json.loads(result.stdout)
+    except ValueError as exc:
+        raise RunnerError("Devin returned invalid model-list JSON") from exc
+    families = catalog.get("families") if isinstance(catalog, dict) else None
+    if not isinstance(families, list) or not families:
+        raise RunnerError("Devin reported no model families")
+    with _MODEL_DISCOVERY_LOCK:
+        _MODEL_DISCOVERY_CACHE[key] = (now, catalog)
+    return catalog
 
 
 def _model_spec(cfg, runner_name, explicit=None):

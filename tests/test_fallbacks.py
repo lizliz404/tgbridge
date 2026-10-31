@@ -185,7 +185,7 @@ class ModelResolutionTest(unittest.TestCase):
             )
         self.assertEqual(
             run.call_args.args[0],
-            ["/x/pi", "--offline", "--list-models"],
+            ["/x/pi", "--list-models"],
         )
 
     def test_pi_selector_with_search_expands_in_chain(self):

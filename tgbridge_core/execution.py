@@ -11,6 +11,7 @@ import socket
 import subprocess
 import threading
 import time
+import uuid
 
 def signal_run_process(app, proc, sig):
     """Signal only the runner process group created by run_agent()."""
@@ -146,6 +147,7 @@ def run_agent(app, cfg, session_id, prompt, live=None):
             None,
             (f"unknown runner {rname!r} (available: {', '.join(sorted(app.RUNNERS))})"),
         )
+    devin_export_path = None
     try:
         cmd, parse = runner_fn(session_id, prompt, cfg.get("model"))
         name = cfg.get("session_name")
@@ -156,6 +158,13 @@ def run_agent(app, cfg, session_id, prompt, live=None):
                 cmd[cmd.index("--title") + 1] = name
             else:
                 cmd[1:1] = ["--title", name]
+        if rname == "devin":
+            devin_export_path = os.path.join(
+                app.CONFIG_DIR, f".devin-export-{uuid.uuid4().hex}.json"
+            )
+            cmd[cmd.index("--print"):cmd.index("--print")] = [
+                "--export", devin_export_path
+            ]
         cmd = app.apply_runner_policy(rname, cmd, cfg)
     except app.RunnerError as e:
         return session_id, None, str(e)
@@ -201,18 +210,29 @@ def run_agent(app, cfg, session_id, prompt, live=None):
         "thinking": None,
         "cost": 0.0,
         "tokens": None,
+        "devin_output": [],
     }
+    if rname == "devin" and live is not None:
+        # Devin --print has no structured tool events. Once launched, its side
+        # effects are unknown, so never replay the prompt through a fallback.
+        live["uncertain_runner_started"] = True
     sid = session_id
     try:
         for line in proc.stdout:
             line = line.strip()
             if not line:
                 continue
+            app.mark_run_progress()
+            if rname == "devin":
+                acc["devin_output"].append(line)
+                if live is not None:
+                    live["preview"] = " ".join(acc["devin_output"])[-500:]
+                    app.edit_status(cfg, live)
+                continue
             try:
                 ev = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            app.mark_run_progress()
             trail = parse(ev, acc)
             app.publish_progress(cfg, live, app.cli_event(rname, ev))
             sid = acc["sid"]
@@ -227,11 +247,32 @@ def run_agent(app, cfg, session_id, prompt, live=None):
                     live["preview"] = acc["texts"][-1]
                     app.edit_status(cfg, live)
         proc.wait()
+        if rname == "devin":
+            answer = "\n".join(acc.pop("devin_output")).strip()
+            if answer:
+                acc["texts"] = [answer]
+            if devin_export_path:
+                try:
+                    with open(devin_export_path, encoding="utf-8") as exported:
+                        acc["sid"] = json.load(exported).get("session_id") or session_id
+                except (OSError, ValueError, AttributeError):
+                    acc["sid"] = session_id
+            sid = acc["sid"]
+            if answer:
+                app.publish_progress(
+                    cfg, live,
+                    {"kind": "text", "id": f"devin:{sid or uuid.uuid4().hex}", "text": answer},
+                )
         journal = (live or {}).get("journal")
         if journal and journal.texts:
             acc["texts"] = list(journal.texts)
     finally:
         stop_timeout.set()
+        if devin_export_path:
+            try:
+                os.remove(devin_export_path)
+            except FileNotFoundError:
+                pass
         with app.RUN_LOCK:
             if app.RUN_STATE.get("cli_run_id") == cli_run_id:
                 app.RUN_STATE["proc"] = None
@@ -285,6 +326,9 @@ def effective_run_config(app, cfg, state):
     out = dict(cfg, runner=rname)
     if override.get("model") is not None:
         out["model"] = override["model"]
+    for key in ("devin_permission_mode", "codex_yolo"):
+        if key in override:
+            out[key] = override[key]
     return out
 
 
@@ -452,10 +496,11 @@ def run_with_fallbacks(app, cfg, session_id, prompt, live=None, result_meta=None
             live
             and (
                 (live.get("journal") and live["journal"].actions)
+                or live.get("uncertain_runner_started")
                 or _trail_tool_count(app, live) > trail_baseline
             )
         )
-        if err == app.CANCEL_MSG or uncertain:
+        if err == app.CANCEL_MSG or (err and uncertain):
             return new_sid, answer, err
         if answer is not None:
             if result_meta is not None:

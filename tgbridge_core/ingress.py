@@ -505,6 +505,37 @@ def handle_update(app, cfg, state, upd, *, state_path=_DEFAULT_STATE_PATH):
             f"(failures: {failures}){cur}",
         )
         return
+    if cmd == "/models":
+        if rest.lower() not in ("", "refresh"):
+            app.send(cfg["bot_token"], chat_id, "usage: /models [refresh]")
+            return
+        refresh = rest.lower() == "refresh"
+        lines = []
+        try:
+            pi_rows = app.discover_pi_model_catalog(cfg, refresh=refresh)
+            lines.append(f"Pi · {len(pi_rows)} models")
+            lines.extend(f"  {provider}/{model}" for provider, model in pi_rows)
+        except app.RunnerError as error:
+            lines.append(f"Pi · unavailable: {error}")
+        try:
+            catalog = app.discover_devin_models(cfg, refresh=refresh)
+            variants = [
+                (family.get("family_label") or family.get("slug") or "Model family", variant)
+                for family in catalog["families"]
+                for variant in family.get("variants", [])
+            ]
+            lines.extend(("", f"Devin · {len(variants)} models ({len(catalog['families'])} families)"))
+            lines.extend(
+                f"  {label} · {variant.get('model_uid')}"
+                for label, variant in variants
+            )
+        except app.RunnerError as error:
+            lines.extend(("", f"Devin · unavailable: {error}"))
+        lines.extend(("", "Switch for this chat: /runner <runner> <model> [permissions]"))
+        response = "Available models:\n" + "\n".join(lines)
+        for part in app.split_chunks(response, cfg.get("chunk") or app.CHUNK):
+            app.send(cfg["bot_token"], chat_id, part)
+        return
     if cmd == "/runners":
         probe = app.probe_runners()
         eff = app.effective_run_config(cfg, state)
@@ -543,7 +574,9 @@ def handle_update(app, cfg, state, upd, *, state_path=_DEFAULT_STATE_PATH):
                 chat_id,
                 f"primary: {eff.get('runner', 'opencode')} "
                 f"({app.resolve_model(eff, eff.get('runner', 'opencode')) or 'runner default'})\n"
-                "usage: /runner <name> [model] · /runner default",
+                "usage: /runner <name> [model] [permissions] · /runner default\n"
+                "permissions: Devin auto | accept-edits | smart | dangerous | yolo | bypass; "
+                "Codex default | yolo | bypass. Model may be omitted before the permission.",
             )
             return
         if args[0] == "default":
@@ -561,7 +594,21 @@ def handle_update(app, cfg, state, upd, *, state_path=_DEFAULT_STATE_PATH):
                 f"primary back to file config: {cfg.get('runner', 'opencode')}",
             )
             return
-        name, model = args[0], (args[1] if len(args) > 1 else "")
+        name = args[0]
+        permission_values = {
+            "devin": {"auto", "accept-edits", "smart", "dangerous", "yolo", "bypass"},
+            "codex": {"default", "yolo", "bypass"},
+        }
+        model = args[1] if len(args) > 1 else ""
+        permission = args[2].lower() if len(args) > 2 else None
+        if name in permission_values and model.lower() in permission_values[name]:
+            permission, model = model.lower(), ""
+        if len(args) > 3:
+            app.send(
+                cfg["bot_token"], chat_id,
+                "usage: /runner <name> [model] [permissions] · /runner default",
+            )
+            return
         if name not in app.RUNNERS:
             app.send(
                 cfg["bot_token"],
@@ -569,19 +616,37 @@ def handle_update(app, cfg, state, upd, *, state_path=_DEFAULT_STATE_PATH):
                 f"unknown runner {name!r} (available: {', '.join(sorted(app.RUNNERS))})",
             )
             return
+        permission_error = permission is not None and permission not in permission_values.get(name, set())
+        if permission_error:
+            app.send(
+                cfg["bot_token"], chat_id,
+                "invalid permissions; choose from Devin: auto | accept-edits | smart | dangerous | yolo | bypass; "
+                "Codex: default | yolo | bypass",
+            )
+            return
         with app.STATE_LOCK:
             selection = {'runner': name, 'model': model}
+            if name == 'devin' and permission is not None:
+                selection['devin_permission_mode'] = (
+                    'dangerous' if permission in ('yolo', 'bypass') else permission
+                )
+            elif name == 'codex' and permission is not None:
+                selection['codex_yolo'] = permission in ('yolo', 'bypass')
             if hasattr(app, 'chat_id'):
                 state.setdefault('chat_runner_overrides', {})[str(chat_id)] = selection
             else:
                 state['runner_override'] = selection
             if state_path is not None:
                 app.save_json(state_path, state)
-        app.audit("runner_override_set", chat_id=chat_id, runner=name, model=model)
+        app.audit(
+            "runner_override_set", chat_id=chat_id, runner=name, model=model,
+            permission=permission,
+        )
         app.send(
             cfg["bot_token"],
             chat_id,
-            f"primary now {name} ({model or 'runner default'}) — applies to the next run",
+            f"primary now {name} ({model or 'runner default'}"
+            f"{', ' + permission if permission else ''}) — applies to the next run",
         )
         return
     if cmd == "/at":

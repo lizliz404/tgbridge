@@ -113,8 +113,10 @@ def run_selftest(app):
     yolo_cmd = apply_runner_policy("codex", codex_cmd, {"codex_yolo": True})
     if CODEX_YOLO_FLAG not in yolo_cmd or yolo_cmd.index(CODEX_YOLO_FLAG) != 2:
         fails.append("codex yolo flag")
-    if apply_runner_policy("codex", codex_cmd, {}) != codex_cmd:
-        fails.append("codex yolo default off")
+    if CODEX_YOLO_FLAG not in apply_runner_policy("codex", codex_cmd, {}):
+        fails.append("codex yolo default on")
+    if apply_runner_policy("codex", codex_cmd, {"codex_yolo": False}) != codex_cmd:
+        fails.append("codex yolo opt-out")
     if apply_runner_policy("pi", ["pi", "--mode", "json"], {"codex_yolo": True}) != [
         "pi",
         "--mode",

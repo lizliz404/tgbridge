@@ -1,6 +1,6 @@
 # tgbridge
 
-A minimal Telegram bridge for a local OpenCode, Codex, or Pi agent.
+A minimal Telegram bridge for local Pi, Devin CLI, Codex, and OpenCode agents.
 
 A small **zero-dependency** Python package (stdlib only) with `tgbridge.py` kept
 as the stable CLI entry point and runtime composition root. Telegram I/O,
@@ -15,13 +15,13 @@ API long-poll in, local CLI agent out.
 - **DM + group chats** — groups are mention-triggered (@bot or reply-to-bot), DMs always answer
 - **Parallel chats and sessions** — one Telegram poller routes each allowlisted chat to an independent execution lane. Only turns in the same chat and session serialize or use native live steering. `/new` immediately opens a new lane while old work finishes independently; old bursts, native session IDs, questions and files remain owned by the old lane. `/status` and `/cancel` target the current lane; `/runner` selects the runner/model for this chat. Use the exact outbox folder in each task prompt: initial lanes use `<outbox_dir>/<chat_id>/`, new lanes add a private execution-ID subfolder. Unattributed legacy root files are not auto-delivered
 - **Per-chat sessions** — each chat maps to one native runner session (`/new` forgets the mapping, `/status` inspects it). Pi CLI/RPC sessions receive a native display name `Telegram · hostname · @bot · chat ID` on creation/resume; new OpenCode CLI sessions receive the same title. Storage locations and native IDs remain unchanged
-- **Agent failover + switching** — a failed CLI or server-mode run (quota, dead binary, broken network, timeout, empty answer, upstream 5xx) automatically walks the run plan only before any observed tool action; a partially executed task stays interrupted rather than replaying unknown side effects. The plan is the primary's own model candidates followed by `runner_fallbacks`, so the same runner may rotate models/providers — a dead model or upstream does not cost the run. Same-runner steps resume the chat's session (model switching mid-session is runner-native); cross-runner steps start fresh because session IDs are not portable, and the answer carries a one-line 🔀 header naming the runner/model that replied. User cancel or uncertain tool execution stops the chain. `auto:opencode-go` discovers the current Go catalog and expands to the newest Muse Spark Contributor followed by the newest GLM; `auto:pi[:search]` expands `pi --list-models` (optionally fuzzy-filtered) interleaved one model per upstream group so a single dead provider cannot block the chain — catalog changes never require config edits. `/runners` shows the resolved plan and on-device availability probe; `/runner <name> [model]` switches this chat's primary without restarting (`/runner default` restores file config)
+- **Agent failover + switching** — Pi is the default runner; Devin CLI with SWE-2 is the first fallback. Failed runs follow the configured runner/model plan before any observed action; once a runner may have made changes, the bridge does not replay the prompt through another runner. `/models` reads Pi and Devin's native catalogs; `/runner <name> [model] [permissions]` changes this chat's runner, model and permission mode. `yolo`/`bypass` maps to Devin `--permission-mode dangerous` or Codex `--dangerously-bypass-approvals-and-sandbox`; `/runner default` restores file config.
 - **Same-turn steering where supported** — Codex app-server uses `turn/steer`; OpenCode server mode uses `prompt_async`; Pi runs on its native RPC transport (`steer`, consumed after the current tool batch and before the next model request—not after the whole task). Live same-chat text bypasses idle burst debounce; injection is submitted before the Telegram acknowledgement, so a slow/rate-limited send cannot gate it. Inputs received during Pi/Codex startup wait for the live transport instead of being queued behind the whole run. Active tools are not cancelled
 - **Burst coalescing** — adjacent Telegram messages are held briefly and merged, so automatic 4096-character splits do not become many separate agent runs
 - **Reply / quote context** — current input, replied-to full text and selected quote remain separate; source IDs/sender and downloaded source attachments stay associated. Missing source text/files and bounded truncation are explicit; quoted text is data, not new instructions
 - **Durable inputs** — accepted addressed prompts persist before Telegram offset advances. Restart restores only unexecuted inputs; executing/steering tasks become interrupted with `/pending` + explicit `/resume <id>`. Recovery notices wait at least 10 minutes, are batched per chat and attempted only once per interruption across restarts; ambiguous delivery is retained locally, not repeatedly sent. Stored results are inspectable with `/result <id>`; uncertain sending never auto-replays tool execution. No guarantee yet for passive group burst tails, scheduled-to-queue transfer, or exact live segment receipts across crashes
 - **Inbound photos + documents** — downloaded privately and passed as local paths; an unaddressed group upload is retained for the next @mention/reply, so the file itself needs no tag
-- **Quiet tool progress** — Pi, Codex and OpenCode tools and To-Do events update the same status bubble, at most once every eight seconds. The tool type and a quoted preview of at most 128 characters are shown; full redacted commands, file changes and results are recorded locally in `audit.jsonl`. Native reasoning events show only `☁️ thinking`, without forwarding private reasoning
+- **Quiet tool progress** — Pi, Devin CLI, Codex and OpenCode tools and To-Do events update the same status bubble, at most once every eight seconds. The tool type and a quoted preview of at most 128 characters are shown; full redacted commands, file changes and results are recorded locally in `audit.jsonl`. Native reasoning events show only `☁️ thinking`, without forwarding private reasoning
 - **Native questions** — Pi RPC `select`, `confirm`, `input` and `editor` dialogs and Codex app-server `item/tool/requestUserInput` become Telegram question cards with buttons and text replies. Answers return to the original request and question IDs; duplicate clicks, foreign senders and expired cards cannot answer it. Nothing is preselected. Extensions using `ctx.ui.custom()` need adaptation to Pi's supported RPC dialogs. OpenCode questions are not connected yet
 - **Segmented public replies** — completed assistant messages are delivered individually, including public progress commentary. One shared delivery journal handles CLI, Pi RPC, Codex app-server and OpenCode server snapshots, deduplicates repeated events, and avoids resending the joined answer at the end
 - **Live status** — one edited message tracks elapsed time, the latest tool and a short answer preview; completed public replies remain in the chat
@@ -32,7 +32,7 @@ API long-poll in, local CLI agent out.
 - **Audit log** — every enqueue/run/send/schedule event appended to `~/.config/tgbridge/audit.jsonl`
 - **Never dies silently** — any fatal crash or SIGTERM announces `💀 …` to every allowed chat (best-effort, 3s each) before systemd restarts it; a dead worker thread is detected and respawned; a failed answer delivery retries once, then is audited and saved to `~/.config/tgbridge/undelivered/` instead of vanishing; a missing runner binary warns at startup instead of crashing
 - **Ambient group context** — hears recent human conversation but only runs when explicitly @mentioned or replied to
-- **Flat slash-command menu** — `/status`, `/cancel`, `/new`, `/pending`, `/resume`, `/result`, `/at`, `/runners`, `/runner`, `/help` all appear directly in the command menu with minimal English descriptions. The menu and `/help` share one catalog; no basic/advanced nesting or persistent reply keyboard. Plain replies remove inherited keyboards; inline question cards remain available. `/new` starts fresh on the next message, not an abort; `/resume <id>` recovers interrupted inputs, not historical sessions; `/runner` changes only this chat's primary; file defaults remain shared. **Goal commands** (`/goal-list`, `/goal-status`, `/goal-focus`, `/goal-resume`, `/goal-pause`, `/goal-clear`, `/goal-direct`) are forwarded verbatim to the runner, which executes them deterministically without a model turn; the bridge relays the text they produce. The rest of the `goal`/`sisyphus` family is accepted the same way when typed. A forwarded command arrives as the message itself — no group context, sender rules, or outbox note wraps it, because the runner only dispatches a command when nothing else is attached. Other unrecognized slash commands (former bridge controls, unrelated extension commands, skill names) are still rejected before reaching the agent; use plain text for tasks and skills. Unix paths are not parsed as commands. Bridge-owned notices and question controls use concise English; agent answers and question content retain their own language
+- **Flat slash-command menu** — `/status`, `/cancel`, `/new`, `/pending`, `/resume`, `/result`, `/at`, `/runners`, `/models`, `/runner`, `/help` all appear directly in the command menu with minimal English descriptions. The menu and `/help` share one catalog; no basic/advanced nesting or persistent reply keyboard. Plain replies remove inherited keyboards; inline question cards remain available. `/new` starts fresh on the next message, not an abort; `/resume <id>` recovers interrupted inputs, not historical sessions; `/runner` changes only this chat's primary; file defaults remain shared. **Goal commands** (`/goal-list`, `/goal-status`, `/goal-focus`, `/goal-resume`, `/goal-pause`, `/goal-clear`, `/goal-direct`) are forwarded verbatim to the runner, which executes them deterministically without a model turn; the bridge relays the text they produce. The rest of the `goal`/`sisyphus` family is accepted the same way when typed. A forwarded command arrives as the message itself — no group context, sender rules, or outbox note wraps it, because the runner only dispatches a command when nothing else is attached. Other unrecognized slash commands (former bridge controls, unrelated extension commands, skill names) are still rejected before reaching the agent; use plain text for tasks and skills. Unix paths are not parsed as commands. Bridge-owned notices and question controls use concise English; agent answers and question content retain their own language
 - **Chat + sender policy** — double allowlist by default; optionally trust all members of specifically allowlisted groups while keeping DMs user-allowlisted
 - **Private runtime state** — config, session index, audit log, attachments, and undelivered replies are kept under `~/.config/tgbridge` with private permissions
 - **Regression + startup gates** — `python3 tgbridge.py --selftest` runs the exhaustive suite on demand/CI; every service start runs only a fast, side-effect-free smoke gate
@@ -52,7 +52,8 @@ API long-poll in, local CLI agent out.
 {
   "runner": "opencode",
   "runner_mode": "cli",
-  "codex_yolo": false,
+  "codex_yolo": true,
+  "devin_permission_mode": "dangerous",
   "bot_token": "123456:ABC-DEF...",
   "allowed_user_ids": [YOUR_TELEGRAM_USER_ID],
   "allowed_chats": [YOUR_TELEGRAM_USER_ID, -1000000000000],
@@ -180,8 +181,9 @@ To post to Telegram yourself: python3 /path/to/tgbridge/tgbridge.py --send <chat
 | `action_presentation` | Legacy key accepted but ignored; tools always use the single bounded status bubble |
 | `input_debounce_s` | Merge adjacent Telegram messages for this many seconds before dispatch (default `1.5`, clamped to `0.2`–`5.0`) |
 | `workdir` | Working directory for the agent |
-| `runner` | `opencode` (default), `codex`, or `pi` |
-| `codex_yolo` | Pass Codex `--dangerously-bypass-approvals-and-sandbox`; grants authorized Telegram users unsandboxed access as the local OS user (default `false`) |
+| `runner` | `pi` (default), with Devin CLI, Codex and OpenCode available as fallbacks |
+| `codex_yolo` | Pass Codex `--dangerously-bypass-approvals-and-sandbox` (default `true`) |
+| `devin_permission_mode` | Devin CLI `--permission-mode` (`auto`, `accept-edits`, `smart`, `dangerous`; default `dangerous`) |
 | `runner_mode` | `cli` (portable default) or `server`; the Codex, OpenCode, and Pi server adapters implement same-turn steering |
 | `runner_modes` | Optional per-runner transport overrides, e.g. Pi `server` with Codex `cli`; prevents one runner's transport requirement from weakening the whole fallback chain |
 | `server_url` | Local runner server URL (default `http://127.0.0.1:4096`; `OPENCODE_SERVER` remains supported) |
@@ -195,10 +197,10 @@ To post to Telegram yourself: python3 /path/to/tgbridge/tgbridge.py --send <chat
 | `poll_failure_exit_threshold` | Default `0`: keep retrying Telegram outages without killing active agent tasks; health remains unhealthy until polling recovers. A positive value opts into exit after that many consecutive failed polls. The systemd main-loop watchdog still recovers a genuinely stuck bridge. |
 | `model` | Optional `provider/model` override passed to CLI and server transports; empty = runner default |
 | `runner_models` | Per-runner default model (string or ordered list; a list rotates same-runner models on failure). Use `{"opencode": "auto:opencode-go"}` to dynamically select the newest `opencode-go` Muse Spark Contributor, or the newest GLM when no Contributor model is listed |
-| `runner_fallbacks` | Ordered failover chain; repeat a runner with different models/providers for model rotation, or pass a list/auto selector as `model`. `auto:opencode-go` expands to resolved Muse and GLM attempts; `auto:pi[:search]` expands `pi --list-models` interleaved one model per upstream group (a dead upstream costs one attempt). Walked on any run failure except user cancel — the bridge tags the failure (quota/unavailable/other) but never refuses to switch on cause |
+| `runner_fallbacks` | Ordered failover chain; defaults are Devin SWE-2, Codex, OpenCode Go and then Pi's discovered catalog. A list or `auto:*` selector can set models; per-runner session mappings are kept independent. Fallback proceeds only before unknown side effects; an interrupted run is not blindly replayed |
 | `max_fallback_steps` | Cap on failover attempts after the primary (default `12`; `0` = unlimited) — bounds a large `auto:*` expansion while still covering every upstream |
 | `model_discovery_cache_s` | Seconds to cache resolved model catalogs (default `300`); expiry picks up newly added model versions without a restart |
-| `model_discovery_timeout_s` | Timeout for `opencode models` / `pi --list-models` discovery (default `15`) |
+| `model_discovery_timeout_s` | Timeout for native runner model-list discovery (default `15`) |
 | `fallback_run_timeout_s` | Optional shorter idle timeout for fallback attempts; prevents one dead model from blocking the rest of a long chain while leaving the primary runner timeout unchanged |
 | `quota_markers` | Extra case-insensitive regexes feeding the failure tag only (audit + 🔀 note); switching does not depend on them |
 | `transcribe_base_url` | OpenAI-compatible base URL for transcription (default `https://api.openai.com/v1`) |
@@ -253,7 +255,7 @@ Stable, independently testable boundaries live under `tgbridge_core/`:
 - `progress.py` — native event normalization and the shared durable action/text delivery journal
 - `health.py` — redacted proxy inspection and network failure classification
 - `storage.py` — private directories and atomic JSON persistence
-- `runners.py` — capability registries and native Codex/OpenCode/Pi CLI adapters
+- `runners.py` — capability registries and native Codex/OpenCode/Pi/Devin CLI adapters
 - `selftest.py` — the exhaustive legacy regression gate, kept out of startup
 
 Focused tests live in `tests/` and run with:
@@ -269,21 +271,24 @@ Codex, OpenCode, or Pi the global internal format.
 
 ## Runners
 
-The bridge drives any of three agent CLIs (config key `runner`):
+The bridge drives Pi, Devin CLI, Codex and OpenCode (config key `runner`):
 
 | runner | non-interactive | resume | notes |
 |---|---|---|---|
-| `opencode` | `opencode run --format json` | `--session` | default; live tool names + cost |
-| `codex` | `codex exec --json` or app-server | native thread resume | use `runner_mode: "server"` for true same-turn steering; set `CODEX_BIN` if needed |
-| `pi` | `pi --mode json` (or `--mode rpc` in server mode) | `--session-id` | native JSON events, tool names, token and cost metadata; private thinking and raw tool arguments are never shown in status messages; `runner_modes: {"pi": "server"}` adds per-segment Telegram messages and live `steer`; set `PI_BIN` if needed |
+| `pi` | `pi --mode json` (or `--mode rpc` in server mode) | `--session-id` | default; `runner_modes: {"pi": "server"}` adds segmented replies and live steering |
+| `devin` | `devin [--resume ID] --model swe-2 --print` | ATIF session ID via `--resume` | first fallback; default permission mode is `dangerous` |
+| `codex` | `codex exec --json` or app-server | native thread resume | bypass approvals and sandbox by default; `CODEX_BIN` can select the binary |
+| `opencode` | `opencode run --format json` | `--session` | final fallback; set `OPENCODE_BIN` if needed |
 
 ### Codex permission mode
 
-Codex CLI policy is read-only in some non-interactive environments. The bridge
-does not silently override that default. Set `codex_yolo` to `true` only when
-the bot token, every allowed chat, and every human authorized in those chats are
-trusted to control the host machine. The bridge then adds
-`--dangerously-bypass-approvals-and-sandbox` to both new and resumed Codex runs.
+Codex CLI policy is read-only in some non-interactive environments. This bridge
+adds `--dangerously-bypass-approvals-and-sandbox` by default, and Devin CLI uses
+`--permission-mode dangerous` by default. Both modes are configurable per chat
+with `/runner codex [model] default|yolo` and `/runner devin [model] auto|accept-edits|smart|dangerous`. The model may be omitted when choosing a permission mode. `/runner devin yolo` is shorthand for `dangerous`.
+These modes grant the bot token, allowed chats and authorized senders control as
+the local OS user. The bridge adds
+`--dangerously-bypass-approvals-and-sandbox` to new and resumed Codex runs.
 
 This is actual host authority, not merely a more capable chat mode: prompts may
 read or modify files, run commands, use locally available credentials, start or
@@ -292,11 +297,11 @@ Discovering the bot ID alone still does not bypass the chat/sender gates, but an
 authorized member of a group configured with
 `allow_all_users_in_allowed_groups: true` receives this authority.
 
-All runners share the same bridge surface: per-chat sessions, live tool
+All runners share the bridge surface: per-chat sessions, live tool
 trail, reactions, chunking. Sessions are titled with a time slug
 (`tg 20260903-0958`) on first message.
 
-The default `runner_mode: "cli"` works with all three runners and on both
+The default `runner_mode: "cli"` works with all four runners and on both
 systemd and launchd installs. True same-turn steering needs a runner transport
 that can accept prompts while busy. For Codex, set `runner_mode` to `server`;
 tgbridge starts the local Codex app-server transport and sends `turn/steer` with

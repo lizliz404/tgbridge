@@ -1,5 +1,5 @@
 {
-  "runner": "opencode",
+  "runner": "pi",
   "runner_mode": "cli",
   "runner_modes": {
     "codex": "server",
@@ -8,7 +8,8 @@
   },
   "server_url": "http://127.0.0.1:4096",
   "server_poll_s": 0.5,
-  "codex_yolo": false,
+  "codex_yolo": true,
+  "devin_permission_mode": "dangerous",
   "bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2P1sQ9tXyZ",
   "allowed_user_ids": [123456789],
   "sender_instructions": {
@@ -27,11 +28,13 @@
   "reactions": true,
   "model": "",
   "runner_models": {
-    "opencode": "auto:opencode-go"
+    "devin": "swe-2"
   },
   "runner_fallbacks": [
-    {"runner": "pi", "model": "auto:pi"},
-    {"runner": "opencode", "model": "auto:opencode-go"}
+    {"runner": "devin", "model": "swe-2"},
+    {"runner": "codex"},
+    {"runner": "opencode", "model": "auto:opencode-go"},
+    {"runner": "pi", "model": "auto:pi"}
   ],
   "max_fallback_steps": 12,
   "model_discovery_cache_s": 300,

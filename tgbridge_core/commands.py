@@ -15,7 +15,8 @@ COMMANDS = (
     ("result", "Task result", "/result <id>", "bridge"),
     ("at", "Schedule task", "/at 30m <prompt>", "bridge"),
     ("runners", "List agents", "/runners", "bridge"),
-    ("runner", "Switch agent", "/runner <name> [model] · /runner default", "bridge"),
+    ("models", "List current models", "/models [refresh]", "bridge"),
+    ("runner", "Switch agent", "/runner <name> [model] [permissions] · /runner default", "bridge"),
     ("help", "Help", "/help", "bridge"),
     # Goal lifecycle, executed by the runner. The whole goal/sisyphus family is
     # accepted, so an unlisted variant still works when typed.

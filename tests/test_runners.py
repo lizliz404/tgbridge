@@ -10,13 +10,22 @@ from tgbridge_core.runners import (
 
 class RunnerAdapterTests(unittest.TestCase):
     def test_all_cli_adapters_are_registered(self):
-        self.assertEqual(set(RUNNERS), {"opencode", "codex", "pi"})
+        self.assertEqual(set(RUNNERS), {"opencode", "codex", "pi", "devin"})
 
     def test_codex_permission_policy_is_explicit_and_isolated(self):
         command = ["codex", "exec", "--json", "prompt"]
         yolo = apply_runner_policy("codex", command, {"codex_yolo": True})
         self.assertEqual(yolo[2], CODEX_YOLO_FLAG)
-        self.assertEqual(apply_runner_policy("codex", command, {}), command)
+        self.assertEqual(apply_runner_policy("codex", command, {})[2], CODEX_YOLO_FLAG)
+        self.assertEqual(apply_runner_policy("codex", command, {"codex_yolo": False}), command)
+        devin = apply_runner_policy("devin", ["devin", "--print", "prompt"], {})
+        self.assertEqual(devin[1:3], ["--permission-mode", "dangerous"])
+        self.assertEqual(
+            apply_runner_policy(
+                "devin", ["devin", "--print", "prompt"], {"devin_permission_mode": "auto"}
+            )[1:3],
+            ["--permission-mode", "auto"],
+        )
         self.assertEqual(
             apply_runner_policy("pi", ["pi", "--mode", "json"], {"codex_yolo": True}),
             ["pi", "--mode", "json"],

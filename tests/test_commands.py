@@ -24,7 +24,7 @@ class CommandTests(unittest.TestCase):
         names = [row['command'] for row in menu]
         self.assertEqual(len(names), len(set(names)))
         bridge = {'status', 'cancel', 'new', 'pending',
-                  'resume', 'result', 'at', 'runners', 'runner', 'help'}
+                  'resume', 'result', 'at', 'runners', 'models', 'runner', 'help'}
         agent = {'goal-list', 'goal-status', 'goal-focus', 'goal-resume',
                  'goal-pause', 'goal-clear', 'goal-direct'}
         # Telegram rejects a command name containing a dash, and one invalid
