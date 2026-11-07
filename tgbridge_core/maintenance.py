@@ -36,6 +36,104 @@ def owned_children(status):
     return pids - {main}
 
 
+def hc_preflight(unit='tgbridge.service', proc_root='/proc'):
+    """Read-only Linux ownership/capability check, NOT deployment readiness.
+
+    Does not load bridge config/state, contact Telegram, start a runner, or
+    change services. Keep this separate from the networked --doctor path.
+    """
+    def command(argv):
+        return subprocess.run(argv, capture_output=True, text=True,
+                              timeout=5, check=True).stdout
+
+    report = {
+        'migration_ready': False,
+        'read_only': True,
+        'transport': 'native Pi RPC over subprocess stdin/stdout pipes (unchanged)',
+        'recommendation': ('Keep systemd supervising the bridge daemon and keep '
+                           'native pipe RPC for steer, questions and segmented replies. '
+                           'Use hc for separate interactive agents, not as a bridge agent.'),
+    }
+    try:
+        status = unit_status(unit)
+        pid = int(status.get('MainPID') or 0)
+        report['supervisor'] = {'kind': 'systemd-user', 'unit': unit,
+                                'main_pid': pid, 'active_state': status.get('ActiveState'),
+                                'control_group': status.get('ControlGroup')}
+        children = []
+        # Only inspect direct-child process metadata, never production files or
+        # environment. Do not expose argv (it may contain prompts or secrets).
+        if pid > 0:
+            tasks = Path(proc_root) / str(pid) / 'task'
+            child_pids = set()
+            for task in tasks.iterdir():
+                try:
+                    child_pids.update((task / 'children').read_text().split())
+                except FileNotFoundError:
+                    continue
+            for child in sorted(child_pids, key=int):
+                try:
+                    child_root = Path(proc_root) / child
+                    argv = (child_root / 'cmdline').read_bytes().decode().split('\0')
+                    parent = next((line.split(':', 1)[1].strip() for line in
+                                   (child_root / 'status').read_text().splitlines()
+                                   if line.startswith('PPid:')), '0')
+                except FileNotFoundError:  # snapshot child already exited
+                    continue
+                if int(parent) == pid and ('--mode=rpc' in argv or any(
+                        argv[i:i+2] == ['--mode', 'rpc'] for i in range(len(argv) - 1))):
+                    children.append({'pid': int(child), 'parent_pid': pid, 'mode': 'rpc'})
+        report['rpc_children'] = children
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        report['supervisor'] = {'kind': 'unknown', 'error': type(error).__name__}
+
+    hc = {'visibility': 'unknown', 'native_pipe_rpc': 'unknown', 'matches': []}
+    report['hc'] = hc
+    try:
+        schema = json.loads(command(['hc', 'schema']))
+        methods = {m['name']: m for m in schema['methods']}
+        run_params = {p['name'] for p in methods.get('terminal.run', {}).get('params', [])}
+        hc['checked_methods'] = [name for name in ('terminal.run', 'terminal.attach', 'machine.exec')
+                                 if name in methods]
+        # A new adopt/pipe API requires a fresh contract review, never an
+        # automatic "ready" verdict based on its name alone.
+        new_surface = any('adopt' in name or 'pipe' in name for name in methods) or bool(
+            run_params & {'stdio', 'pipe', 'pipes', 'adopt', 'pid'})
+        known_surface = {'terminal.run', 'terminal.attach', 'machine.exec'} <= methods.keys()
+        hc['native_pipe_rpc'] = 'needs_review' if new_surface else 'unsupported' if known_surface else 'unknown'
+        hc['reasons'] = [
+            'terminal.run/attach exposes a terminal, not separate protocol stdout and stderr pipes.',
+            'machine.exec accepts one input blob and buffers output until exit; default 60s, max 600s.',
+            'No verified native adoption or long-lived non-PTY bidirectional RPC interface.',
+        ]
+        listing = json.loads(command(['hc', 'ls', '--json']))
+        targets = {c['pid'] for c in report.get('rpc_children', [])}
+        if report.get('supervisor', {}).get('main_pid'):
+            targets.add(report['supervisor']['main_pid'])
+        if not targets or report.get('supervisor', {}).get('active_state') != 'active':
+            return report
+        for terminal in listing['terminals']:
+            address = terminal['address']
+            if '/' in address:  # remote PIDs are not local process identities
+                continue
+            # Addresses can change: resolve against a fresh list before use.
+            current = json.loads(command(['hc', 'ls', '--json']))
+            if not any(t['address'] == address for t in current['terminals']):
+                raise RuntimeError('hc terminal changed during snapshot')
+            facts = json.loads(command(['hc', 'get', '--json', address]))
+            foreground = facts.get('foreground') or {}
+            matched = targets & {facts.get('pid'), foreground.get('pid')}
+            if matched and facts.get('state') == 'live':
+                hc['matches'].append({'address': address, 'pids': sorted(matched),
+                                      'status': facts.get('status')})
+        hc['visibility'] = 'pid_match' if hc['matches'] else 'not_listed_by_pid'
+        hc['visibility_note'] = 'PID snapshot only; visibility/status does not prove native RPC control.'
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as error:
+        hc['visibility'] = 'unknown'
+        hc['error'] = type(error).__name__
+    return report
+
+
 def notify_requester(cfg, chat, text):
     request = urllib.request.Request(
         f"https://api.telegram.org/bot{cfg['bot_token']}/sendMessage",

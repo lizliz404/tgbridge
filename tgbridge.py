@@ -636,6 +636,10 @@ def run(cfg):
 
 def main():
     global HEALTH_OWNER_PID
+    if "--hc-preflight" in sys.argv:
+        from tgbridge_core.maintenance import hc_preflight
+        print(json.dumps(hc_preflight(), ensure_ascii=False, indent=2))
+        sys.exit(2)  # diagnostic only: no hc RPC migration is implemented
     if "--doctor" in sys.argv:
         sys.exit(cli_doctor())
     if "--selftest" in sys.argv:
