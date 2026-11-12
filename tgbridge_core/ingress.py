@@ -3,6 +3,7 @@
 The explicit app argument supplies the single runtime owner and services.
 No copied globals, entry-point import or hidden module-level runtime.
 """
+import os
 import re
 import signal
 import threading
@@ -494,6 +495,15 @@ def handle_update(app, cfg, state, upd, *, state_path=_DEFAULT_STATE_PATH):
             str(chat_id), state.get('runner_override') or {})
         if selected.get('runner'):
             override_note = f" (override, file says {cfg.get('runner', 'opencode')})"
+        governor = cfg.get("_limits")
+        parked = governor.get(str(chat_id)) if governor else None
+        parked_note = ""
+        if parked:
+            wait = max(0, int(parked.get("resume_at", 0) - time.time()))
+            parked_note = (
+                f"\nparked: retry in {wait}s "
+                f"(attempt {parked.get('attempt')}) — /limits to inspect"
+            )
         app.send(
             cfg["bot_token"],
             chat_id,
@@ -502,7 +512,7 @@ def handle_update(app, cfg, state, upd, *, state_path=_DEFAULT_STATE_PATH):
             f"session: {info}\ncwd: {cfg['workdir']}\n"
             f"incoming parts: {incoming_count}\nqueued batches: {app.PROMPT_Q.qsize()}\n"
             f"scheduled: {pending}\ntelegram poll: {poll_health} "
-            f"(failures: {failures}){cur}",
+            f"(failures: {failures}){cur}{parked_note}",
         )
         return
     if cmd == "/models":
@@ -677,6 +687,100 @@ def handle_update(app, cfg, state, upd, *, state_path=_DEFAULT_STATE_PATH):
             chat_id,
             f"⏰ scheduled in {delay}s — fires via this chat's session",
         )
+        return
+    if cmd == "/limits":
+        governor = cfg.get("_limits")
+        if rest.lower() in ("clear", "cancel", "drop"):
+            if governor and governor.pop(str(chat_id), "manual_clear"):
+                app.send(cfg["bot_token"], chat_id, "cleared this chat's parked retry.")
+            else:
+                app.send(cfg["bot_token"], chat_id, "no parked retry for this chat.")
+            return
+        parked = governor.snapshot() if governor else []
+        if not parked:
+            app.send(cfg["bot_token"], chat_id, "no parked turns — cooldown queue empty.")
+            return
+        lines = ["limit cooldown queue:"]
+        for e in parked:
+            who = "this chat" if e.get("chat_id") == chat_id else f"chat {e.get('chat_id')}"
+            wait = int(e.get("resume_at", 0) - time.time())
+            when = "due" if wait <= 0 else f"in {wait}s"
+            lines.append(
+                f"· {who} · attempt {e.get('attempt')} · {e.get('error_kind')} · retry {when}"
+                f" · {(e.get('error') or '')[:80]}"
+            )
+        for ev in governor.events_tail(8):
+            detail = ev.get("reason") or ev.get("key") or ""
+            lines.append(f"· {time.strftime('%H:%M', time.localtime(ev.get('t', 0)))} "
+                         f"{ev.get('event')} {detail}".rstrip())
+        app.send(cfg["bot_token"], chat_id, "\n".join(lines))
+        return
+    if cmd == "/files":
+        paths = app.deliverables(cfg["workdir"])
+        try:
+            pending = [f for f in sorted(os.listdir(app.outbox_dir(cfg)))
+                       if os.path.isfile(os.path.join(app.outbox_dir(cfg), f))]
+        except OSError:
+            pending = []
+        lines = [f"· {f} (outbox, queued)" for f in pending[:15]]
+        lines += [f"· {os.path.relpath(p, cfg['workdir'])}" for p in paths[:15]]
+        if not lines:
+            lines.append("(no deliverable files found)")
+        lines.append("")
+        lines.append("/send <name> pulls one · /send all sends them all")
+        app.send(cfg["bot_token"], chat_id, "📁 files:\n" + "\n".join(lines))
+        return
+    if cmd == "/send":
+        name = rest.strip()
+        if not name:
+            app.send(cfg["bot_token"], chat_id, "usage: /send <name|all> — see /files")
+            return
+        targets = (app.deliverables(cfg["workdir"])[:10] if name == "all"
+                   else [app.resolve_send_name(cfg["workdir"], name)])
+        sent = 0
+        for p in [t for t in targets if t]:
+            res = app.send_document(cfg["bot_token"], chat_id, p)
+            if res and res.get("ok"):
+                sent += 1
+                app.audit("file_sent", chat_id=chat_id, path=p)
+        app.send(cfg["bot_token"], chat_id,
+                 f"sent {sent} file(s)" if sent else f"no file matching {name!r} under workdir")
+        return
+    if cmd == "/session":
+        args = rest.split()
+        sessions = (state.get("runner_sessions") or {}).get(str(chat_id)) or {}
+        if not args:
+            resume_hint = {
+                "pi": "pi --session-id", "devin": "devin --resume",
+                "codex": "codex exec resume", "opencode": "opencode --session",
+            }
+            lines = [
+                f"· {r}: {sid} — resume: {resume_hint.get(r, r)} {sid}"
+                for r, sid in sorted(sessions.items())
+            ] or ["(no sessions bound to this chat)"]
+            lines.append("")
+            lines.append("/session <runner> <id> binds an external session · "
+                         "/session clear drops all bindings")
+            app.send(cfg["bot_token"], chat_id, "sessions:\n" + "\n".join(lines))
+            return
+        if args[0] == "clear":
+            with app.STATE_LOCK:
+                app.clear_runner_sessions(state, chat_id)
+                if state_path is not None:
+                    app.save_json(state_path, state)
+            app.send(cfg["bot_token"], chat_id, "cleared this chat's session bindings.")
+            return
+        if len(args) != 2 or args[0] not in app.RUNNERS:
+            app.send(cfg["bot_token"], chat_id,
+                     "usage: /session [<runner> <session-id>|clear]")
+            return
+        with app.STATE_LOCK:
+            app.store_runner_session(state, chat_id, args[0], args[1])
+            if state_path is not None:
+                app.save_json(state_path, state)
+        app.audit("session_bound", chat_id=chat_id, runner=args[0], session=args[1])
+        app.send(cfg["bot_token"], chat_id,
+                 f"bound {args[0]} session {args[1]} — next prompt resumes it")
         return
 
     if msg.get("voice") and not text.strip():

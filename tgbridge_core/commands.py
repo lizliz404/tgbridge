@@ -17,6 +17,10 @@ COMMANDS = (
     ("runners", "List agents", "/runners", "bridge"),
     ("models", "List current models", "/models [refresh]", "bridge"),
     ("runner", "Switch agent", "/runner <name> [model] [permissions] · /runner default", "bridge"),
+    ("limits", "Limit cooldowns", "/limits [clear]", "bridge"),
+    ("files", "List files", "/files", "bridge"),
+    ("send", "Send a file", "/send <name|all>", "bridge"),
+    ("session", "Session info/bind", "/session [<runner> <id>|clear]", "bridge"),
     ("help", "Help", "/help", "bridge"),
     # Goal lifecycle, executed by the runner. The whole goal/sisyphus family is
     # accepted, so an unlisted variant still works when typed.

@@ -6,12 +6,15 @@ No copied globals, entry-point import or hidden module-level runtime.
 import json
 import os
 import queue
+import random
 import signal
 import socket
 import subprocess
 import threading
 import time
 import uuid
+
+from .limits import RESUME_NOTE, backoff, parse_reset
 
 def signal_run_process(app, proc, sig):
     """Signal only the runner process group created by run_agent()."""
@@ -624,6 +627,142 @@ def question_owner(app, transport, run_id):
             getattr(app, 'execution_id', None), run_id)
 
 
+# ── Provider-limit governor (park → cooldown → staggered resume) ────────────
+# Ported from hanzili/elite-devin-bridge. A quota/refusal error parks the turn
+# instead of failing it; a Timer replays it through PROMPT_Q after the
+# server-quoted reset window (or bounded backoff), and the durable registry
+# survives restarts via rearm_limits().
+
+def limit_resume_max(app, cfg):
+    try:
+        return max(1, int(cfg.get("limit_resume_max", 8)))
+    except (TypeError, ValueError):
+        return 8
+
+
+def _limit_kind(app, cfg, err):
+    kind = app.classify_run_error(err, cfg.get("quota_markers"))
+    return {"quota": "rate_limited", "unavailable": "retryable"}.get(kind)
+
+
+def _limit_timer(app, cfg, key, resume_at):
+    t = threading.Timer(max(resume_at - time.time(), 1), app.limit_fire,
+                        args=(cfg, key))
+    t.daemon = True
+    t.start()
+    return t
+
+
+def limit_park(app, cfg, chat_id, message_id, prompt, input_ids, err):
+    """Park a limit-killed turn for an automatic retry; None when not parkable.
+
+    The caller still settles the inputs 'interrupted' — /resume stays the
+    manual escape hatch, while the governor's timer is the automatic one."""
+    if err == app.CANCEL_MSG:
+        return None
+    kind = _limit_kind(app, cfg, err)
+    governor = cfg.get("_limits")
+    if not kind or governor is None:
+        return None
+    key = str(chat_id)
+    attempts = cfg.setdefault("_limit_attempts", {})
+    attempt = attempts.get(key, 0) + 1
+    max_attempts = limit_resume_max(app, cfg)
+    if attempt > max_attempts:
+        return None
+    attempts[key] = attempt
+    now = time.time()
+    reset_at = parse_reset(err) if kind == "rate_limited" else None
+    if reset_at and reset_at > now:
+        resume_at = reset_at + random.uniform(2, 12)
+        when = "at " + time.strftime("%H:%M", time.localtime(resume_at))
+    else:
+        delay = backoff(attempt,
+                        cfg.get("limit_backoff_s", 30.0),
+                        cfg.get("limit_backoff_cap_s", 300.0))
+        resume_at = now + delay
+        when = f"in ~{int(delay)}s"
+    entry = governor.park(key, {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        # Parked prompts were already suffixed in worker(); flag the replay so
+        # the outbox hint isn't appended twice.
+        "prompt": prompt,
+        "has_outbox_hint": True,
+        "input_ids": list(input_ids or []),
+        "error": str(err)[:300],
+        "error_kind": kind,
+        "attempt": attempt,
+        "resume_at": resume_at,
+    })
+    _limit_timer(app, cfg, key, resume_at)
+    return {"entry": entry, "when": when, "attempt": attempt,
+            "max_attempts": max_attempts, "kind": kind}
+
+
+def limit_fire(app, cfg, key):
+    """Cooldown elapsed: replay the parked turn into its own chat queue."""
+    governor = cfg.get("_limits")
+    dispatcher = cfg.get("_chat_dispatcher")
+    if (governor is None or getattr(app, "STOPPING", False)
+            or (dispatcher and dispatcher.stopped)):
+        return  # registry entry stays durable for the next restart
+    entry = governor.get(key)
+    if not entry:
+        return
+    inbox = cfg.get("_inbox")
+    input_ids = entry.get("input_ids") or []
+    if inbox and input_ids:
+        live = {e["id"]: e["status"] for e in inbox.pending(entry["chat_id"])}
+        still = [i for i in input_ids if live.get(i) == "interrupted"]
+        if not still:
+            governor.pop(key, "superseded")
+            return
+        input_ids = still
+        inbox.transition(input_ids, "queued")
+    governor.pop(key, "resume_attempt")
+    app.send(cfg["bot_token"], entry["chat_id"],
+             f"🔄 limit cooldown over — retrying the parked turn "
+             f"(attempt {entry.get('attempt', '?')}).")
+    prompt = entry.get("prompt") or ""
+    if prompt and not prompt.lstrip().startswith("/"):
+        prompt = RESUME_NOTE + prompt
+    app.PROMPT_Q.put({"chat_id": entry["chat_id"],
+                      "message_id": entry.get("message_id"),
+                      "prompt": prompt,
+                      "input_ids": input_ids,
+                      "has_outbox_hint": entry.get("has_outbox_hint"),
+                      "limit_resumed": True})
+
+
+def limit_supersede(app, cfg, chat_id):
+    """A fresh turn in this chat takes over from its parked retry."""
+    governor = cfg.get("_limits")
+    if governor is not None:
+        governor.pop(str(chat_id), "new_turn")
+
+
+def rearm_limits(app, cfg):
+    """Re-arm parked-turn timers after restart; due ones fire immediately."""
+    governor = cfg.get("_limits")
+    if governor is None:
+        return
+    for entry in governor.snapshot():
+        _limit_timer(app, cfg, entry["key"], entry.get("resume_at", 0))
+
+
+def named_deliverables(app, cfg, chat_id, text):
+    """Auto-send files a reply names — intent-gated pull delivery."""
+    try:
+        from .files import AUTO_SEND_NAMED, named_paths
+        for path in named_paths(app, text, cfg["workdir"])[:AUTO_SEND_NAMED]:
+            res = app.send_document(cfg["bot_token"], chat_id, path)
+            if res and res.get("ok"):
+                app.audit("named_file_sent", chat_id=chat_id, path=path)
+    except Exception as e:
+        app.log(f"named file delivery: {e}")
+
+
 def stop_runtime(app):
     """Stop this execution owner's process/server, never another chat's run."""
     with app.RUN_LOCK:
@@ -662,6 +801,7 @@ def worker(app, cfg, state):
             app.PROMPT_Q.task_done()
             return
         chat_id = message_id = prompt = None
+        answer = None
         input_ids = []
         inbox = cfg.get("_inbox")
         completed = False
@@ -670,6 +810,8 @@ def worker(app, cfg, state):
         try:
             chat_id, message_id, prompt = app.unpack_entry(entry)
             input_ids = (entry.get("input_ids") or []) if isinstance(entry, dict) else []
+            if not (isinstance(entry, dict) and entry.get("limit_resumed")):
+                app.limit_supersede(cfg, chat_id)
             if inbox:
                 inbox.transition(input_ids, "executing")
             with app.STATE_LOCK:
@@ -698,7 +840,9 @@ def worker(app, cfg, state):
                 )
             outbox = app.outbox_dir(cfg)
             app.ensure_private_dir(outbox)
-            if not prompt.lstrip().startswith('/'):
+            if not prompt.lstrip().startswith('/') and not (
+                    isinstance(entry, dict) and entry.get("has_outbox_hint")
+            ):
                 # A slash command must arrive as the message itself, or the
                 # runner treats the suffix as prose instead of dispatching it.
                 prompt = prompt + (
@@ -800,12 +944,27 @@ def worker(app, cfg, state):
                 delivery_confirmed = bool(app.send_retry(cfg, chat_id, app.CANCEL_MSG)) and delivery_confirmed
                 app.log(f"chat={chat_id} cancelled")
             elif err:
-                app.react(cfg, chat_id, message_id, "👎")
-                delivery_confirmed = bool(app.send_retry(cfg, chat_id, f"⚠️ {err}")) and delivery_confirmed
-                app.audit("run_error", chat_id=chat_id, err=err[:200])
-                app.log(f"chat={chat_id} error: {err[:120]}")
+                parked = app.limit_park(cfg, chat_id, message_id, prompt,
+                                        input_ids, err)
+                if parked:
+                    delivery_confirmed = bool(app.send_retry(
+                        cfg, chat_id,
+                        f"⏸️ hit a server-side limit ({parked['kind']}); "
+                        f"turn parked — auto-retry {parked['when']} "
+                        f"(attempt {parked['attempt']}/{parked['max_attempts']}). "
+                        "Send anything to take over, or /limits to inspect.")) and delivery_confirmed
+                    app.audit("run_parked", chat_id=chat_id, kind=parked["kind"],
+                              attempt=parked["attempt"], err=err[:200])
+                    app.log(f"chat={chat_id} parked ({parked['kind']}, "
+                            f"attempt {parked['attempt']})")
+                else:
+                    app.react(cfg, chat_id, message_id, "👎")
+                    delivery_confirmed = bool(app.send_retry(cfg, chat_id, f"⚠️ {err}")) and delivery_confirmed
+                    app.audit("run_error", chat_id=chat_id, err=err[:200])
+                    app.log(f"chat={chat_id} error: {err[:120]}")
             else:
                 app.react(cfg, chat_id, message_id, "👍")
+                cfg.get("_limit_attempts", {}).pop(str(chat_id), None)
                 streamed = bool(live.get("streamed"))
                 payload = app.deliverable_answer(live, answer)
                 if live.get("missing_segments"):
@@ -860,6 +1019,8 @@ def worker(app, cfg, state):
                 pass
             except Exception as e:
                 app.log(f"outbox delivery: {e}")
+            if chat_id is not None and answer:
+                app.named_deliverables(cfg, chat_id, answer)
             app.PROMPT_Q.task_done()
 
 

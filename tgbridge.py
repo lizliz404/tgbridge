@@ -54,6 +54,8 @@ from tgbridge_core.chat_runtime import ChatDispatcher
 from tgbridge_core.runtime import LOADED_CODE, source_identity
 from tgbridge_core.context import reply_context
 from tgbridge_core import telegram_io, execution, opencode_transport, codex_transport, pi_transport, ingress
+from tgbridge_core import files as _files
+from tgbridge_core.limits import Governor
 from tgbridge_core.commands import COMMAND_NAMES, botcmd, command_menu, command_help, is_agent_command, unsupported_command
 from tgbridge_core.ownership import AlreadyRunning, ProcessLease
 from tgbridge_core.inbox import Inbox, InboxError
@@ -250,6 +252,19 @@ _steer_fallback = _bind(execution._steer_fallback)
 worker = _bind(execution.worker)
 fire_at = _bind(execution.fire_at)
 rearm_at = _bind(execution.rearm_at)
+
+# Provider-limit governor: park → cooldown → staggered auto-resume.
+limit_resume_max = _bind(execution.limit_resume_max)
+limit_park = _bind(execution.limit_park)
+limit_fire = _bind(execution.limit_fire)
+limit_supersede = _bind(execution.limit_supersede)
+rearm_limits = _bind(execution.rearm_limits)
+
+# Pull-model file delivery: reply-named paths + /files /send.
+named_paths = _bind(_files.named_paths)
+deliverables = _bind(_files.deliverables)
+resolve_send_name = _bind(_files.resolve_name)
+named_deliverables = _bind(execution.named_deliverables)
 
 # OpenCode HTTP transports and safe-boundary steering.
 _server_call = _bind(opencode_transport._server_call)
@@ -472,6 +487,8 @@ def run(cfg):
         inbox = cfg["_inbox"] = Inbox(os.path.join(CONFIG_DIR, "inputs.json"))
     if cfg.get('_questions') is None:
         cfg['_questions'] = question_broker(cfg)
+    if cfg.get('_limits') is None:
+        cfg['_limits'] = Governor(CONFIG_DIR, printer=log)
     if not cfg.get("capture_group_context", True):
         state.pop("context", None)
         state.pop("hints", None)
@@ -564,6 +581,7 @@ def run(cfg):
     worker_t = threading.Thread(target=CHAT_DISPATCHER.consume, daemon=True)
     worker_t.start()
     rearm_at(cfg, state)
+    rearm_limits(cfg)
 
     offset = state.get("offset")
     backoff = 3

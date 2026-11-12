@@ -37,6 +37,9 @@
     {"runner": "pi", "model": "auto:pi"}
   ],
   "max_fallback_steps": 12,
+  "limit_resume_max": 8,
+  "limit_backoff_s": 30,
+  "limit_backoff_cap_s": 300,
   "model_discovery_cache_s": 300,
   "model_discovery_timeout_s": 15,
   "fallback_run_timeout_s": 300,
