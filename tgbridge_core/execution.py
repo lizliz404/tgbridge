@@ -9,12 +9,15 @@ import queue
 import random
 import signal
 import socket
+import sqlite3
 import subprocess
 import threading
 import time
 import uuid
 
 from .limits import RESUME_NOTE, backoff, parse_reset
+
+DEVIN_STATE_DB = os.path.expanduser("~/.local/share/devin/cli/sessions.db")
 
 def signal_run_process(app, proc, sig):
     """Signal only the runner process group created by run_agent()."""
@@ -136,6 +139,148 @@ def telegram_session_name(app, chat_id, bot_username=None):
     return " · ".join(parts)
 
 
+def _devin_db(app):
+    path = os.environ.get("DEVIN_STATE_DB") or DEVIN_STATE_DB
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+
+
+def _devin_lock_session(app, db, workdir, spawn_epoch, prompt):
+    """Identify the run's own session row, or None while it is unclear.
+
+    Newest-first; an ambiguous spawn window (parallel Devin runs sharing a
+    workdir) falls back to an exact prompt match, else keeps waiting. Never
+    guesses across sessions — a wrong lock would leak another run's tools.
+    """
+    rows = db.execute(
+        "select id, working_directory from sessions where created_at >= ?"
+        " order by created_at desc",
+        (int(spawn_epoch) - 5,),
+    ).fetchall()
+    matches = [
+        r[0] for r in rows if os.path.realpath(r[1] or "") == workdir
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    head = (prompt or "")[:60]
+    if matches and head:
+        for sid in matches:
+            hit = db.execute(
+                "select 1 from prompt_history where session_id=?"
+                " and substr(content,1,60)=? limit 1",
+                (sid, head),
+            ).fetchone()
+            if hit:
+                return sid
+    return None
+
+
+def devin_progress_watch(app, cfg, live, proc, spawn_epoch, prompt):
+    """Feed `devin --print`'s hidden progress into the status bubble.
+
+    --print emits only the final answer, but Devin persists every tool call
+    and chat message into cli/sessions.db as they happen. A read-only poll
+    converts new rows into the same action events the streaming runners
+    produce and renews the idle lease, so a quiet-but-busy run is not
+    killed at run_timeout_s. Silent failure keeps the old blind behavior.
+    """
+    workdir = os.path.realpath(cfg.get("workdir") or ".")
+    try:
+        poll = max(0.2, float(cfg.get("devin_watch_poll_s", 2.0)))
+    except (TypeError, ValueError):
+        poll = 2.0
+    discover_deadline = time.monotonic() + 60
+    session = None
+    tc_seen = {}
+    msg_seen = set()
+    tc_floor = 0
+    node_floor = 0
+    while proc.poll() is None:
+        db = None
+        try:
+            db = _devin_db(app)
+            if session is None:
+                session = _devin_lock_session(app, db, workdir, spawn_epoch, prompt)
+                if session is None:
+                    if time.monotonic() > discover_deadline:
+                        return
+                else:
+                    tc_floor = db.execute(
+                        "select coalesce(max(rowid),0) from tool_call_state"
+                        " where session_id=?", (session,)).fetchone()[0]
+                    node_floor = db.execute(
+                        "select coalesce(max(rowid),0) from message_nodes"
+                        " where session_id=?", (session,)).fetchone()[0]
+            if session is not None:
+                progressed = False
+                for _rowid, tcid, raw, upd in db.execute(
+                    "select rowid, tool_call_id, tool_call_json,"
+                    " tool_call_update_json from tool_call_state"
+                    " where session_id=? and rowid>=?", (session, tc_floor)):
+                    try:
+                        call = json.loads(raw or "{}")
+                    except ValueError:
+                        call = {}
+                    try:
+                        update = json.loads(upd or "{}")
+                    except ValueError:
+                        update = {}
+                    state = update.get("status") or call.get("status") or "running"
+                    if tc_seen.get(tcid) == state:
+                        continue
+                    tc_seen[tcid] = state
+                    inputs = {}
+                    for part in call.get("content") or []:
+                        body = part.get("content") if isinstance(part, dict) else None
+                        res = (body or {}).get("resource") or {}
+                        if res.get("text"):
+                            inputs["command"] = res["text"][:300]
+                            break
+                        if (body or {}).get("text"):
+                            inputs["input"] = body["text"][:300]
+                    app.publish_progress(cfg, live, {
+                        "kind": "action", "id": tcid,
+                        "label": call.get("title") or call.get("kind") or "tool",
+                        "inputs": inputs,
+                        "state": {"pending": "running", "in_progress": "running",
+                                  "completed": "completed",
+                                  "failed": "failed"}.get(state, state),
+                        "output": ""})
+                    progressed = True
+                for rowid, raw in db.execute(
+                    "select rowid, chat_message from message_nodes"
+                    " where session_id=? and rowid>?",
+                    (session, node_floor)):
+                    node_floor = rowid
+                    try:
+                        msg = json.loads(raw or "{}")
+                    except ValueError:
+                        continue
+                    if msg.get("role") == "assistant" and (
+                            msg.get("content") or "").strip():
+                        mid = msg.get("message_id") or f"node:{rowid}"
+                        if mid in msg_seen:
+                            continue
+                        msg_seen.add(mid)
+                        # Interim narration is real output: deliver it as a
+                        # normal message, the journal dedupes it from the
+                        # final --print answer.
+                        app.publish_progress(cfg, live, {
+                            "kind": "text", "id": f"devin:{mid}",
+                            "text": msg["content"].strip()})
+                        progressed = True
+                if progressed:
+                    app.mark_run_progress()
+        except sqlite3.Error:
+            pass
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except sqlite3.Error:
+                    pass
+        time.sleep(poll)
+
+
 def run_agent(app, cfg, session_id, prompt, live=None):
     """Stream the runner's JSON events live (Popen).
 
@@ -171,6 +316,7 @@ def run_agent(app, cfg, session_id, prompt, live=None):
         cmd = app.apply_runner_policy(rname, cmd, cfg)
     except app.RunnerError as e:
         return session_id, None, str(e)
+    spawn_epoch = time.time()
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -201,6 +347,12 @@ def run_agent(app, cfg, session_id, prompt, live=None):
 
     timeout_thread = threading.Thread(target=watch_timeout, daemon=True)
     timeout_thread.start()
+    if rname == "devin" and live is not None:
+        threading.Thread(
+            target=devin_progress_watch,
+            args=(app, cfg, live, proc, spawn_epoch, prompt),
+            daemon=True,
+        ).start()
     errbuf = []
     stderr = proc.stderr
     drain = threading.Thread(

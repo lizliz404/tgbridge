@@ -238,7 +238,11 @@ def typing_loop(app, token, chat_id, stop_event):
 
 def edit_status(app, cfg, live, final=None):
     now = time.monotonic()
-    if not final and now - live.get("last_status_edit", -8) < 8:
+    try:
+        min_edit = max(1.0, float(cfg.get("status_edit_min_s", 8)))
+    except (TypeError, ValueError):
+        min_edit = 8.0
+    if not final and now - live.get("last_status_edit", -min_edit) < min_edit:
         return
     live["last_status_edit"] = now
     elapsed = max(0, int(time.time() - live["start"]))
