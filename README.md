@@ -22,6 +22,9 @@ API long-poll in, local CLI agent out.
 - **Durable inputs** — accepted addressed prompts persist before Telegram offset advances. Restart restores only unexecuted inputs; executing/steering tasks become interrupted with `/pending` + explicit `/resume <id>`. Recovery notices wait at least 10 minutes, are batched per chat and attempted only once per interruption across restarts; ambiguous delivery is retained locally, not repeatedly sent. Stored results are inspectable with `/result <id>`; uncertain sending never auto-replays tool execution. No guarantee yet for passive group burst tails, scheduled-to-queue transfer, or exact live segment receipts across crashes
 - **Inbound photos + documents** — downloaded privately and passed as local paths; an unaddressed group upload is retained for the next @mention/reply, so the file itself needs no tag
 - **Quiet tool progress** — Pi, Devin CLI, Codex and OpenCode tools and To-Do events update the same status bubble, at most once every eight seconds. The tool type and a quoted preview of at most 128 characters are shown; full redacted commands, file changes and results are recorded locally in `audit.jsonl`. Native reasoning events show only `☁️ thinking`, without forwarding private reasoning
+- **Live progress for blind runners** — `devin --print` emits only the final answer, so a Devin turn used to look dead for minutes and a quiet run could hit the idle lease mid-work. The bridge now read-only polls Devin's own `cli/sessions.db`: new rows become ordinary progress events (tool calls update the status bubble, interim assistant text arrives as messages deduped from the final answer) and renew the idle lease. `status_edit_min_s` and `devin_watch_poll_s` tune the cadence
+- **Limit governor** — quota/transport-dead turns park into a durable registry and auto-resume after the provider's reset window (bounded backoff, max 8 attempts); a fresh prompt supersedes the parked retry and timers re-arm across restarts. `/limits` inspects and clears the cooldown queue; `/resume` stays the manual escape hatch for interrupted inputs
+- **Pull file delivery** — `/files` lists deliverables, `/send <name|all>` pulls them into the chat, and absolute paths named in a reply auto-send (workdir-confined). `/session` shows every runner session bound to the chat with native resume hints; `/session <runner> <id>` adopts an external session
 - **Native questions** — Pi RPC `select`, `confirm`, `input` and `editor` dialogs and Codex app-server `item/tool/requestUserInput` become Telegram question cards with buttons and text replies. Answers return to the original request and question IDs; duplicate clicks, foreign senders and expired cards cannot answer it. Nothing is preselected. Extensions using `ctx.ui.custom()` need adaptation to Pi's supported RPC dialogs. OpenCode questions are not connected yet
 - **Segmented public replies** — completed assistant messages are delivered individually, including public progress commentary. One shared delivery journal handles CLI, Pi RPC, Codex app-server and OpenCode server snapshots, deduplicates repeated events, and avoids resending the joined answer at the end
 - **Live status** — one edited message tracks elapsed time, the latest tool and a short answer preview; completed public replies remain in the chat
@@ -32,7 +35,7 @@ API long-poll in, local CLI agent out.
 - **Audit log** — every enqueue/run/send/schedule event appended to `~/.config/tgbridge/audit.jsonl`
 - **Never dies silently** — any fatal crash or SIGTERM announces `💀 …` to every allowed chat (best-effort, 3s each) before systemd restarts it; a dead worker thread is detected and respawned; a failed answer delivery retries once, then is audited and saved to `~/.config/tgbridge/undelivered/` instead of vanishing; a missing runner binary warns at startup instead of crashing
 - **Ambient group context** — hears recent human conversation but only runs when explicitly @mentioned or replied to
-- **Flat slash-command menu** — `/status`, `/cancel`, `/new`, `/pending`, `/resume`, `/result`, `/at`, `/runners`, `/models`, `/runner`, `/help` all appear directly in the command menu with minimal English descriptions. The menu and `/help` share one catalog; no basic/advanced nesting or persistent reply keyboard. Plain replies remove inherited keyboards; inline question cards remain available. `/new` starts fresh on the next message, not an abort; `/resume <id>` recovers interrupted inputs, not historical sessions; `/runner` changes only this chat's primary; file defaults remain shared. **Goal commands** (`/goal-list`, `/goal-status`, `/goal-focus`, `/goal-resume`, `/goal-pause`, `/goal-clear`, `/goal-direct`) are forwarded verbatim to the runner, which executes them deterministically without a model turn; the bridge relays the text they produce. The rest of the `goal`/`sisyphus` family is accepted the same way when typed. A forwarded command arrives as the message itself — no group context, sender rules, or outbox note wraps it, because the runner only dispatches a command when nothing else is attached. Other unrecognized slash commands (former bridge controls, unrelated extension commands, skill names) are still rejected before reaching the agent; use plain text for tasks and skills. Unix paths are not parsed as commands. Bridge-owned notices and question controls use concise English; agent answers and question content retain their own language
+- **Flat slash-command menu** — `/status`, `/cancel`, `/new`, `/pending`, `/resume`, `/result`, `/at`, `/runners`, `/models`, `/runner`, `/limits`, `/files`, `/send`, `/session`, `/help` all appear directly in the command menu with minimal English descriptions. The menu and `/help` share one catalog; no basic/advanced nesting or persistent reply keyboard. Plain replies remove inherited keyboards; inline question cards remain available. `/new` starts fresh on the next message, not an abort; `/resume <id>` recovers interrupted inputs, not historical sessions; `/runner` changes only this chat's primary; file defaults remain shared. **Goal commands** (`/goal-list`, `/goal-status`, `/goal-focus`, `/goal-resume`, `/goal-pause`, `/goal-clear`, `/goal-direct`) are forwarded verbatim to the runner, which executes them deterministically without a model turn; the bridge relays the text they produce. The rest of the `goal`/`sisyphus` family is accepted the same way when typed. A forwarded command arrives as the message itself — no group context, sender rules, or outbox note wraps it, because the runner only dispatches a command when nothing else is attached. Other unrecognized slash commands (former bridge controls, unrelated extension commands, skill names) are still rejected before reaching the agent; use plain text for tasks and skills. Unix paths are not parsed as commands. Bridge-owned notices and question controls use concise English; agent answers and question content retain their own language
 - **Chat + sender policy** — double allowlist by default; optionally trust all members of specifically allowlisted groups while keeping DMs user-allowlisted
 - **Private runtime state** — config, session index, audit log, attachments, and undelivered replies are kept under `~/.config/tgbridge` with private permissions
 - **Regression + startup gates** — `python3 tgbridge.py --selftest` runs the exhaustive suite on demand/CI; every service start runs only a fast, side-effect-free smoke gate
@@ -104,6 +107,10 @@ tail -f ~/.config/tgbridge/tgbridge.log
 ```
 
 or just run it inside `tmux`: `OPENCODE_BIN=$(which opencode) python3 tgbridge.py`
+
+Considering adoption under a fleet orchestrator (herdr-core `hc`)? Run
+`python3 tgbridge.py --hc-preflight` for a read-only verdict — it does not load
+config, hit Telegram, or touch services.
 
 Check the complete service environment before relying on it:
 
@@ -189,6 +196,8 @@ To post to Telegram yourself: python3 /path/to/tgbridge/tgbridge.py --send <chat
 | `server_url` | Local runner server URL (default `http://127.0.0.1:4096`; `OPENCODE_SERVER` remains supported) |
 | `server_poll_s` | Local transcript polling interval in server mode (default `0.5`, clamped to `0.1`–`5.0`) |
 | `run_timeout_s` | Inactivity timeout in seconds (default `900`); model/tool output and accepted steering renew the lease |
+| `devin_watch_poll_s` | Poll interval for the read-only Devin session-DB progress watcher (default `2`) |
+| `status_edit_min_s` | Minimum seconds between status-bubble edits for watched progress (default `8`) |
 | `run_max_s` | Absolute per-run safety cap even with activity (default `43200`, 12 hours) |
 | `chunk` | Outgoing reply chunk size (default `3900`, Telegram caps at 4096) |
 | `outbox_dir` | Base directory for private per-chat delivery folders `<base>/<chat_id>/` (base defaults to `workdir/.tgbridge-outbox`); use the exact folder given in the task prompt |
@@ -256,6 +265,9 @@ Stable, independently testable boundaries live under `tgbridge_core/`:
 - `health.py` — redacted proxy inspection and network failure classification
 - `storage.py` — private directories and atomic JSON persistence
 - `runners.py` — capability registries and native Codex/OpenCode/Pi/Devin CLI adapters
+- `limits.py` — the limit governor: parked-turn registry, reset-window scheduling, `/limits`
+- `files.py` — workdir-confined `/files`/`/send` pull delivery
+- `maintenance.py` — the approved local restart helper (`tests/restart_local.py`) support
 - `selftest.py` — the exhaustive legacy regression gate, kept out of startup
 
 Focused tests live in `tests/` and run with:
